@@ -351,7 +351,7 @@ impl PubkyDataEncryptor {
                         let path = self.destination_path.as_str();
                         let counter = data_link_context.get_counter();
                         println!("Reading at Slot {counter}");
-                        let formatted_path = format!("pubky{public_key}/{path}/{counter}");
+                        let formatted_path = format!("{public_key}/{path}/{counter}");
 
                         if let Ok(response) = self
                             .outbox_client
@@ -540,7 +540,7 @@ impl PubkyDataEncryptor {
             let counter = data_link_context.get_counter();
             println!("Reading at Slot {counter}");
             let public_key = data_link_context.get_endpoint();
-            let formatted_path = format!("pubky{public_key}/{path}/{counter}");
+            let formatted_path = format!("{public_key}/{path}/{counter}");
             if let Ok(response) = self
                 .outbox_client
                 .public_storage()
