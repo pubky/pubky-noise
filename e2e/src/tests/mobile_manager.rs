@@ -10,7 +10,7 @@ use pubky_testnet::{
 #[tokio::test]
 async fn pubky_data_mobile_manager_dual_outbox_simple_test() {
     let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let server = testnet.homeserver_app();
     let alice_pubky = testnet.sdk().unwrap();
 
     let bob_pubky = testnet.sdk().unwrap();

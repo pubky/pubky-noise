@@ -53,8 +53,9 @@ async fn pubky_data_cipher_check_utility_negative() {
 #[tokio::test]
 async fn pubky_data_snow_test_initiator_first() {
     // Start a test homeserver with 1 MB user data limit
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
@@ -202,7 +203,10 @@ async fn pubky_data_snow_test_responder_first() {
     let responder_pubky = testnet.sdk().unwrap();
 
     let mut mock_dir = MockDataDir::test();
-    let server = testnet.create_homeserver_with_mock(mock_dir).await.unwrap();
+    let server = testnet
+        .create_homeserver_app_with_mock(mock_dir)
+        .await
+        .unwrap();
 
     let initiator_signer = initiator_pubky.signer(Keypair::random());
     let initiator_session = initiator_signer
@@ -347,7 +351,10 @@ async fn pubky_data_snow_test_responder_tampering() {
     let responder_pubky = testnet.sdk().unwrap();
 
     let mut mock_dir = MockDataDir::test();
-    let server = testnet.create_homeserver_with_mock(mock_dir).await.unwrap();
+    let server = testnet
+        .create_homeserver_app_with_mock(mock_dir)
+        .await
+        .unwrap();
 
     let initiator_signer = initiator_pubky.signer(Keypair::random());
     let initiator_session = initiator_signer
@@ -480,7 +487,10 @@ async fn pubky_data_snow_test_initiator_tampering() {
     let responder_pubky = testnet.sdk().unwrap();
 
     let mut mock_dir = MockDataDir::test();
-    let server = testnet.create_homeserver_with_mock(mock_dir).await.unwrap();
+    let server = testnet
+        .create_homeserver_app_with_mock(mock_dir)
+        .await
+        .unwrap();
 
     let initiator_signer = initiator_pubky.signer(Keypair::random());
     let initiator_session = initiator_signer
@@ -614,7 +624,10 @@ async fn pubky_data_snow_null_message() {
     let responder_pubky = testnet.sdk().unwrap();
 
     let mut mock_dir = MockDataDir::test();
-    let server = testnet.create_homeserver_with_mock(mock_dir).await.unwrap();
+    let server = testnet
+        .create_homeserver_app_with_mock(mock_dir)
+        .await
+        .unwrap();
 
     let initiator_signer = initiator_pubky.signer(Keypair::random());
     let initiator_session = initiator_signer
@@ -736,8 +749,9 @@ async fn pubky_data_snow_null_message() {
 //#[tokio::test]
 async fn pubky_data_snow_test_min_max_size_message() {
     //TODO: fix accordingly dual outbox model
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
@@ -863,8 +877,8 @@ async fn pubky_data_snow_test_min_max_size_message() {
 #[tokio::test]
 async fn pubky_data_snow_test_unknown_pattern() {
     // Start a test homeserver with 1 MB user data limit
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
 
     let initiator_signer = initiator_pubky.signer(Keypair::random());
@@ -891,8 +905,8 @@ async fn pubky_data_snow_test_unknown_pattern() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_snow_noise_build_error() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
@@ -942,8 +956,8 @@ async fn pubky_data_snow_test_snow_noise_build_error() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_already_existent() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
@@ -996,8 +1010,8 @@ async fn pubky_data_snow_test_already_existent() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_context_not_found() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
@@ -1058,8 +1072,8 @@ async fn pubky_data_snow_test_context_not_found() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_cleaning_sequence() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
@@ -1193,8 +1207,8 @@ async fn pubky_data_snow_test_cleaning_sequence() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_XX_pattern_simple() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
@@ -1325,8 +1339,8 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_XX_pattern_tampering() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
@@ -1526,8 +1540,8 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_simple_backup() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
@@ -1663,8 +1677,8 @@ async fn pubky_data_snow_test_simple_backup() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_context_status() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
@@ -1778,10 +1792,10 @@ async fn pubky_data_snow_test_context_status() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_dual_outbox() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let first_server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let first_server = testnet.homeserver_app();
     //let second_server = testnet.second_homeserver();
-    let second_server = testnet.homeserver();
+    let second_server = testnet.homeserver_app();
 
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
@@ -1902,9 +1916,10 @@ async fn pubky_data_snow_test_dual_outbox() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_identity_commitment() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
-    let first_server = testnet.homeserver();
-    let second_server = testnet.homeserver();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+
+    let first_server = testnet.homeserver_app();
+    let second_server = testnet.homeserver_app();
 
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
