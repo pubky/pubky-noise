@@ -1,12 +1,12 @@
-
-use pubky_testnet::{
-    pubky::Keypair,
-    EphemeralTestnet,
-};
+use pubky_testnet::{pubky::Keypair, EphemeralTestnet};
 
 #[tokio::test]
 async fn pubky_data_mobile_manager_dual_outbox_simple_test() {
-    let testnet = EphemeralTestnet::start().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let alice_pubky = testnet.sdk().unwrap();
 
