@@ -1,16 +1,15 @@
 use pubky_testnet::{
-    pubky::{errors::RequestError, Error, IntoPubkyResource, Keypair, Method, StatusCode},
+    pubky::Keypair,
     pubky_homeserver::MockDataDir,
     EphemeralTestnet, Testnet,
 };
 
 use pubky_data::snow_crypto::{HandshakePattern, PUBKY_DATA_MSG_LEN};
 use pubky_data::{
-    ConversationId, LinkId, PairContextId, PubkyDataEncryptor, PubkyDataError, PubkyKeySet,
+    LinkId, PubkyDataEncryptor, PubkyDataError, PubkyKeySet,
     TemporaryLinkId,
 };
 
-use std::{thread, time};
 
 //TODO:
 //	- test max message size limit
@@ -157,7 +156,7 @@ async fn pubky_data_snow_test_initiator_first() {
     assert!(responder_link_id.is_ok());
 
     // Transport
-    let mut data_payload = String::from("Hello_World_Pubky_Data");
+    let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
     let initiator_link_id = initiator_link_id.unwrap();
@@ -173,12 +172,12 @@ async fn pubky_data_snow_test_initiator_first() {
     assert!(results.len() >= 1);
     for ret in results {
         //println!("raw bytes to check ciphering {:?}", ret);
-        let mut padded_msg = String::from_utf8(ret.to_vec()).unwrap();
+        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
         assert_eq!(msg, "Hello_World_Pubky_Data".to_string());
     }
 
-    let mut data_payload = String::from("Pubky_Data_Rocks");
+    let data_payload = String::from("Pubky_Data_Rocks");
     let raw_bytes = data_payload.as_bytes().to_vec();
     responder_encryptor
         .send_message(raw_bytes, responder_link_id)
@@ -189,7 +188,7 @@ async fn pubky_data_snow_test_initiator_first() {
     assert!(results.len() >= 1);
     for ret in results {
         //println!("raw bytes to check ciphering {:?}", ret);
-        let mut padded_msg = String::from_utf8(ret.to_vec()).unwrap();
+        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
         assert_eq!(msg, "Pubky_Data_Rocks".to_string());
     }
@@ -202,7 +201,7 @@ async fn pubky_data_snow_test_responder_first() {
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
-    let mut mock_dir = MockDataDir::test();
+    let mock_dir = MockDataDir::test();
     let server = testnet
         .create_homeserver_app_with_mock(mock_dir)
         .await
@@ -306,7 +305,7 @@ async fn pubky_data_snow_test_responder_first() {
     assert!(responder_link_id.is_ok());
 
     // Transport
-    let mut data_payload = String::from("Hello World Pubky Data");
+    let data_payload = String::from("Hello World Pubky Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
     let responder_link_id = responder_link_id.unwrap();
@@ -321,12 +320,12 @@ async fn pubky_data_snow_test_responder_first() {
 
     assert!(results.len() >= 1);
     for ret in results {
-        let mut padded_msg = String::from_utf8(ret.to_vec()).unwrap();
+        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
         assert_eq!(msg, "Hello World Pubky Data".to_string());
     }
 
-    let mut data_payload = String::from("Pubky Data Rocks");
+    let data_payload = String::from("Pubky Data Rocks");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
     initiator_encryptor
@@ -337,7 +336,7 @@ async fn pubky_data_snow_test_responder_first() {
 
     assert!(results.len() >= 1);
     for ret in results {
-        let mut padded_msg = String::from_utf8(ret.to_vec()).unwrap();
+        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
         assert_eq!(msg, "Pubky Data Rocks".to_string());
     }
@@ -350,7 +349,7 @@ async fn pubky_data_snow_test_responder_tampering() {
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
-    let mut mock_dir = MockDataDir::test();
+    let mock_dir = MockDataDir::test();
     let server = testnet
         .create_homeserver_app_with_mock(mock_dir)
         .await
@@ -454,7 +453,7 @@ async fn pubky_data_snow_test_responder_tampering() {
     assert!(responder_link_id.is_ok());
 
     // Transport
-    let mut data_payload = String::from("Hello World Pubky Data");
+    let data_payload = String::from("Hello World Pubky Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
     println!("RAW BYTES {:?}", raw_bytes);
     responder_encryptor
@@ -467,7 +466,7 @@ async fn pubky_data_snow_test_responder_tampering() {
 
     assert!(results.len() >= 1);
     for ret in results {
-        let mut padded_msg = String::from_utf8(ret.to_vec());
+        let padded_msg = String::from_utf8(ret.to_vec());
         assert!(padded_msg.is_err());
     }
 
@@ -486,7 +485,7 @@ async fn pubky_data_snow_test_initiator_tampering() {
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
-    let mut mock_dir = MockDataDir::test();
+    let mock_dir = MockDataDir::test();
     let server = testnet
         .create_homeserver_app_with_mock(mock_dir)
         .await
@@ -591,7 +590,7 @@ async fn pubky_data_snow_test_initiator_tampering() {
     assert!(responder_link_id.is_ok());
 
     // Transport
-    let mut data_payload = String::from("Hello World Pubky Data");
+    let data_payload = String::from("Hello World Pubky Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
     println!("RAW BYTES {:?}", raw_bytes);
     initiator_encryptor
@@ -604,7 +603,7 @@ async fn pubky_data_snow_test_initiator_tampering() {
 
     assert!(results.len() >= 1);
     for ret in results {
-        let mut padded_msg = String::from_utf8(ret.to_vec());
+        let padded_msg = String::from_utf8(ret.to_vec());
         assert!(padded_msg.is_err());
     }
 
@@ -623,7 +622,7 @@ async fn pubky_data_snow_null_message() {
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
-    let mut mock_dir = MockDataDir::test();
+    let mock_dir = MockDataDir::test();
     let server = testnet
         .create_homeserver_app_with_mock(mock_dir)
         .await
@@ -728,7 +727,7 @@ async fn pubky_data_snow_null_message() {
     assert!(responder_link_id.is_ok());
 
     // Transport
-    let mut data_payload = String::from("");
+    let data_payload = String::from("");
     let raw_bytes = data_payload.as_bytes().to_vec();
     responder_encryptor
         .send_message(raw_bytes, responder_link_id.unwrap())
@@ -740,7 +739,7 @@ async fn pubky_data_snow_null_message() {
 
     assert!(results.len() >= 1);
     for ret in results {
-        let mut padded_msg = String::from_utf8(ret.to_vec()).unwrap();
+        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
         assert_eq!(msg, "".to_string());
     }
@@ -857,7 +856,7 @@ async fn pubky_data_snow_test_min_max_size_message() {
     assert!(responder_link_id.is_ok());
 
     // Transport
-    let mut data_payload = ['A' as u8; 985];
+    let data_payload = ['A' as u8; 985];
     let raw_bytes = data_payload.to_vec();
     responder_encryptor
         .send_message(raw_bytes, initiator_link_id.unwrap())
@@ -869,7 +868,7 @@ async fn pubky_data_snow_test_min_max_size_message() {
 
     assert!(results.len() >= 1);
     for ret in results {
-        let mut ref_payload = ['A' as u8; 985];
+        let ref_payload = ['A' as u8; 985];
         //assert_eq!(ret, ref_payload);
     }
 }
@@ -1175,7 +1174,7 @@ async fn pubky_data_snow_test_cleaning_sequence() {
     assert!(responder_link_id.is_ok());
 
     // Transport
-    let mut data_payload = String::from("Hello_World_Pubky_Data");
+    let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
     let initiator_link_id = initiator_link_id.unwrap();
@@ -1191,7 +1190,7 @@ async fn pubky_data_snow_test_cleaning_sequence() {
     assert!(results.len() >= 1);
     for ret in results {
         //println!("raw bytes to check ciphering {:?}", ret);
-        let mut padded_msg = String::from_utf8(ret.to_vec()).unwrap();
+        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
         assert_eq!(msg, "Hello_World_Pubky_Data".to_string());
     }
@@ -1318,7 +1317,7 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
     assert!(responder_link_id.is_ok());
 
     // Transport
-    let mut data_payload = String::from("Hello_World_Pubky_Data");
+    let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
     initiator_encryptor
         .send_message(raw_bytes, initiator_link_id.unwrap())
@@ -1331,7 +1330,7 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
     assert!(results.len() >= 1);
     for ret in results {
         //println!("raw bytes to check ciphering {:?}", ret);
-        let mut padded_msg = String::from_utf8(ret.to_vec()).unwrap();
+        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
         assert_eq!(msg, "Hello_World_Pubky_Data".to_string());
     }
@@ -1451,7 +1450,7 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
     assert!(responder_link_id.is_ok());
 
     // Transport
-    let mut data_payload = String::from("Hello_World_Pubky_Data");
+    let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
     initiator_encryptor
         .send_message(raw_bytes.clone(), initiator_link_id.unwrap())
@@ -1463,7 +1462,7 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
 
     assert!(results.len() >= 1);
     for ret in results {
-        let mut padded_msg = String::from_utf8(ret.to_vec());
+        let padded_msg = String::from_utf8(ret.to_vec());
         assert!(padded_msg.is_err());
     }
 
@@ -1651,7 +1650,7 @@ async fn pubky_data_snow_test_simple_backup() {
     assert!(responder_link_id.is_ok());
 
     // Transport
-    let mut data_payload = String::from("Hello_World_Pubky_Data");
+    let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
     let initiator_link_id = initiator_link_id.unwrap();
@@ -1666,7 +1665,7 @@ async fn pubky_data_snow_test_simple_backup() {
     assert!(results.len() >= 1);
     for ret in results {
         //println!("raw bytes to check ciphering {:?}", ret);
-        let mut padded_msg = String::from_utf8(ret.to_vec()).unwrap();
+        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
         assert_eq!(msg, "Hello_World_Pubky_Data".to_string());
     }

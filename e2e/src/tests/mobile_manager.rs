@@ -1,15 +1,12 @@
-use pubky_data::mobile_manager::MobileConfig;
-use pubky_data::mobile_manager::NoiseManager;
 
 use pubky_testnet::{
-    pubky::{errors::RequestError, Error, IntoPubkyResource, Keypair, Method, StatusCode},
-    pubky_homeserver::MockDataDir,
-    EphemeralTestnet, Testnet,
+    pubky::Keypair,
+    EphemeralTestnet,
 };
 
 #[tokio::test]
 async fn pubky_data_mobile_manager_dual_outbox_simple_test() {
-    let mut testnet = EphemeralTestnet::start().await.unwrap();
+    let testnet = EphemeralTestnet::start().await.unwrap();
     let server = testnet.homeserver_app();
     let alice_pubky = testnet.sdk().unwrap();
 
