@@ -218,7 +218,7 @@ pub struct DataLinkContext {
     endpoint_pubkey: PublicKey,
 
     counter: u32,
-    //TODO: add context creation date ? 
+    //TODO: add context creation date ?
     //TODO: already there for identity binding
     #[allow(dead_code)]
     local_pkarr_pubkey: Option<PublicKey>,
@@ -353,7 +353,7 @@ impl DataLinkContext {
             buf[0..32].copy_from_slice(&hash[0..32]);
             return Some(buf);
         }
-	None
+        None
     }
 
     pub fn to_transport(&mut self) -> Result<(), ContextError> {
