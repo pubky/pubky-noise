@@ -1,15 +1,7 @@
-use pubky_testnet::{
-    pubky::Keypair,
-    pubky_homeserver::MockDataDir,
-    EphemeralTestnet, Testnet,
-};
+use pubky_testnet::{pubky::Keypair, EphemeralTestnet};
 
 use pubky_data::snow_crypto::{HandshakePattern, PUBKY_DATA_MSG_LEN};
-use pubky_data::{
-    LinkId, PubkyDataEncryptor, PubkyDataError, PubkyKeySet,
-    TemporaryLinkId,
-};
-
+use pubky_data::{LinkId, PubkyDataEncryptor, PubkyDataError, PubkyKeySet, TemporaryLinkId};
 
 //TODO:
 //	- test max message size limit
@@ -197,15 +189,11 @@ async fn pubky_data_snow_test_initiator_first() {
 #[tokio::test]
 async fn pubky_data_snow_test_responder_first() {
     // Start a test homeserver with 1 MB user data limit
-    let mut testnet = Testnet::new().await.unwrap();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
-    let mock_dir = MockDataDir::test();
-    let server = testnet
-        .create_homeserver_app_with_mock(mock_dir)
-        .await
-        .unwrap();
+    let server = testnet.homeserver_app();
 
     let initiator_signer = initiator_pubky.signer(Keypair::random());
     let initiator_session = initiator_signer
@@ -345,15 +333,11 @@ async fn pubky_data_snow_test_responder_first() {
 #[tokio::test]
 async fn pubky_data_snow_test_responder_tampering() {
     // Start a test homeserver with 1 MB user data limit
-    let mut testnet = Testnet::new().await.unwrap();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
-    let mock_dir = MockDataDir::test();
-    let server = testnet
-        .create_homeserver_app_with_mock(mock_dir)
-        .await
-        .unwrap();
+    let server = testnet.homeserver_app();
 
     let initiator_signer = initiator_pubky.signer(Keypair::random());
     let initiator_session = initiator_signer
@@ -481,15 +465,11 @@ async fn pubky_data_snow_test_responder_tampering() {
 #[tokio::test]
 async fn pubky_data_snow_test_initiator_tampering() {
     // Start a test homeserver with 1 MB user data limit
-    let mut testnet = Testnet::new().await.unwrap();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
-    let mock_dir = MockDataDir::test();
-    let server = testnet
-        .create_homeserver_app_with_mock(mock_dir)
-        .await
-        .unwrap();
+    let server = testnet.homeserver_app();
 
     let initiator_signer = initiator_pubky.signer(Keypair::random());
     let initiator_session = initiator_signer
@@ -618,15 +598,11 @@ async fn pubky_data_snow_test_initiator_tampering() {
 #[tokio::test]
 async fn pubky_data_snow_null_message() {
     // Start a test homeserver with 1 MB user data limit
-    let mut testnet = Testnet::new().await.unwrap();
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
-    let mock_dir = MockDataDir::test();
-    let server = testnet
-        .create_homeserver_app_with_mock(mock_dir)
-        .await
-        .unwrap();
+    let server = testnet.homeserver_app();
 
     let initiator_signer = initiator_pubky.signer(Keypair::random());
     let initiator_session = initiator_signer
