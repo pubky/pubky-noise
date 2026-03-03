@@ -5,12 +5,10 @@ version = "0.6.0-rc.6"
 publish = false
 
 [dependencies]
-pubky-testnet = { path = "../../pubky-core/pubky-testnet" }
-pubky-common = { path = "../../pubky-core/pubky-common" }
+pubky-testnet = { version = "0.6.0" }
 pubky-data = { path = "../pubky-data" }
 tokio = { version = "1.47.1", features = ["full", "test-util"] }
 tracing-subscriber = "0.3.20"
-pkarr = { workspace = true }
 bytes = "1.10.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

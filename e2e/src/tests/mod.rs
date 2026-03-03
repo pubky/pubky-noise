@@ -1,2 +1,2 @@
-mod pubky_data;
 mod mobile_manager;
+mod pubky_data;

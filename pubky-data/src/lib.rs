@@ -209,7 +209,7 @@ impl PubkyDataEncryptor {
         outbox_client: Pubky,
         simulate_tampering: bool,
     ) -> Result<Self, PubkyDataError> {
-        let pubky_root_keypair = Keypair::from_secret_key(&pubky_root_seckey);
+        let pubky_root_keypair = Keypair::from_secret(&pubky_root_seckey);
         let handshake_contexts = HashMap::new();
         let transport_contexts = HashMap::new();
         let pair_context_id_to_link = HashMap::new();
@@ -351,7 +351,7 @@ impl PubkyDataEncryptor {
                         let path = self.destination_path.as_str();
                         let counter = data_link_context.get_counter();
                         println!("Reading at Slot {counter}");
-                        let formatted_path = format!("pubky{public_key}/{path}/{counter}");
+                        let formatted_path = format!("{public_key}/{path}/{counter}");
 
                         if let Ok(response) = self
                             .outbox_client
@@ -540,7 +540,7 @@ impl PubkyDataEncryptor {
             let counter = data_link_context.get_counter();
             println!("Reading at Slot {counter}");
             let public_key = data_link_context.get_endpoint();
-            let formatted_path = format!("pubky{public_key}/{path}/{counter}");
+            let formatted_path = format!("{public_key}/{path}/{counter}");
             if let Ok(response) = self
                 .outbox_client
                 .public_storage()

@@ -9,9 +9,7 @@ keywords = ["pubky", "noise"]
 categories = ["authentication", "encryption"]
 
 [dependencies]
-pkarr = { path = "../../pkarr/pkarr", features = ["full"] }
-pubky = { path = "../../pubky-core/pubky-sdk", version = "0.6.0-rc.6" }
-pubky-common = { path = "../../pubky-core/pubky-common", version = "0.6.0-rc.6" }
+pubky = { version = "0.6.0" }
 ed25519-dalek = { version = "2.1.1" }
 sha256 = { version = "1.6.0" }
 rust-crypto = { version = "0.2.36" }
