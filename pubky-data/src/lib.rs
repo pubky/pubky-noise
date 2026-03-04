@@ -136,6 +136,7 @@ pub enum PubkyDataError {
     /// the homeserver response is a failure
     HomeserverResponseError,
     NoiseContextNotFound,
+    ImpossibleHandshakeState,
     IsTransport,
     IsHandshake,
     OtherError,
@@ -146,6 +147,12 @@ enum LinkIdentifier {
     Temporary(TemporaryLinkId),
     #[allow(dead_code)]
     Set(LinkId),
+}
+
+#[derive(Eq, Hash, PartialEq, Debug)]
+pub enum HandshakeResult {
+    Pending,
+    Terminal,
 }
 
 #[derive(Debug)]
@@ -338,7 +345,7 @@ impl PubkyDataEncryptor {
         initiate: bool,
         tmp_link_id: TemporaryLinkId,
         public_key: PublicKey,
-    ) -> Result<bool, PubkyDataError> {
+    ) -> Result<HandshakeResult, PubkyDataError> {
         println!("IN HANDLE HANDSHAKE");
 
         if let Some(data_link_context) = self.handshake_contexts.get_mut(&tmp_link_id) {
@@ -412,17 +419,17 @@ impl PubkyDataEncryptor {
                     }
                     HandshakeAction::Pending => {
                         // we return responsibility processing to network runtime
-                        break;
+                        return Ok(HandshakeResult::Pending);
                     }
                     HandshakeAction::Terminal => {
-                        break;
+                        return Ok(HandshakeResult::Terminal);
                     }
                 }
             }
+            return Err(PubkyDataError::ImpossibleHandshakeState);
         } else {
             return Err(PubkyDataError::NoiseContextNotFound);
         }
-        Ok(true)
     }
 
     /// Transition a data link context from the Noise Handshake phase to the Transport phase.
