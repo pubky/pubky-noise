@@ -329,29 +329,31 @@ impl PubkyDataEncryptor {
     /// Handle the forwarding and processing of newer Noise handshake messages for a data link.
     ///
     /// Use this method to advance forward the status of the data link undergoing a handshake
-    /// with a remote peer. This method might have to be called numerous times until the handshake
-    /// is over for the specifically initialized Noise pattern, i.e as long as `is_handshake()` keeps
-    /// yielding a `true` Result.
+    /// with a remote peer. This method is **polling-safe**: it can be called repeatedly by either
+    /// the initiator or responder in any order. If the peer's message is not yet available, the
+    /// method returns `HandshakeResult::Pending` without advancing internal state, so the caller
+    /// can safely retry.
+    ///
+    /// The initiator/responder role is determined by the `initiator` flag stored in the
+    /// `DataLinkContext` at `init_context` time — callers no longer need to pass it.
     ///
     /// # Parameters:
-    ///      - `initiate`: A boolean flag if the local application is the Noise handshake initator or not.
     ///      - `context_id`: The opaque unique identifier of the data link context.
-    ///      - `public_key`: A remote peer ed25519 public key to be used as a suffix in the path to the sharing endpoiint.
+    ///      - `public_key`: A remote peer ed25519 public key to be used as a suffix in the path to the sharing endpoint.
     ///
     /// # Errors:
     ///      - Returns [`PubkyDataError::NoiseContextNotFound`] if the stack does not know this context.
     pub async fn handle_handshake(
         &mut self,
-        initiate: bool,
         tmp_link_id: TemporaryLinkId,
         public_key: PublicKey,
     ) -> Result<HandshakeResult, PubkyDataError> {
         println!("IN HANDLE HANDSHAKE");
 
         if let Some(data_link_context) = self.handshake_contexts.get_mut(&tmp_link_id) {
-            let steps_to_be_done = data_link_context.handshake_steps(initiate);
-            for step in steps_to_be_done {
-                match step {
+            let remaining_actions = data_link_context.remaining_handshake_actions();
+            for action in remaining_actions {
+                match action {
                     HandshakeAction::Read => {
                         //TODO: what if more to read: Vec<u8> should be size bounded
                         println!("Handshake Read");
@@ -386,12 +388,19 @@ impl PubkyDataEncryptor {
                                         &mut payload,
                                         len as usize,
                                     );
-                                    // we do not care about the result as we shouldn't get plaintext during
+                                    // we do not care about the result as we shouldn't get plaintext during handshake
                                 } else {
                                     return Err(PubkyDataError::HomeserverResponseError);
                                 }
                                 data_link_context.increment_counter();
+                                data_link_context.advance_sub_step();
+                            } else {
+                                // Peer hasn't written yet — return Pending without advancing state
+                                return Ok(HandshakeResult::Pending);
                             }
+                        } else {
+                            // Network error or peer data not available — return Pending to allow retry
+                            return Ok(HandshakeResult::Pending);
                         }
                         //TODO: make a single message buffer + tag
                     }
@@ -415,18 +424,25 @@ impl PubkyDataEncryptor {
                                 .put(formatted_path, packet.to_vec())
                                 .await;
                             data_link_context.increment_counter();
+                            data_link_context.advance_sub_step();
                         }
                     }
                     HandshakeAction::Pending => {
-                        // we return responsibility processing to network runtime
+                        // Advance past the Pending marker, complete the step, and return
+                        data_link_context.advance_sub_step();
+                        data_link_context.complete_step();
                         return Ok(HandshakeResult::Pending);
                     }
                     HandshakeAction::Terminal => {
+                        data_link_context.complete_step();
                         return Ok(HandshakeResult::Terminal);
                     }
                 }
             }
-            return Err(PubkyDataError::ImpossibleHandshakeState);
+            // All actions in the current step completed without hitting Pending/Terminal.
+            // Complete the step and return Pending so the caller re-polls for the next step.
+            data_link_context.complete_step();
+            return Ok(HandshakeResult::Pending);
         } else {
             return Err(PubkyDataError::NoiseContextNotFound);
         }

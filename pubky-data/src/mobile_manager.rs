@@ -242,7 +242,6 @@ impl NoiseManager {
                     .is_ok()
                 {
                     pubky_encryptor_lock.handle_handshake(
-                        true,
                         *init_ret.as_ref().unwrap(),
                         path_pubkey.clone(),
                     );
@@ -304,7 +303,6 @@ impl NoiseManager {
                     .is_ok()
                 {
                     pubky_encryptor_lock.handle_handshake(
-                        true,
                         *init_ret.as_ref().unwrap(),
                         path_pubkey.clone(),
                     );
