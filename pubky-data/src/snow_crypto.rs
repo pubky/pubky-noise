@@ -448,11 +448,10 @@ impl DataLinkContext {
                 .as_mut()
                 .unwrap()
                 .write_message(&payload, message.as_mut());
-            if result.is_err() {
-                panic!("NOISE WRITE FAILED {result:?}");
-            }
-            ret = result.unwrap();
-            println!("HANDLE WRITE RET {ret:?}");
+	    match result {
+		Ok(write_size) => { return Ok(write_size); },
+		Err(e) => { return Err(ContextError::InternalSnowWriteErr); },
+	    }
         } else if self.noise_phase == NoisePhase::Transport {
             println!("WRITE TRANSPORT");
             println!(
@@ -465,11 +464,10 @@ impl DataLinkContext {
                 .as_mut()
                 .unwrap()
                 .write_message(&payload, message.as_mut());
-            if result.is_err() {
-                panic!("NOISE WRITE FAILED {result:?}");
-            }
-            ret = result.unwrap();
-            println!("HANDLE WRITE RET {ret:?}");
+	    match result {
+		Ok(write_size) => { return Ok(write_size); },
+		Err(e) => { return Err(ContextError::InternalSnowWriteErr); },
+	    }
         }
 
         Ok(ret)
@@ -499,7 +497,10 @@ impl DataLinkContext {
                 .as_mut()
                 .unwrap()
                 .read_message(&message[..index], payload);
-            println!("HANDLE READ RET {ret:?}");
+	    match ret {
+		Ok(_) => { return Ok(()); },
+		Err(e) => { return Err(ContextError::InternalSnowReadErr); },
+	    }
         } else if self.noise_phase == NoisePhase::Transport {
             println!("READ TRANSPORT");
             let ret = self
@@ -507,7 +508,10 @@ impl DataLinkContext {
                 .as_mut()
                 .unwrap()
                 .read_message(&message[..index], payload);
-            println!("HANDLE READ RET {ret:?}");
+	    match ret {
+		Ok(_) => { return Ok(()); },
+		Err(e) => { return Err(ContextError::InternalSnowReadErr); },
+	    }
         }
 
         Ok(())
