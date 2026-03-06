@@ -218,6 +218,12 @@ pub struct DataLinkContext {
     endpoint_pubkey: PublicKey,
 
     counter: u32,
+
+    // Tracks progress within the current step's action list for polling-safe handshake.
+    // When a Read fails (peer hasn't written yet), we return Pending without advancing
+    // sub_step_index, so the next poll retries from the same action.
+    sub_step_index: usize,
+
     //TODO: add context creation date ?
     //TODO: already there for identity binding
     #[allow(dead_code)]
@@ -314,6 +320,8 @@ impl DataLinkContext {
 
             counter: 0,
 
+            sub_step_index: 0,
+
             local_pkarr_pubkey,
         })
     }
@@ -385,23 +393,35 @@ impl DataLinkContext {
         Err(ContextError::InternalSnowTransitionErr)
     }
 
-    pub fn handshake_steps(&mut self, initiator: bool) -> Vec<HandshakeAction> {
-        //TODO: write resolve pattern
+    /// Returns the remaining actions for the current step, starting from sub_step_index.
+    /// Uses the stored `initiator` flag — callers no longer need to pass it.
+    /// Does NOT advance noise_step — call `complete_step()` for that.
+    pub fn remaining_handshake_actions(&self) -> Vec<HandshakeAction> {
         assert!(
             self.message_patterns == HandshakePattern::PatternNN
                 || self.message_patterns == HandshakePattern::PatternXX
         );
-        let steps_to_be_done = match self.message_patterns {
-            HandshakePattern::PatternNN => resolve_pattern_nn(self.noise_step, initiator),
-            HandshakePattern::PatternXX => resolve_pattern_xx(self.noise_step, initiator),
-            HandshakePattern::PatternIK => resolve_pattern_ik(self.noise_step, initiator),
-            HandshakePattern::PatternNK => resolve_pattern_nk(self.noise_step, initiator),
+        let all_actions = match self.message_patterns {
+            HandshakePattern::PatternNN => resolve_pattern_nn(self.noise_step, self.initiator),
+            HandshakePattern::PatternXX => resolve_pattern_xx(self.noise_step, self.initiator),
+            HandshakePattern::PatternIK => resolve_pattern_ik(self.noise_step, self.initiator),
+            HandshakePattern::PatternNK => resolve_pattern_nk(self.noise_step, self.initiator),
             _ => {
                 panic!("unsupported handshake pattern for resolution");
             }
         };
+        all_actions.into_iter().skip(self.sub_step_index).collect()
+    }
+
+    /// Mark one sub-step action as completed, advancing the sub-step index.
+    pub fn advance_sub_step(&mut self) {
+        self.sub_step_index += 1;
+    }
+
+    /// Complete the current step and move to the next one, resetting sub-step index.
+    pub fn complete_step(&mut self) {
         self.noise_step = self.noise_step.next_step();
-        steps_to_be_done
+        self.sub_step_index = 0;
     }
 
     pub fn write_act(
