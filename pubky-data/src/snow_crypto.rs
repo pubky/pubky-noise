@@ -38,32 +38,123 @@ pub enum HandshakeAction {
     Terminal,
 }
 
+/// The source properties are:
+///
+/// 0. **No authentication**. This payload may have been sent by any party, including an active attacker.
+///
+/// 1. **Sender authentication vulnerable to key-compromise impersonation (KCI)**. The sender authentication
+/// is based on a static-static DH ("ss") involving both parties' static key pairs. If the recipient's
+/// long-term private key has been compromised, this authentication can be forged. Note that a future
+/// version of Noise might include signatures, which could improve this security property, but brings
+/// other trade-offs.
+///
+/// 2. **Sender authentication resistant to key-compromise impersonation (KCI)**. The sender authentication
+/// is based on an ephemeral-static DH ("es" or "se") between the sender's static key pair and the recipient's
+/// ephemeral key pair. Assuming the corresponding private keys are secure, this authentication cannot be
+/// forged.
+///
+/// The destination properties are:
+///
+/// 0. **No confidentiality**. This payload is sent in cleartext.
+///
+/// 1. **Encryption to an ephemeral recipient**. This payload has forward secrecy, since encryption involves
+/// an ephemeral-ephemeral DH ("ee"). However, the sender has not authenticated the recipient, so this payload
+/// might be sent to any party, including an active attacker.
+///
+/// 2. **Encryption to a known recipient, forward secrecy for sender compromise only, vulnerable to replay**.
+/// This payload is encrypted based only on DHs involving the recipient's static key pair. If the recipient's
+/// static private key is compromised, even at a later date, this payload can be decrypted. This message can
+/// also be replayed, since there's no ephemeral contribution from the recipient.
+///
+/// 3. **Encryption to a known recipient, weak forward secrecy**. This payload is encrypted based on an
+/// ephemeral-ephemeral DH and also an ephemeral-static DH involving the recipient's static key pair. However,
+/// the binding between the recipient's alleged ephemeral public key and the recipient's static public key
+/// hasn't been verified by the sender, so the recipient's alleged ephemeral public key may have been forged
+/// by an active attacker. In this case, the attacker could later compromise the recipient's static private
+/// key to decrypt the payload. Note that a future version of Noise might include signatures, which could
+/// improve this security property, but brings other trade-offs.
+///
+/// 4. **Encryption to a known recipient, weak forward secrecy if the sender's private key has been compromised**.
+/// This payload is encrypted based on an ephemeral-ephemeral DH, and also based on an ephemeral-static DH
+/// involving the recipient's static key pair. However, the binding between the recipient's alleged ephemeral
+/// public and the recipient's static public key has only been verified based on DHs involving both those public
+/// keys and the sender's static private key. Thus, if the sender's static private key was previously compromised,
+/// the recipient's alleged ephemeral public key may have been forged by an active attacker. In this case, the
+/// attacker could later compromise the intended recipient's static private key to decrypt the payload (this is
+/// a variant of a "KCI" attack enabling a "weak forward secrecy" attack). Note that a future version of Noise
+/// might include signatures, which could improve this security property, but brings other trade-offs.
+///
+/// 5. **Encryption to a known recipient, strong forward secrecy**. This payload is encrypted based on an
+/// ephemeral-ephemeral DH as well as an ephemeral-static DH with the recipient's static key pair. Assuming
+/// the ephemeral private keys are secure, and the recipient is not being actively impersonated by an attacker
+/// that has stolen its static private key, this payload cannot be decrypted.
 #[derive(PartialEq, Copy, Clone, Debug)]
 pub enum HandshakePattern {
-    /// <- s
+    /// <- s                      0                0
     /// ...
-    /// -> e, es
+    /// -> e, es                  0                2
     PatternN,
-    /// -> e,
-    /// <- e, ee
+    /// -> e                      0                0
+    /// <- e, ee                  0                1
+    /// ->                        0                1
     PatternNN,
-    /// -> e
-    /// <- e, ee, s, es
-    /// -> s, se
+    /// -> e                      0                0
+    /// <- e, ee, s, es           2                1
+    /// -> s, se                  2                5
+    /// <-                        2                5
     PatternXX,
     /// <- s
     /// ...
-    /// -> e, es, s, ss
-    /// <- e, ee, se
-    /// ->
-    /// <-
+    /// -> e, es, s, ss           1                2
+    /// <- e, ee, se              2                4
+    /// ->                        2                5
+    /// <-                        2                5
     PatternIK,
     /// <- s
     /// ...
-    /// -> e, es
-    /// <- e, ee
-    /// ->
+    /// -> e, es                  0                2
+    /// <- e, ee                  2                1
+    /// ->                        0                5
     PatternNK,
+
+    // TODO ???:
+    //   -> s
+    //   <- s
+    //   ...
+    //   -> e, es, ss              1                2
+    //   <- e, ee, se              2                4
+    //   ->                        2                5
+    //   <-                        2                5
+    // KK
+    //
+    //   -> s
+    //   ...
+    //   -> e                      0                0
+    //   <- e, ee, se, s, es       2                3
+    //   ->                        2                5
+    //   <-                        2                5
+    // KX
+    //
+    //   -> e, s                   0                0
+    //   <- e, ee, se              0                3
+    //   ->                        2                1
+    //   <-                        0                5
+    // IN
+    //
+    //   <- s
+    //   ...
+    //   -> e, es, s, ss           1                2
+    //   <- e, ee, se              2                4
+    //   ->                        2                5
+    //   <-                        2                5
+    // IK
+    //
+    //   -> e, s                   0                0
+    //   <- e, ee, se, s, es       2                3
+    //   ->                        2                5
+    //   <-                        2                5
+    // IX
+    //
     // test-only pattern to inject build fault
     TestOnlyPatternAA,
 }
