@@ -531,7 +531,7 @@ impl DataLinkContext {
         // For "es": Calls MixKey (DH(e, rs)) if initiator, MixKey(DH(s, re)
         // if responder.
         println!("SNOW WRITE {payload:?}");
-        let mut ret = 0;
+        let ret = 0;
         if self.noise_phase == NoisePhase::HandShake {
             //TODO: determinate_transition()
             let result = self
@@ -543,7 +543,7 @@ impl DataLinkContext {
                 Ok(write_size) => {
                     return Ok(write_size);
                 }
-                Err(e) => {
+                Err(_e) => {
                     return Err(ContextError::InternalSnowWriteErr);
                 }
             }
@@ -563,7 +563,7 @@ impl DataLinkContext {
                 Ok(write_size) => {
                     return Ok(write_size);
                 }
-                Err(e) => {
+                Err(_e) => {
                     return Err(ContextError::InternalSnowWriteErr);
                 }
             }
@@ -600,7 +600,7 @@ impl DataLinkContext {
                 Ok(_) => {
                     return Ok(());
                 }
-                Err(e) => {
+                Err(_e) => {
                     return Err(ContextError::InternalSnowReadErr);
                 }
             }
@@ -615,7 +615,7 @@ impl DataLinkContext {
                 Ok(_) => {
                     return Ok(());
                 }
-                Err(e) => {
+                Err(_e) => {
                     return Err(ContextError::InternalSnowReadErr);
                 }
             }

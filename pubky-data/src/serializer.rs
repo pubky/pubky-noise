@@ -9,6 +9,12 @@ pub struct PubkyDataBackupFormatter {
     //TODO: signature
 }
 
+impl Default for PubkyDataBackupFormatter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PubkyDataBackupFormatter {
     pub fn new() -> Self {
         PubkyDataBackupFormatter {
@@ -25,7 +31,7 @@ impl PubkyDataBackupFormatter {
         buffer.push(self.pubky_data_version);
         buffer.push(self.serial_id);
         buffer.push(self.reserved_field);
-        return buffer;
+        buffer
     }
 
     pub fn deserialize(mut raw_bytes: Vec<u8>) -> Result<Self, ()> {

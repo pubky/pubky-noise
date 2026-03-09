@@ -30,15 +30,15 @@ fn cipher_check(plaintext: Vec<u8>, ciphertext: &[u8; PUBKY_DATA_MSG_LEN + 2]) {
 #[tokio::test]
 #[should_panic]
 async fn pubky_data_cipher_check_utility_positive() {
-    let plaintext = ['A' as u8; PUBKY_DATA_MSG_LEN + 2];
-    let ciphertext = plaintext.clone();
+    let plaintext = [b'A'; PUBKY_DATA_MSG_LEN + 2];
+    let ciphertext = plaintext;
     cipher_check(plaintext.to_vec(), &ciphertext);
 }
 
 #[tokio::test]
 async fn pubky_data_cipher_check_utility_negative() {
-    let plaintext = ['A' as u8; PUBKY_DATA_MSG_LEN + 2];
-    let mut ciphertext = plaintext.clone();
+    let plaintext = [b'A'; PUBKY_DATA_MSG_LEN + 2];
+    let mut ciphertext = plaintext;
     ciphertext[0] = b'B';
     cipher_check(plaintext.to_vec(), &ciphertext);
 }
@@ -64,7 +64,7 @@ async fn pubky_data_snow_test_initiator_first() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -115,12 +115,12 @@ async fn pubky_data_snow_test_initiator_first() {
     // Initiator sends handshake
     // -> e
     // <- e, ee
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
 
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
     let initiator_link_id = initiator_encryptor.transition_transport();
     assert!(initiator_link_id.is_ok());
@@ -135,11 +135,11 @@ async fn pubky_data_snow_test_initiator_first() {
 
     let results = responder_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello_World_Pubky_Data".to_string());
+        assert_eq!(msg, "Hello_World_Pubky_Data");
     }
 
     let data_payload = String::from("Pubky_Data_Rocks");
@@ -148,11 +148,11 @@ async fn pubky_data_snow_test_initiator_first() {
 
     let results = initiator_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Pubky_Data_Rocks".to_string());
+        assert_eq!(msg, "Pubky_Data_Rocks");
     }
 }
 
@@ -177,7 +177,7 @@ async fn pubky_data_snow_test_responder_first() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -228,17 +228,17 @@ async fn pubky_data_snow_test_responder_first() {
     // Initiator sends handshake
     // -> e
     // <- e, ee
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
 
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     // Transport
     let data_payload = String::from("Hello World Pubky Data");
@@ -248,11 +248,11 @@ async fn pubky_data_snow_test_responder_first() {
 
     let results = initiator_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello World Pubky Data".to_string());
+        assert_eq!(msg, "Hello World Pubky Data");
     }
 
     let data_payload = String::from("Pubky Data Rocks");
@@ -262,11 +262,11 @@ async fn pubky_data_snow_test_responder_first() {
 
     let results = responder_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Pubky Data Rocks".to_string());
+        assert_eq!(msg, "Pubky Data Rocks");
     }
 }
 
@@ -291,7 +291,7 @@ async fn pubky_data_snow_test_responder_tampering() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -344,17 +344,17 @@ async fn pubky_data_snow_test_responder_tampering() {
     // Initiator sends handshake
     // -> e
     // <- e, ee
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
 
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     // Transport
     let data_payload = String::from("Hello World Pubky Data");
@@ -364,17 +364,17 @@ async fn pubky_data_snow_test_responder_tampering() {
 
     let results = initiator_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec());
         assert!(padded_msg.is_err());
     }
 
     let last_ciphertext = responder_encryptor.test_last_ciphertext();
-    if last_ciphertext.is_none() {
-        panic!();
+    if let Some(ct) = last_ciphertext {
+        cipher_check(raw_bytes, &ct);
     } else {
-        cipher_check(raw_bytes, &last_ciphertext.unwrap());
+        panic!();
     }
 }
 
@@ -399,7 +399,7 @@ async fn pubky_data_snow_test_initiator_tampering() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -452,18 +452,18 @@ async fn pubky_data_snow_test_initiator_tampering() {
     // Initiator sends handshake
     // -> e
     // <- e, ee
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
 
     // yield Err(PubkyDataError::IsTransport)
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     // Transport
     let data_payload = String::from("Hello World Pubky Data");
@@ -473,17 +473,17 @@ async fn pubky_data_snow_test_initiator_tampering() {
 
     let results = responder_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec());
         assert!(padded_msg.is_err());
     }
 
     let last_ciphertext = initiator_encryptor.test_last_ciphertext();
-    if last_ciphertext.is_none() {
-        panic!();
+    if let Some(ct) = last_ciphertext {
+        cipher_check(raw_bytes, &ct);
     } else {
-        cipher_check(raw_bytes, &last_ciphertext.unwrap());
+        panic!();
     }
 }
 
@@ -508,7 +508,7 @@ async fn pubky_data_snow_null_message() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -559,18 +559,18 @@ async fn pubky_data_snow_null_message() {
     // Initiator sends handshake
     // -> e
     // <- e, ee
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
 
     // yield Err(PubkyDataError::IsTransport)
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     // Transport
     let data_payload = String::from("");
@@ -579,11 +579,11 @@ async fn pubky_data_snow_null_message() {
 
     let results = initiator_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "".to_string());
+        assert_eq!(msg, "");
     }
 }
 
@@ -600,7 +600,7 @@ async fn pubky_data_snow_test_unknown_pattern() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let init_config_ret = PubkyDataConfig::new(
@@ -634,7 +634,7 @@ async fn pubky_data_snow_test_snow_noise_build_error() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     // Create config with NN pattern, then override to TestOnlyPatternAA
@@ -686,7 +686,7 @@ async fn pubky_data_snow_test_cleaning_sequence() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -737,17 +737,17 @@ async fn pubky_data_snow_test_cleaning_sequence() {
     // Initiator sends handshake
     // -> e
     // <- e, ee
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
 
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     // Transport
     let data_payload = String::from("Hello_World_Pubky_Data");
@@ -757,11 +757,11 @@ async fn pubky_data_snow_test_cleaning_sequence() {
 
     let results = responder_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello_World_Pubky_Data".to_string());
+        assert_eq!(msg, "Hello_World_Pubky_Data");
     }
 
     // Close both encryptors
@@ -770,6 +770,7 @@ async fn pubky_data_snow_test_cleaning_sequence() {
 }
 
 #[tokio::test]
+#[allow(non_snake_case)]
 async fn pubky_data_snow_test_XX_pattern_simple() {
     let testnet = EphemeralTestnet::builder().build().await.unwrap();
     let server = testnet.homeserver_app();
@@ -788,7 +789,7 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -840,18 +841,18 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
     // -> e
     // <- e, ee, s, es
     // -> s, se
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
 
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     // Transport
     let data_payload = String::from("Hello_World_Pubky_Data");
@@ -860,11 +861,11 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
 
     let results = responder_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello_World_Pubky_Data".to_string());
+        assert_eq!(msg, "Hello_World_Pubky_Data");
     }
 
     // ===== Verify what's actually stored on the homeserver using pubky SDK =====
@@ -1023,6 +1024,7 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
 }
 
 #[tokio::test]
+#[allow(non_snake_case)]
 async fn pubky_data_snow_test_XX_pattern_tampering() {
     let testnet = EphemeralTestnet::builder().build().await.unwrap();
     let server = testnet.homeserver_app();
@@ -1041,7 +1043,7 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -1095,18 +1097,18 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
     // -> e
     // <- e, ee, s, es
     // -> s, se
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
 
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     // Transport
     let data_payload = String::from("Hello_World_Pubky_Data");
@@ -1115,17 +1117,17 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
 
     let results = responder_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec());
         assert!(padded_msg.is_err());
     }
 
     let last_ciphertext = initiator_encryptor.test_last_ciphertext();
-    if last_ciphertext.is_none() {
-        panic!();
+    if let Some(ct) = last_ciphertext {
+        cipher_check(raw_bytes, &ct);
     } else {
-        cipher_check(raw_bytes, &last_ciphertext.unwrap());
+        panic!();
     }
 }
 
@@ -1148,7 +1150,7 @@ async fn pubky_data_snow_test_simple_backup() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -1200,18 +1202,18 @@ async fn pubky_data_snow_test_simple_backup() {
     // -> e
     // <- e, ee, s, es
     // -> s, se
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
 
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     // Transport
     let data_payload = String::from("Hello_World_Pubky_Data");
@@ -1221,14 +1223,14 @@ async fn pubky_data_snow_test_simple_backup() {
 
     let results = responder_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello_World_Pubky_Data".to_string());
+        assert_eq!(msg, "Hello_World_Pubky_Data");
     }
 
-    initiator_encryptor.generate_backup(false).await;
+    let _ = initiator_encryptor.generate_backup(false).await;
 }
 
 #[tokio::test]
@@ -1252,7 +1254,7 @@ async fn pubky_data_snow_test_dual_outbox() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -1303,18 +1305,18 @@ async fn pubky_data_snow_test_dual_outbox() {
     // Initiator sends handshake
     // -> e
     // <- e, ee
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
 
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     //TODO: Alice can write only to her own Homeserver but can read from own
     // and Bob's Homeserver.
@@ -1344,7 +1346,7 @@ async fn pubky_data_snow_test_identity_commitment() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -1395,18 +1397,18 @@ async fn pubky_data_snow_test_identity_commitment() {
     // Initiator sends handshake
     // -> e
     // <- e, ee
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
 
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     //TODO: initiator receive_message -> identity binding
     //TODO: responder receive_message -> identity binding
@@ -1418,6 +1420,7 @@ async fn pubky_data_snow_test_identifers() {
 }
 
 #[tokio::test]
+#[allow(non_snake_case)]
 async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
     let testnet = EphemeralTestnet::builder().build().await.unwrap();
     let server = testnet.homeserver_app();
@@ -1436,7 +1439,7 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -1488,22 +1491,22 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
     // -> e
     // <- e, ee, s, es
     // -> s, se
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
 
-    assert!(!initiator_encryptor.is_handshake().is_ok());
-    assert!(!responder_encryptor.is_handshake().is_ok());
+    assert!(initiator_encryptor.is_handshake().is_err());
+    assert!(responder_encryptor.is_handshake().is_err());
 
-    let _initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(_initiator_link_id.is_ok());
-    let _responder_link_id = responder_encryptor.transition_transport();
-    assert!(_responder_link_id.is_ok());
+    let initiator_link_id = initiator_encryptor.transition_transport();
+    assert!(initiator_link_id.is_ok());
+    let responder_link_id = responder_encryptor.transition_transport();
+    assert!(responder_link_id.is_ok());
 
     // Transport
     let data_payload = String::from("Hello_World_Pubky_Data");
@@ -1512,11 +1515,11 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
 
     let results = responder_encryptor.receive_message().await;
 
-    assert!(results.len() >= 1);
+    assert!(!results.is_empty());
     for ret in results {
         let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
         let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello_World_Pubky_Data".to_string());
+        assert_eq!(msg, "Hello_World_Pubky_Data");
     }
 
     // ===== Verify what's actually stored on the homeserver using pubky SDK =====
@@ -1675,6 +1678,7 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
 }
 
 #[tokio::test]
+#[allow(non_snake_case)]
 async fn pubky_data_snow_test_XX_pattern_simple_incomplete_handshake() {
     let testnet = EphemeralTestnet::builder().build().await.unwrap();
     let server = testnet.homeserver_app();
@@ -1693,7 +1697,7 @@ async fn pubky_data_snow_test_XX_pattern_simple_incomplete_handshake() {
         .await
         .unwrap();
 
-    let server_path_string = format!("/pub/data");
+    let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
     let initiator_config = PubkyDataConfig::new(
@@ -1745,15 +1749,15 @@ async fn pubky_data_snow_test_XX_pattern_simple_incomplete_handshake() {
     // -> e
     // <- e, ee, s, es
     // -> s, se  (NOT DONE)
-    initiator_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
-    responder_encryptor.handle_handshake().await;
+    let _ = initiator_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
+    let _ = responder_encryptor.handle_handshake().await;
 
     assert!(initiator_encryptor.is_handshake().is_ok());
     assert!(responder_encryptor.is_handshake().is_ok());
 
     let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(!initiator_link_id.is_ok());
+    assert!(initiator_link_id.is_err());
     let responder_link_id = responder_encryptor.transition_transport();
-    assert!(!responder_link_id.is_ok());
+    assert!(responder_link_id.is_err());
 }
