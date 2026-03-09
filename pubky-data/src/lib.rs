@@ -1,4 +1,5 @@
 pub mod identity_payload;
+pub mod path_derivation;
 pub mod serializer;
 pub mod snow_crypto;
 
@@ -38,26 +39,44 @@ pub enum HandshakeResult {
 ///
 /// This struct holds the resources that are common across all Noise sessions for
 /// a given user: the HTTP client, the authenticated homeserver session, the
-/// destination path, and the root keypair. Wrap it in `Arc` and share it across
+/// write/read paths, and the root keypair. Wrap it in `Arc` and share it across
 /// multiple single-session encryptors.
+///
+/// ## Asymmetric paths
+///
+/// `write_path` is the folder prefix used when writing messages to the local
+/// homeserver. `read_path` is the folder prefix used when reading messages from
+/// the remote homeserver. For symmetric usage (same path for both), pass the
+/// same value to both fields via [`PubkyDataConfig::new`].
+///
+/// For per-peer-pair path privacy, use [`path_derivation::derive_asymmetric_paths`]
+/// to compute distinct write/read paths from a DH shared secret.
 pub struct PubkyDataConfig {
     pub outbox_client: Pubky,
     pub local_session: PubkySession,
-    pub destination_path: String,
+    /// Folder prefix for writing messages to the local homeserver.
+    pub write_path: String,
+    /// Folder prefix for reading messages from the remote homeserver.
+    pub read_path: String,
     pub pubky_root_keypair: Keypair,
     pub pubky_data_version: u32,
     pub default_pattern: HandshakePattern,
 }
 
 impl PubkyDataConfig {
-    /// Create a new shared configuration for Pubky Data encryptors.
+    /// Create a new shared configuration with a single symmetric path.
+    ///
+    /// This is a convenience constructor that uses the same path for both
+    /// reading and writing. For per-peer-pair path privacy, use
+    /// [`PubkyDataConfig::new_with_paths`] instead.
     ///
     /// # Parameters:
     ///      - `pubky_root_seckey`: A 32-byte root secret key.
     ///      - `pubky_data_version`: Protocol version identifier.
     ///      - `pattern_string`: Default Noise pattern (e.g. "NN", "XX").
     ///      - `homeserver_auth_session`: An authenticated PubkySession.
-    ///      - `destination_path`: Custom destination prefix for message sharing.
+    ///      - `destination_path`: Custom destination prefix for message sharing
+    ///        (used for both reads and writes).
     ///      - `outbox_client`: HTTP Pubky client.
     ///
     /// # Errors:
@@ -70,6 +89,43 @@ impl PubkyDataConfig {
         destination_path: String,
         outbox_client: Pubky,
     ) -> Result<Arc<Self>, PubkyDataError> {
+        Self::new_with_paths(
+            pubky_root_seckey,
+            pubky_data_version,
+            pattern_string,
+            homeserver_auth_session,
+            destination_path.clone(),
+            destination_path,
+            outbox_client,
+        )
+    }
+
+    /// Create a new shared configuration with separate write and read paths.
+    ///
+    /// Use this constructor when the local party writes to a different path
+    /// than it reads from (e.g., when using
+    /// [`path_derivation::derive_asymmetric_paths`] for per-peer-pair privacy).
+    ///
+    /// # Parameters:
+    ///      - `pubky_root_seckey`: A 32-byte root secret key.
+    ///      - `pubky_data_version`: Protocol version identifier.
+    ///      - `pattern_string`: Default Noise pattern (e.g. "NN", "XX").
+    ///      - `homeserver_auth_session`: An authenticated PubkySession.
+    ///      - `write_path`: Folder prefix for writing messages to the local homeserver.
+    ///      - `read_path`: Folder prefix for reading messages from the remote homeserver.
+    ///      - `outbox_client`: HTTP Pubky client.
+    ///
+    /// # Errors:
+    ///      - Returns [`PubkyDataError::UnknownNoisePattern`] if the pattern string is invalid.
+    pub fn new_with_paths(
+        pubky_root_seckey: [u8; 32],
+        pubky_data_version: u32,
+        pattern_string: String,
+        homeserver_auth_session: PubkySession,
+        write_path: String,
+        read_path: String,
+        outbox_client: Pubky,
+    ) -> Result<Arc<Self>, PubkyDataError> {
         let pubky_root_keypair = Keypair::from_secret(&pubky_root_seckey);
         let default_pattern = HandshakePattern::from_string(pattern_string)
             .map_err(|_| PubkyDataError::UnknownNoisePattern)?;
@@ -77,7 +133,8 @@ impl PubkyDataConfig {
         Ok(Arc::new(PubkyDataConfig {
             outbox_client,
             local_session: homeserver_auth_session,
-            destination_path,
+            write_path,
+            read_path,
             pubky_root_keypair,
             pubky_data_version,
             default_pattern,
@@ -170,7 +227,7 @@ impl PubkyDataEncryptor {
             match action {
                 HandshakeAction::Read => {
                     println!("Handshake Read");
-                    let path = self.config.destination_path.as_str();
+                    let path = self.config.read_path.as_str();
                     let counter = self.context.get_counter();
                     println!("Reading at Slot {counter}");
                     let public_key = &self.endpoint_pubkey;
@@ -197,11 +254,9 @@ impl PubkyDataEncryptor {
                                     .copy_from_slice(&ciphertext[2..len as usize + 2]);
                                 let mut payload = [0; PUBKY_DATA_MSG_LEN];
                                 println!("RCV LEN {len} CIPHER {message:?}");
-                                let _ = self.context.read_act(
-                                    &mut message,
-                                    &mut payload,
-                                    len as usize,
-                                );
+                                let _ =
+                                    self.context
+                                        .read_act(&mut message, &mut payload, len as usize);
                             } else {
                                 return Err(PubkyDataError::HomeserverResponseError);
                             }
@@ -219,7 +274,7 @@ impl PubkyDataEncryptor {
                     let mut message = [0; PUBKY_DATA_MSG_LEN];
                     if let Ok(len) = self.context.write_act(vec![], &mut message) {
                         println!("FWD LEN {len} CIPHER {message:?}");
-                        let path = self.config.destination_path.as_str();
+                        let path = self.config.write_path.as_str();
                         let counter = self.context.get_counter();
                         println!("Writing at Slot {counter}");
                         let formatted_path = format!("{path}/{counter}");
@@ -295,8 +350,8 @@ impl PubkyDataEncryptor {
             self.last_ciphertext = Some(packet);
         }
 
-        println!("destination path {:?}", self.config.destination_path.as_str());
-        let path = self.config.destination_path.as_str();
+        println!("write path {:?}", self.config.write_path.as_str());
+        let path = self.config.write_path.as_str();
         let counter = self.context.get_counter();
         println!("Writing at Slot {counter}");
         let formatted_path = format!("{path}/{counter}");
@@ -320,7 +375,7 @@ impl PubkyDataEncryptor {
     ///      - A vector of decrypted payloads (empty on failure).
     pub async fn receive_message(&mut self) -> Vec<[u8; PUBKY_DATA_MSG_LEN]> {
         let mut results = Vec::new();
-        let path = self.config.destination_path.as_str();
+        let path = self.config.read_path.as_str();
         let counter = self.context.get_counter();
         println!("Reading at Slot {counter}");
         let public_key = self.context.get_endpoint();
@@ -416,7 +471,8 @@ impl PubkyDataEncryptor {
 impl std::fmt::Debug for PubkyDataConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PubkyDataConfig")
-            .field("destination_path", &self.destination_path)
+            .field("write_path", &self.write_path)
+            .field("read_path", &self.read_path)
             .field("pubky_data_version", &self.pubky_data_version)
             .field("default_pattern", &self.default_pattern)
             .finish_non_exhaustive()
