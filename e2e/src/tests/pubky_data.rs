@@ -2061,7 +2061,11 @@ async fn pubky_data_snow_test_identifers() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -2342,7 +2346,11 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
 }
 #[tokio::test]
 async fn pubky_data_snow_test_XX_pattern_simple_incomplete_handshake() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
