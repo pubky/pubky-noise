@@ -44,7 +44,11 @@ async fn pubky_data_cipher_check_utility_negative() {
 #[tokio::test]
 async fn pubky_data_snow_test_initiator_first() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
 
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
@@ -177,7 +181,12 @@ async fn pubky_data_snow_test_initiator_first() {
 #[tokio::test]
 async fn pubky_data_snow_test_responder_first() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
@@ -309,7 +318,11 @@ async fn pubky_data_snow_test_responder_first() {
 #[tokio::test]
 async fn pubky_data_snow_test_responder_tampering() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
@@ -429,7 +442,11 @@ async fn pubky_data_snow_test_responder_tampering() {
 #[tokio::test]
 async fn pubky_data_snow_test_initiator_tampering() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
@@ -550,7 +567,11 @@ async fn pubky_data_snow_test_initiator_tampering() {
 #[tokio::test]
 async fn pubky_data_snow_null_message() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
@@ -664,7 +685,11 @@ async fn pubky_data_snow_null_message() {
 //#[tokio::test]
 async fn pubky_data_snow_test_min_max_size_message() {
     //TODO: fix accordingly dual outbox model
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
 
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
@@ -780,7 +805,11 @@ async fn pubky_data_snow_test_min_max_size_message() {
 #[tokio::test]
 async fn pubky_data_snow_test_unknown_pattern() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
 
@@ -808,7 +837,11 @@ async fn pubky_data_snow_test_unknown_pattern() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_snow_noise_build_error() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -859,7 +892,11 @@ async fn pubky_data_snow_test_snow_noise_build_error() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_already_existent() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -913,7 +950,11 @@ async fn pubky_data_snow_test_already_existent() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_context_not_found() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -975,7 +1016,11 @@ async fn pubky_data_snow_test_context_not_found() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_cleaning_sequence() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -1098,7 +1143,11 @@ async fn pubky_data_snow_test_cleaning_sequence() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_XX_pattern_simple() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -1368,7 +1417,11 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_XX_pattern_tampering() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -1553,7 +1606,11 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_simple_backup() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -1674,7 +1731,11 @@ async fn pubky_data_snow_test_simple_backup() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_context_status() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -1773,7 +1834,11 @@ async fn pubky_data_snow_test_context_status() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_dual_outbox() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let first_server = testnet.homeserver_app();
     //let second_server = testnet.second_homeserver();
     let second_server = testnet.homeserver_app();
@@ -1881,7 +1946,11 @@ async fn pubky_data_snow_test_dual_outbox() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_identity_commitment() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
 
     let first_server = testnet.homeserver_app();
     let second_server = testnet.homeserver_app();
@@ -1992,7 +2061,11 @@ async fn pubky_data_snow_test_identifers() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -2273,7 +2346,11 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
 }
 #[tokio::test]
 async fn pubky_data_snow_test_XX_pattern_simple_incomplete_handshake() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
