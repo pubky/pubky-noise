@@ -75,7 +75,7 @@ impl PubkyDataConfig {
     ///      - `pubky_data_version`: Protocol version identifier.
     ///      - `pattern_string`: Default Noise pattern (e.g. "NN", "XX").
     ///      - `homeserver_auth_session`: An authenticated PubkySession.
-   ///      - `destination_path`: Custom destination prefix for message sharing
+    ///      - `destination_path`: Custom destination prefix for message sharing
     ///        (used for both reads and writes).
     ///      - `outbox_client`: HTTP Pubky client.
     ///

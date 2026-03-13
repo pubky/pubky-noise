@@ -616,7 +616,6 @@ async fn pubky_data_snow_null_message() {
 //         .build()
 //         .await
 //         .unwrap();
-
 //     let server = testnet.homeserver_app();
 //     let initiator_pubky = testnet.sdk().unwrap();
 //     let responder_pubky = testnet.sdk().unwrap();
