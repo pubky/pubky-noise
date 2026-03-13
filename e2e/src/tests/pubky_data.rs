@@ -46,7 +46,11 @@ async fn pubky_data_cipher_check_utility_negative() {
 #[tokio::test]
 async fn pubky_data_snow_test_initiator_first() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
 
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
@@ -159,7 +163,12 @@ async fn pubky_data_snow_test_initiator_first() {
 #[tokio::test]
 async fn pubky_data_snow_test_responder_first() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
@@ -273,7 +282,11 @@ async fn pubky_data_snow_test_responder_first() {
 #[tokio::test]
 async fn pubky_data_snow_test_responder_tampering() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
@@ -381,7 +394,11 @@ async fn pubky_data_snow_test_responder_tampering() {
 #[tokio::test]
 async fn pubky_data_snow_test_initiator_tampering() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
@@ -490,7 +507,11 @@ async fn pubky_data_snow_test_initiator_tampering() {
 #[tokio::test]
 async fn pubky_data_snow_null_message() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
@@ -587,10 +608,134 @@ async fn pubky_data_snow_null_message() {
     }
 }
 
+// //#[tokio::test]
+// async fn pubky_data_snow_test_min_max_size_message() {
+//     //TODO: fix accordingly dual outbox model
+//     let testnet = EphemeralTestnet::builder()
+//         .with_embedded_postgres()
+//         .build()
+//         .await
+//         .unwrap();
+
+//     let server = testnet.homeserver_app();
+//     let initiator_pubky = testnet.sdk().unwrap();
+//     let responder_pubky = testnet.sdk().unwrap();
+
+//     let initiator_signer = initiator_pubky.signer(Keypair::random());
+//     let initiator_session = initiator_signer
+//         .signup(&server.public_key(), None)
+//         .await
+//         .unwrap();
+
+//     let responder_signer = responder_pubky.signer(Keypair::random());
+//     let responder_session = responder_signer
+//         .signup(&server.public_key(), None)
+//         .await
+//         .unwrap();
+
+//     let server_path_string = format!("/pub/data");
+
+//     let initiator_keypair = Keypair::random();
+//     let mut initiator_encryptor = PubkyDataEncryptor::init_encryptor_stack(
+//         initiator_keypair.secret_key(),
+//         0,
+//         "NN".to_string(),
+//         initiator_session.clone(),
+//         server_path_string.clone(),
+//         initiator_pubky,
+//         false,
+//     )
+//     .unwrap();
+
+//     let responder_keypair = Keypair::random();
+//     let mut responder_encryptor = PubkyDataEncryptor::init_encryptor_stack(
+//         responder_keypair.secret_key(),
+//         0,
+//         "NN".to_string(),
+//         responder_session.clone(),
+//         server_path_string.clone(),
+//         responder_pubky,
+//         false,
+//     )
+//     .unwrap();
+
+//     let initiator_ephemeral_keypair = Keypair::random();
+//     let responder_ephemeral_keypair = Keypair::random();
+
+//     let initiator_ephemeral_keypair = Keypair::random();
+//     let responder_ephemeral_keypair = Keypair::random();
+
+//     let initiator_public_key = initiator_session.info().public_key();
+//     let responder_public_key = responder_session.info().public_key();
+
+//     let initiator_key_set = PubkyKeySet::new(
+//         Some(initiator_ephemeral_keypair.secret_key()),
+//         Some(responder_ephemeral_keypair.public_key()),
+//     );
+//     let initiator_temporary_link_id = initiator_encryptor
+//         .init_context(initiator_key_set, true, responder_public_key.clone())
+//         .unwrap();
+
+//     let responder_key_set = PubkyKeySet::new(
+//         Some(responder_ephemeral_keypair.secret_key()),
+//         Some(initiator_ephemeral_keypair.public_key()),
+//     );
+//     let responder_temporary_link_id = responder_encryptor
+//         .init_context(responder_key_set, false, initiator_public_key.clone())
+//         .unwrap();
+
+//     // Initiator sends handshake
+//     // -> e
+//     // <- e, ee
+//     initiator_encryptor
+//         .handle_handshake(initiator_temporary_link_id, responder_public_key.clone())
+//         .await;
+//     responder_encryptor
+//         .handle_handshake(responder_temporary_link_id, initiator_public_key.clone())
+//         .await;
+//     initiator_encryptor
+//         .handle_handshake(initiator_temporary_link_id, responder_public_key.clone())
+//         .await;
+
+//     // yield Err(PubkyDataError::IsTransport)
+//     assert!(!initiator_encryptor
+//         .is_handshake(&initiator_temporary_link_id)
+//         .is_ok());
+//     assert!(!responder_encryptor
+//         .is_handshake(&responder_temporary_link_id)
+//         .is_ok());
+
+//     let initiator_link_id = initiator_encryptor.transition_transport(initiator_temporary_link_id);
+//     assert!(initiator_link_id.is_ok());
+//     let responder_link_id = responder_encryptor.transition_transport(responder_temporary_link_id);
+//     assert!(responder_link_id.is_ok());
+
+//     // Transport
+//     let data_payload = ['A' as u8; 985];
+//     let raw_bytes = data_payload.to_vec();
+//     responder_encryptor
+//         .send_message(raw_bytes, initiator_link_id.unwrap())
+//         .await;
+
+//     let results = initiator_encryptor
+//         .receive_message(responder_link_id.unwrap())
+//         .await;
+
+//     assert!(results.len() >= 1);
+//     for ret in results {
+//         let ref_payload = ['A' as u8; 985];
+//         //assert_eq!(ret, ref_payload);
+//     }
+// }
+
 #[tokio::test]
 async fn pubky_data_snow_test_unknown_pattern() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
 
@@ -617,7 +762,11 @@ async fn pubky_data_snow_test_unknown_pattern() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_snow_noise_build_error() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -669,7 +818,11 @@ async fn pubky_data_snow_test_snow_noise_build_error() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_cleaning_sequence() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -772,7 +925,11 @@ async fn pubky_data_snow_test_cleaning_sequence() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn pubky_data_snow_test_XX_pattern_simple() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -1026,7 +1183,11 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn pubky_data_snow_test_XX_pattern_tampering() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -1133,7 +1294,11 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_simple_backup() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -1235,7 +1400,11 @@ async fn pubky_data_snow_test_simple_backup() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_dual_outbox() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let first_server = testnet.homeserver_app();
     let second_server = testnet.homeserver_app();
 
@@ -1326,7 +1495,11 @@ async fn pubky_data_snow_test_dual_outbox() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_identity_commitment() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
 
     let first_server = testnet.homeserver_app();
     let second_server = testnet.homeserver_app();
@@ -1422,7 +1595,11 @@ async fn pubky_data_snow_test_identifers() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -1680,7 +1857,11 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn pubky_data_snow_test_XX_pattern_simple_incomplete_handshake() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
