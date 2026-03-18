@@ -7,7 +7,6 @@
 //!
 //! The binding message uses BLAKE3 with a specific input format per spec Section 6.4.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 //use serde::{Deserialize, Serialize};
 
 // Helper for serializing [u8; 64]
