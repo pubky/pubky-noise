@@ -1944,7 +1944,11 @@ async fn pubky_data_snow_test_XX_pattern_simple_incomplete_handshake() {
 
 #[tokio::test]
 async fn pubky_data_snow_test_restore() {
-    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
     let first_server = testnet.homeserver_app();
     let second_server = testnet.homeserver_app();
 
