@@ -2076,3 +2076,64 @@ async fn pubky_data_snow_test_restore() {
         assert_eq!(msg, "Pubky_Data_Rocks");
     }
 }
+
+#[tokio::test]
+//async fn pubky_data_snow_test_encryptor_parallel() {
+//     let mut testnet = EphemeralTestnet::start().await.unwrap();
+//     let server = testnet.homeserver();
+//     let alice_pubky = testnet.sdk().unwrap();
+//     let bob_pubky = alice_pubky.clone();
+//     let caroll_pubky = alice_pubky.clone();
+//
+//     let alice_signer = alice_pubky.signer(Keypair::random());
+//     let alice_session = alice_signer.signup(&server.public_key(), None).await.unwrap();
+//
+//     let bob_signer = bob_pubky.signer(Keypair::random());
+//     let bob_session = bob_signer.signup(&server.public_key(), None).await.unwrap();
+//
+//     let caroll_signer = caroll_pubky.signer(Keypair::random());
+//     let caroll_session = caroll_signer.signup(&server.public_key(), None).await.unwrap();
+//
+//     let server_path_string = format!("/pub/data");
+//
+//     let alice_keypair = Keypair::random();
+//     let mut alice_encryptor = PubkyDataEncryptor::init_encryptor_stack(alice_keypair.secret_key(), 0, "NN".to_strin
+(), alice_session.clone(), server_path_string.clone(), false).unwrap();
+//
+//     let bob_keypair = Keypair::random();
+//     let mut bob_encryptor = PubkyDataEncryptor::init_encryptor_stack(bob_keypair.secret_key(), 0, "NN".to_string(),
+ bob_session.clone(), server_path_string.clone(), false).unwrap();
+//
+//     let caroll_keypair = Keypair::random();
+//     let mut caroll_encryptor = PubkyDataEncryptor::init_encryptor_stack(caroll_keypair.secret_key(), 0, "NN".to_str
+ng(), caroll_session.clone(), server_path_string.clone(), false).unwrap();
+//     let caroll_session = caroll_signer.signup(&server.public_key(), None).await.unwrap();
+//
+//     let server_path_string = format!("/pub/data");
+//
+//     let alice_keypair = Keypair::random();
+//     let mut alice_encryptor = PubkyDataEncryptor::init_encryptor_stack(alice_keypair.secret_key(), 0, "NN".to_string(), alice_session.clone(), server_path_string.clone(), false).unwrap();
+//
+//     let bob_keypair = Keypair::random();
+//     let mut bob_encryptor = PubkyDataEncryptor::init_encryptor_stack(bob_keypair.secret_key(), 0, "NN".to_string(), bob_session.clone(), server_path_string.clone(), false).unwrap();
+//
+//     let caroll_keypair = Keypair::random();
+//     let mut caroll_encryptor = PubkyDataEncryptor::init_encryptor_stack(caroll_keypair.secret_key(), 0, "NN".to_string(), caroll_session.clone(), server_path_string.clone(), false).unwrap();
+//
+//     let alice_ephemeral_keypair = Keypair::random();
+//     let bob_ephemeral_keypair = Keypair::random();
+//     let caroll_ephemeral_keypair = Keypair::random();
+//
+//     let alice_public_key = alice_session.info().public_key();
+//     let bob_public_key = bob_session.info().public_key();
+//     let caroll_public_key = caroll_session.info().public_key();
+//
+//     // We set up 3 data links:
+//     //      - Alice - Bob
+//     //      - Alice - Caroll
+//     //      - Bob - Caroll
+//
+//     // Alice - Bob
+//     let ab_key_set = PubkyKeySet::new(Some(alice_ephemeral_keypair.secret_key()), Some(bob_ephemeral_keypair.public_key()));
+//     let ab_temporary_link_id = alice_encryptor.init_context(ab_key_set, true, bob_public_key.clone(), alice_pubky.clone()).unwrap();
+

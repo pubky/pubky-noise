@@ -11,7 +11,10 @@ use pubky::PubkySession;
 use serializer::PubkyDataBackupFormatter;
 use snow_crypto::{DataLinkContext, HandshakeAction, HandshakePattern, PUBKY_DATA_MSG_LEN};
 
-// Derived from noise handshake ; changes on every handshake
+/// A 32-byte identifier derived from the Noise handshake.
+///
+/// If ephemeral keys are used by the Noise pattern relied
+/// on for the handshake, should change after every handshake.
 #[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 pub struct LinkId(pub [u8; 32]);
 
@@ -41,6 +44,9 @@ pub enum HandshakeResult {
 /// a given user: the HTTP client, the authenticated homeserver session, the
 /// write/read paths, and the root keypair. Wrap it in `Arc` and share it across
 /// multiple single-session encryptors.
+///
+/// Alternatively, a unique PubkyDataConfig can be passed to each `PubkyDataEncryptor`
+/// to customize the ressource for performance reasons.
 ///
 /// ## Asymmetric paths
 ///
@@ -346,6 +352,8 @@ impl PubkyDataEncryptor {
         packet[0..2].copy_from_slice(&be_bytes[0..2]);
         packet[2..len + 2].copy_from_slice(&out[0..len]);
 
+	// This code path is enabled only for testing
+	// of the correct enciphering of a payload.
         if self.simulate_tampering {
             self.last_ciphertext = Some(packet);
         }
@@ -402,6 +410,8 @@ impl PubkyDataEncryptor {
                     let mut payload = [0; PUBKY_DATA_MSG_LEN];
                     println!("RCV LEN {len} CIPHER {message:?}");
 
+	            // This code path is enabled only for testing
+		    // of the correct deciphering of a payload.
                     if self.simulate_tampering {
                         message[1] = 0xff;
                     }
