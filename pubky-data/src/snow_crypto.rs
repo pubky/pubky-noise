@@ -249,85 +249,62 @@ impl HandshakePattern {
 }
 
 pub fn resolve_pattern_nn(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
-    let mut steps_to_be_done: Vec<HandshakeAction> = Vec::new();
     if initiator {
         match noise_step {
-            NoiseStep::StepOne => {
-                steps_to_be_done.push(HandshakeAction::Write);
-                steps_to_be_done.push(HandshakeAction::Pending);
-            }
-            NoiseStep::StepTwo => {
-                steps_to_be_done.push(HandshakeAction::Read);
-            }
-            NoiseStep::Final => {
-                steps_to_be_done.push(HandshakeAction::Terminal);
-            }
+            NoiseStep::StepOne => vec![HandshakeAction::Write, HandshakeAction::Pending],
+            NoiseStep::StepTwo => vec![HandshakeAction::Read],
+            NoiseStep::Final => vec![HandshakeAction::Terminal],
         }
     } else {
-        // == responder
         match noise_step {
-            NoiseStep::StepOne => {
-                steps_to_be_done.push(HandshakeAction::Read);
-                steps_to_be_done.push(HandshakeAction::Write);
-            }
-            NoiseStep::StepTwo => {
-                steps_to_be_done.push(HandshakeAction::Terminal);
-            }
-            NoiseStep::Final => {
-                steps_to_be_done.push(HandshakeAction::Terminal);
-            }
+            NoiseStep::StepOne => vec![HandshakeAction::Read, HandshakeAction::Write],
+            NoiseStep::StepTwo => vec![HandshakeAction::Terminal],
+            NoiseStep::Final => vec![HandshakeAction::Terminal],
         }
     }
-    steps_to_be_done
 }
 
 pub fn resolve_pattern_xx(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
-    let mut steps_to_be_done: Vec<HandshakeAction> = Vec::new();
     if initiator {
         match noise_step {
-            NoiseStep::StepOne => {
-                // write -> e
-                steps_to_be_done.push(HandshakeAction::Write);
-                steps_to_be_done.push(HandshakeAction::Pending);
-            }
-            NoiseStep::StepTwo => {
-                // read <- e, s
-                steps_to_be_done.push(HandshakeAction::Read);
-                // write -> s
-                steps_to_be_done.push(HandshakeAction::Write);
-            }
-            NoiseStep::Final => {
-                steps_to_be_done.push(HandshakeAction::Terminal);
-            }
+            NoiseStep::StepOne => vec![HandshakeAction::Write, HandshakeAction::Pending],
+            NoiseStep::StepTwo => vec![HandshakeAction::Read, HandshakeAction::Write],
+            NoiseStep::Final => vec![HandshakeAction::Terminal],
         }
     } else {
-        // == responder
         match noise_step {
             NoiseStep::StepOne => {
-                // read -> e
-                steps_to_be_done.push(HandshakeAction::Read);
-                // write <- e, s
-                steps_to_be_done.push(HandshakeAction::Write);
-                steps_to_be_done.push(HandshakeAction::Pending);
+                vec![
+                    HandshakeAction::Read,
+                    HandshakeAction::Write,
+                    HandshakeAction::Pending,
+                ]
             }
-            NoiseStep::StepTwo => {
-                // read -> s
-                steps_to_be_done.push(HandshakeAction::Read);
-            }
-            NoiseStep::Final => {
-                steps_to_be_done.push(HandshakeAction::Terminal);
-            }
+            NoiseStep::StepTwo => vec![HandshakeAction::Read],
+            NoiseStep::Final => vec![HandshakeAction::Terminal],
         }
     }
-    steps_to_be_done
 }
 
-fn resolve_pattern_ik(_noise_step: NoiseStep, _initiator: bool) -> Vec<HandshakeAction> {
-    vec![]
-}
-
-fn resolve_pattern_nk(_noise_step: NoiseStep, _initiator: bool) -> Vec<HandshakeAction> {
-    vec![]
+/// Resolve the handshake actions for a given pattern, step, and role.
+///
+/// Only NN and XX patterns are currently implemented. IK and NK will
+/// panic with "not yet implemented" if called.
+fn resolve_pattern(
+    pattern: HandshakePattern,
+    noise_step: NoiseStep,
+    initiator: bool,
+) -> Vec<HandshakeAction> {
+    match pattern {
+        HandshakePattern::PatternNN => resolve_pattern_nn(noise_step, initiator),
+        HandshakePattern::PatternXX => resolve_pattern_xx(noise_step, initiator),
+        HandshakePattern::PatternN | HandshakePattern::PatternIK | HandshakePattern::PatternNK => {
+            unimplemented!("handshake pattern {:?} is not yet implemented", pattern)
+        }
+        HandshakePattern::TestOnlyPatternAA => {
+            panic!("TestOnlyPatternAA cannot be resolved to handshake actions")
+        }
+    }
 }
 
 /// Return the flat sequence of Write/Read actions for a complete handshake,
@@ -337,18 +314,10 @@ fn resolve_pattern_nk(_noise_step: NoiseStep, _initiator: bool) -> Vec<Handshake
 ///      - `pattern`: a handshake pattern
 ///      - `initiator`: boolean parameter which indicates who is initiator and who is responder
 pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec<HandshakeAction> {
-    let resolve = match pattern {
-        HandshakePattern::PatternNN => resolve_pattern_nn,
-        HandshakePattern::PatternXX => resolve_pattern_xx,
-        HandshakePattern::PatternIK => resolve_pattern_ik,
-        HandshakePattern::PatternNK => resolve_pattern_nk,
-        _ => panic!("unsupported handshake pattern for full_handshake_actions"),
-    };
-
     let mut actions = Vec::new();
     let steps = [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final];
     for step in &steps {
-        let step_actions = resolve(*step, initiator);
+        let step_actions = resolve_pattern(pattern, *step, initiator);
         for action in step_actions {
             match action {
                 HandshakeAction::Write | HandshakeAction::Read => actions.push(action),
@@ -636,19 +605,7 @@ impl DataLinkContext {
     /// Uses the stored `initiator` flag -- callers no longer need to pass it.
     /// Does NOT advance noise_step -- call `complete_step()` for that.
     pub fn remaining_handshake_actions(&self) -> Vec<HandshakeAction> {
-        assert!(
-            self.message_patterns == HandshakePattern::PatternNN
-                || self.message_patterns == HandshakePattern::PatternXX
-        );
-        let all_actions = match self.message_patterns {
-            HandshakePattern::PatternNN => resolve_pattern_nn(self.noise_step, self.initiator),
-            HandshakePattern::PatternXX => resolve_pattern_xx(self.noise_step, self.initiator),
-            HandshakePattern::PatternIK => resolve_pattern_ik(self.noise_step, self.initiator),
-            HandshakePattern::PatternNK => resolve_pattern_nk(self.noise_step, self.initiator),
-            _ => {
-                panic!("unsupported handshake pattern for resolution");
-            }
-        };
+        let all_actions = resolve_pattern(self.message_patterns, self.noise_step, self.initiator);
         all_actions.into_iter().skip(self.sub_step_index).collect()
     }
 
