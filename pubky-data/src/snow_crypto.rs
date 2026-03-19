@@ -8,13 +8,13 @@ use crate::snow_crypto_resolver::ReplayResolver;
 
 pub const PUBKY_DATA_MSG_LEN: usize = 1000;
 
-#[derive(PartialEq, Debug, Copy, Clone)]
+#[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum NoisePhase {
     HandShake,
     Transport,
 }
 
-#[derive(PartialEq, Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum NoiseStep {
     StepOne,
     StepTwo,
@@ -51,7 +51,7 @@ impl NoiseStep {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum HandshakeAction {
     Read,
     Write,
@@ -64,52 +64,52 @@ pub enum HandshakeAction {
 /// 0. **No authentication**. This payload may have been sent by any party, including an active attacker.
 ///
 /// 1. **Sender authentication vulnerable to key-compromise impersonation (KCI)**. The sender authentication
-/// is based on a static-static DH ("ss") involving both parties' static key pairs. If the recipient's
-/// long-term private key has been compromised, this authentication can be forged. Note that a future
-/// version of Noise might include signatures, which could improve this security property, but brings
-/// other trade-offs.
+///    is based on a static-static DH ("ss") involving both parties' static key pairs. If the recipient's
+///    long-term private key has been compromised, this authentication can be forged. Note that a future
+///    version of Noise might include signatures, which could improve this security property, but brings
+///    other trade-offs.
 ///
 /// 2. **Sender authentication resistant to key-compromise impersonation (KCI)**. The sender authentication
-/// is based on an ephemeral-static DH ("es" or "se") between the sender's static key pair and the recipient's
-/// ephemeral key pair. Assuming the corresponding private keys are secure, this authentication cannot be
-/// forged.
+///    is based on an ephemeral-static DH ("es" or "se") between the sender's static key pair and the recipient's
+///    ephemeral key pair. Assuming the corresponding private keys are secure, this authentication cannot be
+///    forged.
 ///
 /// The destination properties are:
 ///
 /// 0. **No confidentiality**. This payload is sent in cleartext.
 ///
 /// 1. **Encryption to an ephemeral recipient**. This payload has forward secrecy, since encryption involves
-/// an ephemeral-ephemeral DH ("ee"). However, the sender has not authenticated the recipient, so this payload
-/// might be sent to any party, including an active attacker.
+///    an ephemeral-ephemeral DH ("ee"). However, the sender has not authenticated the recipient, so this payload
+///    might be sent to any party, including an active attacker.
 ///
 /// 2. **Encryption to a known recipient, forward secrecy for sender compromise only, vulnerable to replay**.
-/// This payload is encrypted based only on DHs involving the recipient's static key pair. If the recipient's
-/// static private key is compromised, even at a later date, this payload can be decrypted. This message can
-/// also be replayed, since there's no ephemeral contribution from the recipient.
+///    This payload is encrypted based only on DHs involving the recipient's static key pair. If the recipient's
+///    static private key is compromised, even at a later date, this payload can be decrypted. This message can
+///    also be replayed, since there's no ephemeral contribution from the recipient.
 ///
 /// 3. **Encryption to a known recipient, weak forward secrecy**. This payload is encrypted based on an
-/// ephemeral-ephemeral DH and also an ephemeral-static DH involving the recipient's static key pair. However,
-/// the binding between the recipient's alleged ephemeral public key and the recipient's static public key
-/// hasn't been verified by the sender, so the recipient's alleged ephemeral public key may have been forged
-/// by an active attacker. In this case, the attacker could later compromise the recipient's static private
-/// key to decrypt the payload. Note that a future version of Noise might include signatures, which could
-/// improve this security property, but brings other trade-offs.
+///    ephemeral-ephemeral DH and also an ephemeral-static DH involving the recipient's static key pair. However,
+///    the binding between the recipient's alleged ephemeral public key and the recipient's static public key
+///    hasn't been verified by the sender, so the recipient's alleged ephemeral public key may have been forged
+///    by an active attacker. In this case, the attacker could later compromise the recipient's static private
+///    key to decrypt the payload. Note that a future version of Noise might include signatures, which could
+///    improve this security property, but brings other trade-offs.
 ///
 /// 4. **Encryption to a known recipient, weak forward secrecy if the sender's private key has been compromised**.
-/// This payload is encrypted based on an ephemeral-ephemeral DH, and also based on an ephemeral-static DH
-/// involving the recipient's static key pair. However, the binding between the recipient's alleged ephemeral
-/// public and the recipient's static public key has only been verified based on DHs involving both those public
-/// keys and the sender's static private key. Thus, if the sender's static private key was previously compromised,
-/// the recipient's alleged ephemeral public key may have been forged by an active attacker. In this case, the
-/// attacker could later compromise the intended recipient's static private key to decrypt the payload (this is
-/// a variant of a "KCI" attack enabling a "weak forward secrecy" attack). Note that a future version of Noise
-/// might include signatures, which could improve this security property, but brings other trade-offs.
+///    This payload is encrypted based on an ephemeral-ephemeral DH, and also based on an ephemeral-static DH
+///    involving the recipient's static key pair. However, the binding between the recipient's alleged ephemeral
+///    public and the recipient's static public key has only been verified based on DHs involving both those public
+///    keys and the sender's static private key. Thus, if the sender's static private key was previously compromised,
+///    the recipient's alleged ephemeral public key may have been forged by an active attacker. In this case, the
+///    attacker could later compromise the intended recipient's static private key to decrypt the payload (this is
+///    a variant of a "KCI" attack enabling a "weak forward secrecy" attack). Note that a future version of Noise
+///    might include signatures, which could improve this security property, but brings other trade-offs.
 ///
 /// 5. **Encryption to a known recipient, strong forward secrecy**. This payload is encrypted based on an
-/// ephemeral-ephemeral DH as well as an ephemeral-static DH with the recipient's static key pair. Assuming
-/// the ephemeral private keys are secure, and the recipient is not being actively impersonated by an attacker
-/// that has stolen its static private key, this payload cannot be decrypted.
-#[derive(PartialEq, Copy, Clone, Debug)]
+///    ephemeral-ephemeral DH as well as an ephemeral-static DH with the recipient's static key pair. Assuming
+///    the ephemeral private keys are secure, and the recipient is not being actively impersonated by an attacker
+///    that has stolen its static private key, this payload cannot be decrypted.
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum HandshakePattern {
     /// <- s                      0                0
     /// ...
@@ -181,31 +181,33 @@ pub enum HandshakePattern {
 }
 
 pub enum PatternError {
-    UnknownLitteralPattern,
+    UnknownLiteralPattern,
 }
 
-impl HandshakePattern {
-    pub fn pattern_to_string(&self) -> Result<String, ()> {
-        match self {
-            HandshakePattern::PatternN => Ok(String::from("N")),
-            HandshakePattern::PatternNN => Ok(String::from("NN")),
-            HandshakePattern::PatternXX => Ok(String::from("XX")),
-            HandshakePattern::PatternIK => Ok(String::from("IK")),
-            HandshakePattern::PatternNK => Ok(String::from("NK")),
-            HandshakePattern::TestOnlyPatternAA => Ok(String::from("AA")),
-        }
-    }
+impl std::str::FromStr for HandshakePattern {
+    type Err = PatternError;
 
-    //TODO: fix
-    pub fn from_string(pattern_string: String) -> Result<Self, PatternError> {
-        match pattern_string.as_str() {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
             "N" => Ok(HandshakePattern::PatternN),
             "NN" => Ok(HandshakePattern::PatternNN),
             "XX" => Ok(HandshakePattern::PatternXX),
             "IK" => Ok(HandshakePattern::PatternIK),
             "NK" => Ok(HandshakePattern::PatternNK),
-            "AA" => Ok(HandshakePattern::TestOnlyPatternAA),
-            _ => Err(PatternError::UnknownLitteralPattern),
+            _ => Err(PatternError::UnknownLiteralPattern),
+        }
+    }
+}
+
+impl HandshakePattern {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HandshakePattern::PatternN => "N",
+            HandshakePattern::PatternNN => "NN",
+            HandshakePattern::PatternXX => "XX",
+            HandshakePattern::PatternIK => "IK",
+            HandshakePattern::PatternNK => "NK",
+            HandshakePattern::TestOnlyPatternAA => "AA",
         }
     }
 
@@ -412,10 +414,7 @@ impl DataLinkContext {
     /// We're using ChaCha as the stream cipher. Poly1305 as the MAC and SHA256 as a hash function.
     fn build_protocol_name(handshake_pattern: &HandshakePattern) -> Result<String, ContextError> {
         let mut protocol_name = String::from("Noise_");
-        let pattern_string = handshake_pattern
-            .pattern_to_string()
-            .map_err(|_| ContextError::Init)?;
-        protocol_name.push_str(&pattern_string);
+        protocol_name.push_str(handshake_pattern.as_str());
         protocol_name.push_str("_25519_ChaChaPoly_SHA256");
         Ok(protocol_name)
     }

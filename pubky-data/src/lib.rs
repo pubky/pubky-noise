@@ -152,7 +152,8 @@ impl PubkyDataConfig {
         outbox_client: Pubky,
     ) -> Result<Arc<Self>, PubkyDataError> {
         let pubky_root_keypair = Keypair::from_secret(&pubky_root_seckey);
-        let default_pattern = HandshakePattern::from_string(pattern_string)
+        let default_pattern = pattern_string
+            .parse::<HandshakePattern>()
             .map_err(|_| PubkyDataError::UnknownNoisePattern)?;
 
         Ok(Arc::new(PubkyDataConfig {
