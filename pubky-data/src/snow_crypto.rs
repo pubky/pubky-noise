@@ -8,14 +8,14 @@ use crate::snow_crypto_resolver::ReplayResolver;
 
 pub const PUBKY_DATA_MSG_LEN: usize = 1000;
 
-#[derive(PartialEq, Debug)]
-enum NoisePhase {
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum NoisePhase {
     HandShake,
     Transport,
 }
 
 #[derive(PartialEq, Copy, Clone, Debug)]
-enum NoiseStep {
+pub enum NoiseStep {
     StepOne,
     StepTwo,
     Final,
@@ -28,6 +28,25 @@ impl NoiseStep {
             NoiseStep::StepTwo => NoiseStep::Final,
             // if final echo final
             NoiseStep::Final => NoiseStep::Final,
+        }
+    }
+
+    /// Convert to a u8 for serialization.
+    pub fn to_u8(&self) -> u8 {
+        match self {
+            NoiseStep::StepOne => 0,
+            NoiseStep::StepTwo => 1,
+            NoiseStep::Final => 2,
+        }
+    }
+
+    /// Convert from a u8 for deserialization.
+    pub fn from_u8(val: u8) -> Option<NoiseStep> {
+        match val {
+            0 => Some(NoiseStep::StepOne),
+            1 => Some(NoiseStep::StepTwo),
+            2 => Some(NoiseStep::Final),
+            _ => None,
         }
     }
 }
@@ -190,6 +209,31 @@ impl HandshakePattern {
         }
     }
 
+    /// Convert to a u8 for serialization.
+    pub fn to_u8(&self) -> u8 {
+        match self {
+            HandshakePattern::PatternN => 0,
+            HandshakePattern::PatternNN => 1,
+            HandshakePattern::PatternXX => 2,
+            HandshakePattern::PatternIK => 3,
+            HandshakePattern::PatternNK => 4,
+            HandshakePattern::TestOnlyPatternAA => 255,
+        }
+    }
+
+    /// Convert from a u8 for deserialization.
+    pub fn from_u8(val: u8) -> Option<HandshakePattern> {
+        match val {
+            0 => Some(HandshakePattern::PatternN),
+            1 => Some(HandshakePattern::PatternNN),
+            2 => Some(HandshakePattern::PatternXX),
+            3 => Some(HandshakePattern::PatternIK),
+            4 => Some(HandshakePattern::PatternNK),
+            255 => Some(HandshakePattern::TestOnlyPatternAA),
+            _ => None,
+        }
+    }
+
     pub fn needs_local_key(&self) -> bool {
         match self {
             HandshakePattern::PatternN => false,
@@ -202,7 +246,7 @@ impl HandshakePattern {
     }
 }
 
-fn resolve_pattern_nn(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
+pub fn resolve_pattern_nn(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
     let mut steps_to_be_done: Vec<HandshakeAction> = Vec::new();
     if initiator {
         match noise_step {
@@ -235,7 +279,7 @@ fn resolve_pattern_nn(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAc
     steps_to_be_done
 }
 
-fn resolve_pattern_xx(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
+pub fn resolve_pattern_xx(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
     let mut steps_to_be_done: Vec<HandshakeAction> = Vec::new();
     if initiator {
         match noise_step {
@@ -282,6 +326,37 @@ fn resolve_pattern_ik(_noise_step: NoiseStep, _initiator: bool) -> Vec<Handshake
 
 fn resolve_pattern_nk(_noise_step: NoiseStep, _initiator: bool) -> Vec<HandshakeAction> {
     vec![]
+}
+
+/// Return the flat sequence of Write/Read actions for a complete handshake,
+/// given the pattern and role (initiator/respnder). Used by the replay logic
+/// to know which operations to perform when re-feeding persisted messages.
+/// # Parameters:
+///      - `patthern`: a handshake pattern
+///      - `initiator`: boolean parameter which indicates who is initiator and who is responder
+pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec<HandshakeAction> {
+    let resolve = match pattern {
+        HandshakePattern::PatternNN => resolve_pattern_nn,
+        HandshakePattern::PatternXX => resolve_pattern_xx,
+        HandshakePattern::PatternIK => resolve_pattern_ik,
+        HandshakePattern::PatternNK => resolve_pattern_nk,
+        _ => panic!("unsupported handshake pattern for full_handshake_actions"),
+    };
+
+    let mut actions = Vec::new();
+    let steps = [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final];
+    for step in &steps {
+        let step_actions = resolve(*step, initiator);
+        for action in step_actions {
+            match action {
+                HandshakeAction::Write | HandshakeAction::Read => actions.push(action),
+                HandshakeAction::Pending | HandshakeAction::Terminal => {
+                    // Skip control actions; we only care about Write/Read for replay
+                }
+            }
+        }
+    }
+    actions
 }
 
 //TODO: more granularity for errors
@@ -694,5 +769,82 @@ impl DataLinkContext {
         }
 
         Ok(())
+    }
+
+    /// Check if this context is in transport phase.
+    pub fn is_transport(&self) -> bool {
+        self.noise_phase == NoisePhase::Transport
+    }
+
+    // --- Snapshot / restore accessors ---
+
+    /// Get the current noise phase.
+    pub fn get_phase(&self) -> NoisePhase {
+        self.noise_phase
+    }
+
+    /// Get the handshake pattern.
+    pub fn get_pattern(&self) -> HandshakePattern {
+        self.message_patterns
+    }
+
+    /// Whether this side is the initiator.
+    pub fn is_initiator(&self) -> bool {
+        self.initiator
+    }
+
+    /// Get the local ephemeral secret key (for backup/restore).
+    pub fn get_ephemeral_secret(&self) -> &[u8; 32] {
+        &self.local_ephemeral_seckey
+    }
+
+    /// Get the local static secret key (for backup/restore).
+    pub fn get_static_secret(&self) -> Option<&SecretKey> {
+        self.local_static_seckey.as_ref()
+    }
+
+    /// Get the current noise step.
+    pub fn get_noise_step(&self) -> NoiseStep {
+        self.noise_step
+    }
+
+    /// Get the current sub-step index.
+    pub fn get_sub_step_index(&self) -> usize {
+        self.sub_step_index
+    }
+
+    /// Get the sending nonce (transport phase).
+    pub fn get_sending_nonce(&self) -> u64 {
+        self.sending_nonce
+    }
+
+    /// Get the receiving nonce (transport phase).
+    pub fn get_receiving_nonce(&self) -> u64 {
+        self.receiving_nonce
+    }
+
+    /// Set the counter (used during restore).
+    pub fn set_counter(&mut self, counter: u32) {
+        self.counter = counter;
+    }
+
+    /// Set the noise step (used during restore).
+    pub fn set_noise_step(&mut self, step: NoiseStep) {
+        self.noise_step = step;
+    }
+
+    /// Set the sub-step index (used during restore).
+    pub fn set_sub_step_index(&mut self, index: usize) {
+        self.sub_step_index = index;
+    }
+
+    /// Set the sending nonce (used during restore after transport transition).
+    pub fn set_sending_nonce(&mut self, nonce: u64) {
+        self.sending_nonce = nonce;
+    }
+
+    /// Set the receiving nonce (used during restore after transport transition).
+    pub fn set_receiving_nonce(&mut self, nonce: u64) {
+        self.receiving_nonce = nonce;
     }
 }
