@@ -207,10 +207,8 @@ impl PubkyDataEncryptor {
         let data_link_context = DataLinkContext::new(
             config.default_pattern,
             initiator,
-            vec![],
             Some(holder_skey),
             endpoint_pubkey.clone(),
-            None,
         )
         .map_err(|_| PubkyDataError::SnowNoiseBuildError)?;
 
@@ -298,7 +296,7 @@ impl PubkyDataEncryptor {
                 HandshakeAction::Write => {
                     println!("Handshake Write");
                     let mut message = [0; PUBKY_DATA_MSG_LEN];
-                    if let Ok(len) = self.context.write_act(vec![], &mut message) {
+                    if let Ok(len) = self.context.write_act(&[], &mut message) {
                         println!("FWD LEN {len} CIPHER {message:?}");
                         let path = self.config.write_path.as_str();
                         let counter = self.context.get_counter();
@@ -367,7 +365,7 @@ impl PubkyDataEncryptor {
         }
 
         let mut out = [0; PUBKY_DATA_MSG_LEN];
-        let len = self.context.write_act(plaintext, &mut out)?;
+        let len = self.context.write_act(&plaintext, &mut out)?;
 
         println!("FWD LEN {len} CIPHER {out:?}");
         let mut packet = [0; PUBKY_DATA_MSG_LEN + 2];
@@ -541,10 +539,8 @@ impl PubkyDataEncryptor {
         let mut context = DataLinkContext::new_with_ephemeral(
             state.pattern,
             state.initiator,
-            vec![],
             state.static_secret,
             endpoint_pubkey.clone(),
-            None,
             Some(state.ephemeral_secret),
         )
         .map_err(|_| PubkyDataError::SnowNoiseBuildError)?;
@@ -598,7 +594,7 @@ impl PubkyDataEncryptor {
                     // internal state advances correctly.
                     let mut message = [0; PUBKY_DATA_MSG_LEN];
                     context
-                        .write_act(vec![], &mut message)
+                        .write_act(&[], &mut message)
                         .map_err(|_| PubkyDataError::RestoreReplayError)?;
                     replay_counter += 1;
                 }

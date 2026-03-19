@@ -371,21 +371,16 @@ pub struct DataLinkContext {
     // When a Read fails (peer hasn't written yet), we return Pending without advancing
     // sub_step_index, so the next poll retries from the same action.
     sub_step_index: usize,
-
-    //TODO: add context creation date ?
-    //TODO: already there for identity binding
-    #[allow(dead_code)]
-    local_pkarr_pubkey: Option<PublicKey>,
 }
 
 impl DataLinkContext {
     /// Build the Snow protocol name string for the given pattern.
     /// We're using ChaCha as the stream cipher. Poly1305 as the MAC and SHA256 as a hash function.
-    fn build_protocol_name(handshake_pattern: &HandshakePattern) -> Result<String, ContextError> {
-        let mut protocol_name = String::from("Noise_");
-        protocol_name.push_str(handshake_pattern.as_str());
-        protocol_name.push_str("_25519_ChaChaPoly_SHA256");
-        Ok(protocol_name)
+    fn build_protocol_name(handshake_pattern: &HandshakePattern) -> String {
+        format!(
+            "Noise_{}_25519_ChaChaPoly_SHA256",
+            handshake_pattern.as_str()
+        )
     }
 
     /// Build a Snow HandshakeState using the ReplayResolver with the given ephemeral seed.
@@ -426,18 +421,14 @@ impl DataLinkContext {
     pub fn new(
         handshake_pattern: HandshakePattern,
         initiator: bool,
-        _prologue: Vec<u8>,
         local_static_key: Option<SecretKey>,
         endpoint_pubkey: PublicKey,
-        local_pkarr_pubkey: Option<PublicKey>,
     ) -> Result<DataLinkContext, ContextError> {
         Self::new_with_ephemeral(
             handshake_pattern,
             initiator,
-            _prologue,
             local_static_key,
             endpoint_pubkey,
-            local_pkarr_pubkey,
             None,
         )
     }
@@ -449,10 +440,8 @@ impl DataLinkContext {
     pub fn new_with_ephemeral(
         handshake_pattern: HandshakePattern,
         initiator: bool,
-        _prologue: Vec<u8>,
         local_static_key: Option<SecretKey>,
         endpoint_pubkey: PublicKey,
-        local_pkarr_pubkey: Option<PublicKey>,
         ephemeral_secret: Option<[u8; 32]>,
     ) -> Result<DataLinkContext, ContextError> {
         // Section 5.3 The Handshake Object
@@ -462,8 +451,7 @@ impl DataLinkContext {
         //   the handshake pattern and crypto functions, as specified in Section 8.
         //   Calls InitializeSymmetric(protocol_name).
 
-        let protocol_name = Self::build_protocol_name(&handshake_pattern)?;
-        println!("Current Protocol Name {protocol_name}");
+        let protocol_name = Self::build_protocol_name(&handshake_pattern);
 
         // Generate or use provided ephemeral seed
         let ephemeral_seed = match ephemeral_secret {
@@ -482,8 +470,6 @@ impl DataLinkContext {
             &local_static_key,
             &ephemeral_seed,
         )?;
-
-        println!("build result Ok");
 
         // - Sets the initator s, e, rs and re variables to the corresponding
         //   arguments.
@@ -518,8 +504,6 @@ impl DataLinkContext {
             counter: 0,
 
             sub_step_index: 0,
-
-            local_pkarr_pubkey,
         })
     }
 
@@ -543,11 +527,10 @@ impl DataLinkContext {
     }
 
     pub fn is_handshake(&self) -> bool {
-        !self
-            .noise_handshake
-            .as_ref()
-            .unwrap()
-            .is_handshake_finished()
+        match &self.noise_handshake {
+            Some(hs) => !hs.is_handshake_finished(),
+            None => false,
+        }
     }
 
     /// Check if this context is in transport phase.
@@ -567,38 +550,24 @@ impl DataLinkContext {
     }
 
     pub fn to_transport(&mut self) -> Result<(), ContextError> {
-        println!(
-            "TO TRANSPORT HANDSHAKE FINISHED {} INITIATOR {}",
-            self.noise_handshake
-                .as_ref()
-                .unwrap()
-                .is_handshake_finished(),
-            self.initiator
-        );
-        if !self
+        let hs = self
             .noise_handshake
             .as_ref()
-            .unwrap()
-            .is_handshake_finished()
-        {
+            .ok_or(ContextError::OngoingHandshake)?;
+        if !hs.is_handshake_finished() {
             return Err(ContextError::OngoingHandshake);
         }
         let transport = self
             .noise_handshake
             .take()
             .unwrap()
-            .into_stateless_transport_mode();
-        if let Ok(transport) = transport {
-            println!("TRANSPORT OK");
-            //TODO: zeroize HandshakeState
-            self.noise_transport = Some(transport);
-            self.noise_phase = NoisePhase::Transport;
-            self.sending_nonce = 0;
-            self.receiving_nonce = 0;
-            return Ok(());
-        }
-        println!("TRANSPORT NOT OK");
-        Err(ContextError::InternalSnowTransitionErr)
+            .into_stateless_transport_mode()
+            .map_err(|_| ContextError::InternalSnowTransitionErr)?;
+        self.noise_transport = Some(transport);
+        self.noise_phase = NoisePhase::Transport;
+        self.sending_nonce = 0;
+        self.receiving_nonce = 0;
+        Ok(())
     }
 
     /// Returns the remaining actions for the current step, starting from sub_step_index.
@@ -622,61 +591,28 @@ impl DataLinkContext {
 
     pub fn write_act(
         &mut self,
-        payload: Vec<u8>,
+        payload: &[u8],
         message: &mut [u8; PUBKY_DATA_MSG_LEN],
     ) -> Result<usize, ContextError> {
-        //TODO: care better about error
-        // Section 5.3 The HandshakeState object
-        //
-        // For "e": Sets e (which must be empty) to GENERATE_KEYPAIR().
-        // Appends e.public_key to the buffer. Calls MixHash(e.public_key).
-        //
-        // For "ee": Calls MixKey(DH(e, re))
-        //
-        // For "es": Calls MixKey (DH(e, rs)) if initiator, MixKey(DH(s, re)
-        // if responder.
-        println!("SNOW WRITE {payload:?}");
-        let ret = 0;
-        if self.noise_phase == NoisePhase::HandShake {
-            //TODO: determinate_transition()
-            let result = self
+        match self.noise_phase {
+            NoisePhase::HandShake => self
                 .noise_handshake
                 .as_mut()
                 .unwrap()
-                .write_message(&payload, message.as_mut());
-            match result {
-                Ok(write_size) => {
-                    return Ok(write_size);
-                }
-                Err(_e) => {
-                    return Err(ContextError::InternalSnowWriteErr);
-                }
-            }
-        } else if self.noise_phase == NoisePhase::Transport {
-            println!("WRITE TRANSPORT");
-            println!(
-                "payload size {} message size {}",
-                payload.len(),
-                message.len()
-            );
-            let nonce = self.sending_nonce;
-            let result = self.noise_transport.as_ref().unwrap().write_message(
-                nonce,
-                &payload,
-                message.as_mut(),
-            );
-            match result {
-                Ok(write_size) => {
-                    self.sending_nonce += 1;
-                    return Ok(write_size);
-                }
-                Err(_e) => {
-                    return Err(ContextError::InternalSnowWriteErr);
-                }
+                .write_message(payload, message.as_mut())
+                .map_err(|_| ContextError::InternalSnowWriteErr),
+            NoisePhase::Transport => {
+                let nonce = self.sending_nonce;
+                let size = self
+                    .noise_transport
+                    .as_ref()
+                    .unwrap()
+                    .write_message(nonce, payload, message.as_mut())
+                    .map_err(|_| ContextError::InternalSnowWriteErr)?;
+                self.sending_nonce += 1;
+                Ok(size)
             }
         }
-
-        Ok(ret)
     }
 
     pub fn read_act(
@@ -685,52 +621,25 @@ impl DataLinkContext {
         payload: &mut [u8; PUBKY_DATA_MSG_LEN],
         index: usize,
     ) -> Result<(), ContextError> {
-        // Section 5.3 The HandshakeState Object
-        //
-        // For "e": Sets re (which must be empty) to the next DHLEN bytes
-        // from the message. Calls MixHash(re.public_keys).
-        //
-        // For "ee": Calls MixKey (DH(e, re)).
-        //
-        // For "es": Calls MixKey (DH(e, rs)) if initiator, MixKey(DH(s, re))
-        // if responder.
-        println!("SNOW READ");
-        //TODO: improv ret error management
-        if self.noise_phase == NoisePhase::HandShake {
-            println!("INDEX {index}");
-            let ret = self
-                .noise_handshake
-                .as_mut()
-                .unwrap()
-                .read_message(&message[..index], payload);
-            match ret {
-                Ok(_) => {
-                    return Ok(());
-                }
-                Err(_e) => {
-                    return Err(ContextError::InternalSnowReadErr);
-                }
+        match self.noise_phase {
+            NoisePhase::HandShake => {
+                self.noise_handshake
+                    .as_mut()
+                    .unwrap()
+                    .read_message(&message[..index], payload)
+                    .map_err(|_| ContextError::InternalSnowReadErr)?;
+                Ok(())
             }
-        } else if self.noise_phase == NoisePhase::Transport {
-            println!("READ TRANSPORT");
-            let nonce = self.receiving_nonce;
-            let ret = self.noise_transport.as_ref().unwrap().read_message(
-                nonce,
-                &message[..index],
-                payload,
-            );
-            match ret {
-                Ok(_) => {
-                    self.receiving_nonce += 1;
-                    return Ok(());
-                }
-                Err(_e) => {
-                    return Err(ContextError::InternalSnowReadErr);
-                }
+            NoisePhase::Transport => {
+                self.noise_transport
+                    .as_ref()
+                    .unwrap()
+                    .read_message(self.receiving_nonce, &message[..index], payload)
+                    .map_err(|_| ContextError::InternalSnowReadErr)?;
+                self.receiving_nonce += 1;
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     // --- Snapshot / restore accessors ---
