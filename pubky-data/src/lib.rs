@@ -9,8 +9,11 @@ use std::sync::Arc;
 use pubky::prelude::*;
 use pubky::PubkySession;
 
-use serializer::PubkyDataBackupFormatter;
-use snow_crypto::{DataLinkContext, HandshakeAction, HandshakePattern, PUBKY_DATA_MSG_LEN};
+use serializer::PubkyDataSessionState;
+use snow_crypto::{
+    full_handshake_actions, DataLinkContext, HandshakeAction, HandshakePattern, NoisePhase,
+    PUBKY_DATA_MSG_LEN,
+};
 
 /// A 32-byte identifier derived from the Noise handshake.
 ///
@@ -30,6 +33,12 @@ pub enum PubkyDataError {
     HomeserverResponseError,
     IsTransport,
     IsHandshake,
+    /// Restore failed: handshake replay error.
+    RestoreReplayError,
+    /// Restore failed: handshake hash mismatch after replay.
+    RestoreHashMismatch,
+    /// Restore failed: deserialization error.
+    RestoreDeserializeError,
     OtherError,
 }
 
@@ -353,8 +362,8 @@ impl PubkyDataEncryptor {
         packet[0..2].copy_from_slice(&be_bytes[0..2]);
         packet[2..len + 2].copy_from_slice(&out[0..len]);
 
-	// This code path is enabled only for testing
-	// of the correct enciphering of a payload.
+        // This code path is enabled only for testing
+        // of the correct enciphering of a payload.
         if self.simulate_tampering {
             self.last_ciphertext = Some(packet);
         }
@@ -411,8 +420,8 @@ impl PubkyDataEncryptor {
                     let mut payload = [0; PUBKY_DATA_MSG_LEN];
                     println!("RCV LEN {len} CIPHER {message:?}");
 
-	            // This code path is enabled only for testing
-		    // of the correct deciphering of a payload.
+                    // This code path is enabled only for testing
+                    // of the correct deciphering of a payload.
                     if self.simulate_tampering {
                         message[1] = 0xff;
                     }
@@ -433,19 +442,241 @@ impl PubkyDataEncryptor {
         self.context.delete();
     }
 
-    /// Generate a backup of the current session state.
-    pub async fn generate_backup(&self, _commit: bool) -> Result<(), PubkyDataError> {
-        let backup_formatter = PubkyDataBackupFormatter::new();
-        let serialized_backup = backup_formatter.serialize();
-        let public_key = self.config.pubky_root_keypair.public_key();
-        let formatted_backup_path = format!("pubky/{public_key}/backup");
-        let _ = self
-            .config
+    /// Capture the current session state as a serializable snapshot.
+    ///
+    /// This snapshot contains everything needed to restore the session later
+    /// by replaying persisted handshake messages.
+    pub fn snapshot(&self) -> PubkyDataSessionState {
+        let phase = self.context.get_phase();
+        let handshake_hash = self.context.get_handshake_hash();
+
+        PubkyDataSessionState {
+            version: 1,
+            phase,
+            pattern: self.context.get_pattern(),
+            initiator: self.context.is_initiator(),
+            ephemeral_secret: *self.context.get_ephemeral_secret(),
+            static_secret: self.context.get_static_secret().copied(),
+            counter: self.context.get_counter(),
+            noise_step: self.context.get_noise_step(),
+            sub_step_index: self.context.get_sub_step_index() as u8,
+            handshake_hash,
+            link_id: self.link_id.map(|id| id.0),
+            sending_nonce: self.context.get_sending_nonce(),
+            receiving_nonce: self.context.get_receiving_nonce(),
+            endpoint_pubkey: self.endpoint_pubkey.to_bytes(),
+        }
+    }
+
+    /// Persist the current session snapshot to the homeserver (encrypted path).
+    pub async fn persist_snapshot(&self) -> Result<(), PubkyDataError> {
+        let state = self.snapshot();
+        let serialized = state.serialize();
+        // TODO: encrypt serialized bytes with a key derived from pubky_root_keypair
+        // before storing. For now, store as-is.
+        let path = format!("{}/backup", self.config.write_path);
+        self.config
             .local_session
             .storage()
-            .put(formatted_backup_path, serialized_backup.to_vec())
-            .await;
+            .put(path, serialized)
+            .await
+            .map_err(|_| PubkyDataError::OtherError)?;
         Ok(())
+    }
+
+    /// Restore a `PubkyDataEncryptor` from a previously saved session state.
+    ///
+    /// This method:
+    /// 1. Builds a fresh `DataLinkContext` with the saved ephemeral key
+    /// 2. Reads all handshake messages from the homeservers
+    /// 3. Replays them through the fresh `HandshakeState` to re-derive state
+    /// 4. For transport restore: transitions to transport and sets nonces
+    /// 5. For handshake restore: stops at the saved step position
+    ///
+    /// # Parameters:
+    ///      - `config`: Shared configuration (must match the original session).
+    ///      - `state`: The saved session state snapshot.
+    ///
+    /// # Errors:
+    ///      - Returns [`PubkyDataError::SnowNoiseBuildError`] if the Noise stack fails to build.
+    ///      - Returns [`PubkyDataError::RestoreReplayError`] if handshake replay fails.
+    ///      - Returns [`PubkyDataError::RestoreHashMismatch`] if the replayed handshake
+    ///        produces a different hash than the saved one.
+    pub async fn restore(
+        config: Arc<PubkyDataConfig>,
+        state: PubkyDataSessionState,
+        endpoint_pubkey: PublicKey,
+    ) -> Result<Self, PubkyDataError> {
+        // Verify the caller-provided pubkey matches the snapshot (consistency check)
+        if endpoint_pubkey.to_bytes() != state.endpoint_pubkey {
+            return Err(PubkyDataError::RestoreDeserializeError);
+        }
+
+        // Build a fresh context with the saved ephemeral key
+        let mut context = DataLinkContext::new_with_ephemeral(
+            state.pattern,
+            state.initiator,
+            vec![],
+            state.static_secret,
+            endpoint_pubkey.clone(),
+            None,
+            Some(state.ephemeral_secret),
+        )
+        .map_err(|_| PubkyDataError::SnowNoiseBuildError)?;
+
+        // Determine the full sequence of handshake Write/Read actions
+        let all_actions = full_handshake_actions(state.pattern, state.initiator);
+
+        // Determine how many actions to replay:
+        // - For transport restore: replay ALL handshake actions
+        // - For handshake restore: replay up to the saved position
+        let replay_all = state.phase == NoisePhase::Transport;
+
+        // We need to figure out which homeserver slots correspond to which actions.
+        // The counter tracks slot indices. During the original handshake:
+        // - Write actions write to local homeserver at write_path/counter, then increment
+        // - Read actions read from remote homeserver at read_path/counter, then increment
+        //
+        // For replay, we need to re-read ALL messages (both our own writes and
+        // the peer's writes) from the homeservers and feed them through Snow.
+
+        // Compute the local public key (for reading our own writes back)
+        let _local_public_key = config.local_session.info().public_key();
+
+        let mut replay_counter: u32 = 0;
+
+        // How many actions were completed in the original session?
+        // For transport: all of them. For handshake: we need to count.
+        let actions_to_replay = if replay_all {
+            all_actions.len()
+        } else {
+            // Count completed actions based on saved counter.
+            // Each Write or Read increments the counter by 1.
+            // The saved counter tells us how many Write/Read actions completed.
+            state.counter as usize
+        };
+
+        for (i, action) in all_actions.iter().enumerate() {
+            if i >= actions_to_replay {
+                break;
+            }
+
+            match action {
+                HandshakeAction::Write => {
+                    // During replay, we need to re-read our own written message
+                    // from the homeserver and feed it through Snow's write_message.
+                    //
+                    // However, Snow's write_message generates the message -- it doesn't
+                    // consume an existing one. So for Write actions during replay,
+                    // we just call write_message with empty payload (same as original)
+                    // and discard the output. The important thing is that Snow's
+                    // internal state advances correctly.
+                    let mut message = [0; PUBKY_DATA_MSG_LEN];
+                    context
+                        .write_act(vec![], &mut message)
+                        .map_err(|_| PubkyDataError::RestoreReplayError)?;
+                    replay_counter += 1;
+                }
+                HandshakeAction::Read => {
+                    // Read the peer's message from their homeserver
+                    let read_path = config.read_path.as_str();
+                    let formatted_path = format!("{endpoint_pubkey}/{read_path}/{replay_counter}");
+
+                    let response = config
+                        .outbox_client
+                        .public_storage()
+                        .get(formatted_path)
+                        .await
+                        .map_err(|_| PubkyDataError::RestoreReplayError)?;
+
+                    if !response.status().is_success() {
+                        return Err(PubkyDataError::RestoreReplayError);
+                    }
+
+                    let ciphertext = response
+                        .bytes()
+                        .await
+                        .map_err(|_| PubkyDataError::RestoreReplayError)?;
+
+                    if ciphertext.len() > PUBKY_DATA_MSG_LEN + 2 {
+                        return Err(PubkyDataError::BadLengthCiphertext);
+                    }
+
+                    let mut buf_len = [0; 2];
+                    buf_len[0..2].copy_from_slice(&ciphertext[0..2]);
+                    let len = u16::from_be_bytes(buf_len) as usize;
+                    let mut message = [0; PUBKY_DATA_MSG_LEN];
+                    message[0..len].copy_from_slice(&ciphertext[2..len + 2]);
+                    let mut payload = [0; PUBKY_DATA_MSG_LEN];
+
+                    context
+                        .read_act(&mut message, &mut payload, len)
+                        .map_err(|_| PubkyDataError::RestoreReplayError)?;
+                    replay_counter += 1;
+                }
+                HandshakeAction::Pending | HandshakeAction::Terminal => {
+                    // These don't correspond to actual messages
+                }
+            }
+        }
+
+        // Now set the context state to match the saved snapshot
+        let link_id;
+
+        if state.phase == NoisePhase::Transport {
+            // Verify the handshake completed
+            if context.is_handshake() {
+                return Err(PubkyDataError::RestoreReplayError);
+            }
+
+            // Verify handshake hash matches (integrity check)
+            if let Some(saved_hash) = state.handshake_hash {
+                if let Some(replayed_hash) = context.get_handshake_hash() {
+                    if saved_hash != replayed_hash {
+                        return Err(PubkyDataError::RestoreHashMismatch);
+                    }
+                }
+            }
+
+            // Transition to transport
+            let hash = context.get_handshake_hash().unwrap();
+            context
+                .to_transport()
+                .map_err(|_| PubkyDataError::RestoreReplayError)?;
+
+            // Set nonces from saved state
+            context.set_sending_nonce(state.sending_nonce);
+            context.set_receiving_nonce(state.receiving_nonce);
+
+            // Set counter to saved value (includes handshake + transport messages)
+            context.set_counter(state.counter);
+
+            link_id = if let Some(id) = state.link_id {
+                Some(LinkId(id))
+            } else {
+                Some(LinkId(hash))
+            };
+        } else {
+            // Handshake restore: set step/sub_step/counter
+            context.set_noise_step(state.noise_step);
+            context.set_sub_step_index(state.sub_step_index as usize);
+            context.set_counter(state.counter);
+            link_id = None;
+        }
+
+        Ok(PubkyDataEncryptor {
+            config,
+            context,
+            link_id,
+            endpoint_pubkey,
+            simulate_tampering: false,
+            last_ciphertext: None,
+        })
+    }
+
+    /// Generate a backup of the current session state (legacy method).
+    pub async fn generate_backup(&self, _commit: bool) -> Result<(), PubkyDataError> {
+        self.persist_snapshot().await
     }
 
     /// Get the LinkId for this session (available after transition_transport).
