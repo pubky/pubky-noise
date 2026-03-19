@@ -4,6 +4,7 @@ pub mod serializer;
 pub mod snow_crypto;
 pub mod snow_crypto_resolver;
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use pubky::prelude::*;
@@ -22,17 +23,37 @@ use snow_crypto::{
 #[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 pub struct LinkId(pub [u8; 32]);
 
+/// Decode a length-prefixed packet into a message buffer and its length.
+///
+/// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
+fn decode_packet(ciphertext: &[u8]) -> Result<([u8; PUBKY_DATA_MSG_LEN], usize), PubkyDataError> {
+    if ciphertext.len() > PUBKY_DATA_MSG_LEN + 2 {
+        return Err(PubkyDataError::BadLengthCiphertext);
+    }
+    let len = u16::from_be_bytes([ciphertext[0], ciphertext[1]]) as usize;
+    let mut message = [0u8; PUBKY_DATA_MSG_LEN];
+    message[..len].copy_from_slice(&ciphertext[2..len + 2]);
+    Ok((message, len))
+}
+
+/// Encode a message into a length-prefixed packet.
+///
+/// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
+fn encode_packet(data: &[u8], len: usize) -> [u8; PUBKY_DATA_MSG_LEN + 2] {
+    let mut packet = [0u8; PUBKY_DATA_MSG_LEN + 2];
+    let be_bytes = (len as u16).to_be_bytes();
+    packet[0..2].copy_from_slice(&be_bytes);
+    packet[2..len + 2].copy_from_slice(&data[..len]);
+    packet
+}
+
 #[derive(Eq, Hash, PartialEq, Debug)]
 pub enum PubkyDataError {
     UnknownNoisePattern,
     SnowNoiseBuildError,
     BadLengthCiphertext,
-    /// the homeserver path error
-    HomeserverPathError,
     /// the homeserver response is a failure
-    HomeserverWriteError,
-    HomeserverReadError,
-    IsTransport,
+    HomeserverResponseError,
     IsHandshake,
     /// Restore failed: handshake replay error.
     RestoreReplayError,
@@ -40,15 +61,7 @@ pub enum PubkyDataError {
     RestoreHashMismatch,
     /// Restore failed: deserialization error.
     RestoreDeserializeError,
-    NoiseContextError,
     OtherError,
-}
-
-// TODO: impl from ContextError for PubkyDataError
-impl From<snow_crypto::ContextError> for PubkyDataError {
-    fn from(_: snow_crypto::ContextError) -> Self {
-        PubkyDataError::NoiseContextError
-    }
 }
 
 #[derive(Eq, Hash, PartialEq, Debug)]
@@ -63,9 +76,6 @@ pub enum HandshakeResult {
 /// a given user: the HTTP client, the authenticated homeserver session, the
 /// write/read paths, and the root keypair. Wrap it in `Arc` and share it across
 /// multiple single-session encryptors.
-///
-/// Alternatively, a unique PubkyDataConfig can be passed to each `PubkyDataEncryptor`
-/// to customize the ressource for performance reasons.
 ///
 /// ## Asymmetric paths
 ///
@@ -109,7 +119,7 @@ impl PubkyDataConfig {
     pub fn new(
         pubky_root_seckey: [u8; 32],
         pubky_data_version: u32,
-        pattern_string: String,
+        pattern_string: &str,
         homeserver_auth_session: PubkySession,
         destination_path: String,
         outbox_client: Pubky,
@@ -145,15 +155,14 @@ impl PubkyDataConfig {
     pub fn new_with_paths(
         pubky_root_seckey: [u8; 32],
         pubky_data_version: u32,
-        pattern_string: String,
+        pattern_string: &str,
         homeserver_auth_session: PubkySession,
         write_path: String,
         read_path: String,
         outbox_client: Pubky,
     ) -> Result<Arc<Self>, PubkyDataError> {
         let pubky_root_keypair = Keypair::from_secret(&pubky_root_seckey);
-        let default_pattern = pattern_string
-            .parse::<HandshakePattern>()
+        let default_pattern = HandshakePattern::from_str(pattern_string)
             .map_err(|_| PubkyDataError::UnknownNoisePattern)?;
 
         Ok(Arc::new(PubkyDataConfig {
@@ -191,7 +200,6 @@ impl PubkyDataEncryptor {
     /// # Parameters:
     ///      - `config`: Shared configuration (wrapped in Arc).
     ///      - `holder_skey`: Local static secret key for this session.
-    ///      - `remote_pkey`: Remote peer's static ed25519 public key.
     ///      - `initiator`: Whether this side initiates the Noise handshake.
     ///      - `endpoint_pubkey`: Remote peer's public key used as path suffix.
     ///
@@ -200,7 +208,6 @@ impl PubkyDataEncryptor {
     pub fn new(
         config: Arc<PubkyDataConfig>,
         holder_skey: [u8; 32],
-        _remote_pkey: PublicKey, // TODO: remove it!
         initiator: bool,
         endpoint_pubkey: PublicKey,
     ) -> Result<Self, PubkyDataError> {
@@ -225,12 +232,12 @@ impl PubkyDataEncryptor {
     /// Check if this encryptor is still in the Noise Handshake phase.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyDataError::IsTransport`] if already transitioned to transport.
+    ///      - Returns [`PubkyDataError::OtherError`] if already transitioned to transport.
     pub fn is_handshake(&self) -> Result<(), PubkyDataError> {
         if self.context.is_handshake() {
             Ok(())
         } else {
-            Err(PubkyDataError::IsTransport)
+            Err(PubkyDataError::OtherError)
         }
     }
 
@@ -244,16 +251,12 @@ impl PubkyDataEncryptor {
     ///      - Returns [`PubkyDataError::BadLengthCiphertext`] on malformed messages.
     ///      - Returns [`PubkyDataError::HomeserverResponseError`] on response parse failure.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyDataError> {
-        println!("IN HANDLE HANDSHAKE");
-
         let remaining_actions = self.context.remaining_handshake_actions();
         for action in remaining_actions {
             match action {
                 HandshakeAction::Read => {
-                    println!("Handshake Read");
                     let path = self.config.read_path.as_str();
                     let counter = self.context.get_counter();
-                    println!("Reading at Slot {counter}");
                     let public_key = &self.endpoint_pubkey;
                     let formatted_path = format!("{public_key}/{path}/{counter}");
 
@@ -266,23 +269,11 @@ impl PubkyDataEncryptor {
                     {
                         if response.status().is_success() {
                             if let Ok(ciphertext) = response.bytes().await {
-                                println!("getting response bytes...");
-                                if ciphertext.len() > PUBKY_DATA_MSG_LEN + 2 {
-                                    return Err(PubkyDataError::BadLengthCiphertext);
-                                }
-                                let mut buf_len = [0; 2];
-                                buf_len[0..2].copy_from_slice(&ciphertext[0..2]);
-                                let len = u16::from_be_bytes(buf_len);
-                                let mut message = [0; PUBKY_DATA_MSG_LEN];
-                                message[0..len as usize]
-                                    .copy_from_slice(&ciphertext[2..len as usize + 2]);
+                                let (mut message, len) = decode_packet(&ciphertext)?;
                                 let mut payload = [0; PUBKY_DATA_MSG_LEN];
-                                println!("RCV LEN {len} CIPHER {message:?}");
-                                let _ =
-                                    self.context
-                                        .read_act(&mut message, &mut payload, len as usize);
+                                let _ = self.context.read_act(&mut message, &mut payload, len);
                             } else {
-                                return Err(PubkyDataError::HomeserverReadError);
+                                return Err(PubkyDataError::HomeserverResponseError);
                             }
                             self.context.increment_counter();
                             self.context.advance_sub_step();
@@ -294,18 +285,12 @@ impl PubkyDataEncryptor {
                     }
                 }
                 HandshakeAction::Write => {
-                    println!("Handshake Write");
                     let mut message = [0; PUBKY_DATA_MSG_LEN];
                     if let Ok(len) = self.context.write_act(&[], &mut message) {
-                        println!("FWD LEN {len} CIPHER {message:?}");
                         let path = self.config.write_path.as_str();
                         let counter = self.context.get_counter();
-                        println!("Writing at Slot {counter}");
                         let formatted_path = format!("{path}/{counter}");
-                        let mut packet = [0; PUBKY_DATA_MSG_LEN + 2];
-                        let be_bytes = (len as u16).to_be_bytes();
-                        packet[0..2].copy_from_slice(&be_bytes[0..2]);
-                        packet[2..len + 2].copy_from_slice(&message[0..len]);
+                        let packet = encode_packet(&message, len);
                         let _ = self
                             .config
                             .local_session
@@ -333,7 +318,7 @@ impl PubkyDataEncryptor {
 
     /// Transition from Noise Handshake phase to Transport phase.
     ///
-    /// Call this once `is_handshake()` returns `Err(IsTransport)`.
+    /// Call this once `is_handshake()` returns `Err(OtherError)`.
     /// Returns the `LinkId` derived from the handshake transcript hash.
     ///
     /// # Errors:
@@ -356,22 +341,18 @@ impl PubkyDataEncryptor {
     /// # Returns:
     ///      - `true` on success, `false` on failure.
     pub async fn send_message(&mut self, plaintext: Vec<u8>) -> Result<(), PubkyDataError> {
-        println!("in send message");
-
         // Phase guard: must be in transport mode
         if !self.context.is_transport() {
-            println!("send_message called but not in transport phase");
             return Err(PubkyDataError::IsHandshake);
         }
 
         let mut out = [0; PUBKY_DATA_MSG_LEN];
-        let len = self.context.write_act(&plaintext, &mut out)?;
+        let len = self
+            .context
+            .write_act(&plaintext, &mut out)
+            .map_err(|_| PubkyDataError::OtherError)?;
 
-        println!("FWD LEN {len} CIPHER {out:?}");
-        let mut packet = [0; PUBKY_DATA_MSG_LEN + 2];
-        let be_bytes = (len as u16).to_be_bytes();
-        packet[0..2].copy_from_slice(&be_bytes[0..2]);
-        packet[2..len + 2].copy_from_slice(&out[0..len]);
+        let packet = encode_packet(&out, len);
 
         // This code path is enabled only for testing
         // of the correct enciphering of a payload.
@@ -379,10 +360,8 @@ impl PubkyDataEncryptor {
             self.last_ciphertext = Some(packet);
         }
 
-        println!("write path {:?}", self.config.write_path.as_str());
         let path = self.config.write_path.as_str();
         let counter = self.context.get_counter();
-        println!("Writing at Slot {counter}");
         let formatted_path = format!("{path}/{counter}");
         if self
             .config
@@ -392,7 +371,7 @@ impl PubkyDataEncryptor {
             .await
             .is_err()
         {
-            return Err(PubkyDataError::HomeserverWriteError);
+            return Err(PubkyDataError::HomeserverResponseError);
         }
         self.context.increment_counter();
         Ok(())
@@ -405,7 +384,6 @@ impl PubkyDataEncryptor {
     pub async fn receive_message(
         &mut self,
     ) -> Result<Vec<[u8; PUBKY_DATA_MSG_LEN]>, PubkyDataError> {
-        println!("in receive message");
         // Phase guard: must be in transport mode
         if !self.context.is_transport() {
             return Err(PubkyDataError::IsHandshake);
@@ -414,7 +392,6 @@ impl PubkyDataEncryptor {
         let mut results = Vec::new();
         let path = self.config.read_path.as_str();
         let counter = self.context.get_counter();
-        println!("Reading at Slot {counter}");
         let public_key = self.context.get_endpoint();
         let formatted_path = format!("{public_key}/{path}/{counter}");
         if let Ok(response) = self
@@ -424,20 +401,10 @@ impl PubkyDataEncryptor {
             .get(formatted_path)
             .await
         {
-            println!("getting result");
             if response.status().is_success() {
                 if let Ok(ciphertext) = response.bytes().await {
-                    println!("getting response bytes...");
-                    if ciphertext.len() > PUBKY_DATA_MSG_LEN + 2 {
-                        //TODO: BadLengthCiphertext
-                    }
-                    let mut buf_len = [0; 2];
-                    buf_len[0..2].copy_from_slice(&ciphertext[0..2]);
-                    let len = u16::from_be_bytes(buf_len);
-                    let mut message = [0; PUBKY_DATA_MSG_LEN];
-                    message[0..len as usize].copy_from_slice(&ciphertext[2..len as usize + 2]);
+                    let (mut message, len) = decode_packet(&ciphertext)?;
                     let mut payload = [0; PUBKY_DATA_MSG_LEN];
-                    println!("RCV LEN {len} CIPHER {message:?}");
 
                     // This code path is enabled only for testing
                     // of the correct deciphering of a payload.
@@ -447,15 +414,15 @@ impl PubkyDataEncryptor {
 
                     let _ = self
                         .context
-                        .read_act(&mut message, &mut payload, len as usize);
+                        .read_act(&mut message, &mut payload, len);
                     results.push(payload);
                     self.context.increment_counter();
                 }
             } else {
-                return Err(PubkyDataError::HomeserverReadError);
+                return Err(PubkyDataError::HomeserverResponseError);
             }
         } else {
-            return Err(PubkyDataError::HomeserverReadError);
+            return Err(PubkyDataError::HomeserverResponseError);
         }
         Ok(results)
     }
@@ -561,9 +528,6 @@ impl PubkyDataEncryptor {
         // For replay, we need to re-read ALL messages (both our own writes and
         // the peer's writes) from the homeservers and feed them through Snow.
 
-        // Compute the local public key (for reading our own writes back)
-        let _local_public_key = config.local_session.info().public_key();
-
         let mut replay_counter: u32 = 0;
 
         // How many actions were completed in the original session?
@@ -619,15 +583,7 @@ impl PubkyDataEncryptor {
                         .await
                         .map_err(|_| PubkyDataError::RestoreReplayError)?;
 
-                    if ciphertext.len() > PUBKY_DATA_MSG_LEN + 2 {
-                        return Err(PubkyDataError::BadLengthCiphertext);
-                    }
-
-                    let mut buf_len = [0; 2];
-                    buf_len[0..2].copy_from_slice(&ciphertext[0..2]);
-                    let len = u16::from_be_bytes(buf_len) as usize;
-                    let mut message = [0; PUBKY_DATA_MSG_LEN];
-                    message[0..len].copy_from_slice(&ciphertext[2..len + 2]);
+                    let (mut message, len) = decode_packet(&ciphertext)?;
                     let mut payload = [0; PUBKY_DATA_MSG_LEN];
 
                     context
@@ -642,9 +598,7 @@ impl PubkyDataEncryptor {
         }
 
         // Now set the context state to match the saved snapshot
-        let link_id;
-
-        if state.phase == NoisePhase::Transport {
+        let link_id = if state.phase == NoisePhase::Transport {
             // Verify the handshake completed
             if context.is_handshake() {
                 return Err(PubkyDataError::RestoreReplayError);
@@ -672,18 +626,14 @@ impl PubkyDataEncryptor {
             // Set counter to saved value (includes handshake + transport messages)
             context.set_counter(state.counter);
 
-            link_id = if let Some(id) = state.link_id {
-                Some(LinkId(id))
-            } else {
-                Some(LinkId(hash))
-            };
+            Some(LinkId(state.link_id.unwrap_or(hash)))
         } else {
             // Handshake restore: set step/sub_step/counter
             context.set_noise_step(state.noise_step);
             context.set_sub_step_index(state.sub_step_index as usize);
             context.set_counter(state.counter);
-            link_id = None;
-        }
+            None
+        };
 
         Ok(PubkyDataEncryptor {
             config,
@@ -695,32 +645,12 @@ impl PubkyDataEncryptor {
         })
     }
 
-    /// Generate a backup of the current session state (legacy method).
-    pub async fn generate_backup(&self, _commit: bool) -> Result<(), PubkyDataError> {
-        self.persist_snapshot().await
-    }
-
     /// Get the LinkId for this session (available after transition_transport).
     pub fn get_link_id(&self) -> Option<LinkId> {
         self.link_id
     }
 
-    // Test-only methods
-    #[cfg(test)]
-    pub fn enable_tampering(&mut self) {
-        self.simulate_tampering = true;
-    }
-
-    #[cfg(test)]
-    pub fn test_get_last_ciphertext(&self) -> Option<[u8; PUBKY_DATA_MSG_LEN + 2]> {
-        self.last_ciphertext
-    }
-}
-
-// Allow test access from e2e crate (not #[cfg(test)] since e2e is a separate crate)
-impl PubkyDataEncryptor {
     /// Test-only: enable ciphertext tampering simulation.
-    /// This method is intended for use in integration tests.
     pub fn test_enable_tampering(&mut self) {
         self.simulate_tampering = true;
     }
