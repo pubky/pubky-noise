@@ -2,7 +2,7 @@ use ed25519_dalek::SecretKey;
 use pubky::PublicKey;
 
 use snow::Builder;
-use snow::{HandshakeState, TransportState};
+use snow::{HandshakeState, StatelessTransportState};
 
 pub const PUBKY_DATA_MSG_LEN: usize = 1000;
 
@@ -304,7 +304,11 @@ pub struct DataLinkContext {
     noise_phase: NoisePhase,
 
     noise_handshake: Option<HandshakeState>,
-    noise_transport: Option<TransportState>,
+    noise_transport: Option<StatelessTransportState>,
+    /// Explicit nonce for outbound transport messages.
+    sending_nonce: u64,
+    /// Explicit nonce for inbound transport messages.
+    receiving_nonce: u64,
 
     endpoint_pubkey: PublicKey,
 
@@ -406,6 +410,8 @@ impl DataLinkContext {
 
             noise_handshake: Some(noise_stack.unwrap()),
             noise_transport: None,
+            sending_nonce: 0,
+            receiving_nonce: 0,
 
             endpoint_pubkey,
 
@@ -472,12 +478,18 @@ impl DataLinkContext {
         {
             return Err(ContextError::OngoingHandshake);
         }
-        let transport = self.noise_handshake.take().unwrap().into_transport_mode();
+        let transport = self
+            .noise_handshake
+            .take()
+            .unwrap()
+            .into_stateless_transport_mode();
         if let Ok(transport) = transport {
             println!("TRANSPORT OK");
             //TODO: zeroize HandshakeState
             self.noise_transport = Some(transport);
             self.noise_phase = NoisePhase::Transport;
+            self.sending_nonce = 0;
+            self.receiving_nonce = 0;
             return Ok(());
         }
         println!("TRANSPORT NOT OK");
@@ -554,13 +566,15 @@ impl DataLinkContext {
                 payload.len(),
                 message.len()
             );
-            let result = self
-                .noise_transport
-                .as_mut()
-                .unwrap()
-                .write_message(&payload, message.as_mut());
+            let nonce = self.sending_nonce;
+            let result = self.noise_transport.as_ref().unwrap().write_message(
+                nonce,
+                &payload,
+                message.as_mut(),
+            );
             match result {
                 Ok(write_size) => {
+                    self.sending_nonce += 1;
                     return Ok(write_size);
                 }
                 Err(_e) => {
@@ -606,13 +620,15 @@ impl DataLinkContext {
             }
         } else if self.noise_phase == NoisePhase::Transport {
             println!("READ TRANSPORT");
-            let ret = self
-                .noise_transport
-                .as_mut()
-                .unwrap()
-                .read_message(&message[..index], payload);
+            let nonce = self.receiving_nonce;
+            let ret = self.noise_transport.as_ref().unwrap().read_message(
+                nonce,
+                &message[..index],
+                payload,
+            );
             match ret {
                 Ok(_) => {
+                    self.receiving_nonce += 1;
                     return Ok(());
                 }
                 Err(_e) => {
