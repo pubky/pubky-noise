@@ -4,6 +4,8 @@ use pubky::PublicKey;
 use snow::Builder;
 use snow::{HandshakeState, StatelessTransportState};
 
+use crate::snow_crypto_resolver::ReplayResolver;
+
 pub const PUBKY_DATA_MSG_LEN: usize = 1000;
 
 #[derive(PartialEq, Debug)]
@@ -164,7 +166,7 @@ pub enum PatternError {
 }
 
 impl HandshakePattern {
-    fn pattern_to_string(&self) -> Result<String, ()> {
+    pub fn pattern_to_string(&self) -> Result<String, ()> {
         match self {
             HandshakePattern::PatternN => Ok(String::from("N")),
             HandshakePattern::PatternNN => Ok(String::from("NN")),
@@ -300,6 +302,10 @@ pub struct DataLinkContext {
     // ephemeral key always handled by the snow
     local_static_seckey: Option<SecretKey>,
 
+    /// The local ephemeral secret key used for this session.
+    /// Captured at construction time so it can be persisted for restore.
+    local_ephemeral_seckey: [u8; 32],
+
     noise_step: NoiseStep,
     noise_phase: NoisePhase,
 
@@ -334,47 +340,53 @@ impl DataLinkContext {
         endpoint_pubkey: PublicKey,
         local_pkarr_pubkey: Option<PublicKey>,
     ) -> Result<DataLinkContext, ContextError> {
-        // Section 5.3 The Handshake Object
-        //
-        // Perform the following steps:
-        // - Derives a protocol_name byte sequence by combining the names for
-        //   the handshake pattern and crypto functions, as specified in Section 8.
-        //   Calls InitializeSymmetric(protocol_name).
+        Self::new_with_ephemeral(
+            handshake_pattern,
+            initiator,
+            _prologue,
+            local_static_key,
+            endpoint_pubkey,
+            local_pkarr_pubkey,
+            None,
+        )
+    }
 
-        let mut protocol_name = String::from("Noise");
-        protocol_name.push('_');
-        let pattern_string = if let Ok(pattern_string) = handshake_pattern.pattern_to_string() {
-            pattern_string
-        } else {
-            return Err(ContextError::Init);
-        };
+    /// Build the Snow protocol name string for the given pattern.
+    /// We're using ChaCha as the stream cipher. Poly1305 as the MAC and SHA256 as a hash function.
+    fn build_protocol_name(handshake_pattern: &HandshakePattern) -> Result<String, ContextError> {
+        let mut protocol_name = String::from("Noise_");
+        let pattern_string = handshake_pattern
+            .pattern_to_string()
+            .map_err(|_| ContextError::Init)?;
         protocol_name.push_str(&pattern_string);
-        let basic_string = String::from("_25519_ChaChaPoly_SHA256");
-        protocol_name.push_str(&basic_string);
+        protocol_name.push_str("_25519_ChaChaPoly_SHA256");
+        Ok(protocol_name)
+    }
 
-        println!("Current Protocol Name {protocol_name}");
+    /// Build a Snow HandshakeState using the ReplayResolver with the given ephemeral seed.
+    fn build_handshake_state(
+        protocol_name: &str,
+        handshake_pattern: &HandshakePattern,
+        initiator: bool,
+        local_static_key: &Option<SecretKey>,
+        ephemeral_seed: &[u8; 32],
+    ) -> Result<HandshakeState, ContextError> {
+        let params = protocol_name.parse().map_err(|_| ContextError::Init)?;
 
-        let builder_init = protocol_name.clone().parse();
-        if builder_init.is_err() {
-            return Err(ContextError::Init);
-        }
-        let builder_init = builder_init.unwrap();
-
-        let builder = Builder::new(builder_init);
+        let resolver = ReplayResolver::new(*ephemeral_seed);
+        let builder = Builder::with_resolver(params, resolver);
 
         let noise_stack = if handshake_pattern.needs_local_key() {
-            if local_static_key.is_none() {
-                return Err(ContextError::Init);
-            }
+            let key = local_static_key.as_ref().ok_or(ContextError::Init)?;
             if initiator {
                 builder
-                    .local_private_key(&local_static_key.unwrap())
-                    .unwrap()
+                    .local_private_key(key)
+                    .map_err(|_| ContextError::Init)?
                     .build_initiator()
             } else {
                 builder
-                    .local_private_key(&local_static_key.unwrap())
-                    .unwrap()
+                    .local_private_key(key)
+                    .map_err(|_| ContextError::Init)?
                     .build_responder()
             }
         } else if initiator {
@@ -383,10 +395,51 @@ impl DataLinkContext {
             builder.build_responder()
         };
 
-        println!("build result {noise_stack:?}");
-        if noise_stack.is_err() {
-            return Err(ContextError::Init);
-        }
+        noise_stack.map_err(|_| ContextError::Init)
+    }
+
+    /// Create a new DataLinkContext, optionally with a pre-set ephemeral key.
+    ///
+    /// When `ephemeral_secret` is `None`, a fresh 32-byte random seed is generated.
+    /// When `Some`, the provided seed is used (for session restore / replay).
+    pub fn new_with_ephemeral(
+        handshake_pattern: HandshakePattern,
+        initiator: bool,
+        _prologue: Vec<u8>,
+        local_static_key: Option<SecretKey>,
+        endpoint_pubkey: PublicKey,
+        local_pkarr_pubkey: Option<PublicKey>,
+        ephemeral_secret: Option<[u8; 32]>,
+    ) -> Result<DataLinkContext, ContextError> {
+        // Section 5.3 The Handshake Object
+        //
+        // Perform the following steps:
+        // - Derives a protocol_name byte sequence by combining the names for
+        //   the handshake pattern and crypto functions, as specified in Section 8.
+        //   Calls InitializeSymmetric(protocol_name).
+
+        let protocol_name = Self::build_protocol_name(&handshake_pattern)?;
+        println!("Current Protocol Name {protocol_name}");
+
+        // Generate or use provided ephemeral seed
+        let ephemeral_seed = match ephemeral_secret {
+            Some(seed) => seed,
+            None => {
+                let mut seed = [0u8; 32];
+                getrandom::fill(&mut seed).map_err(|_| ContextError::Init)?;
+                seed
+            }
+        };
+
+        let handshake_state = Self::build_handshake_state(
+            &protocol_name,
+            &handshake_pattern,
+            initiator,
+            &local_static_key,
+            &ephemeral_seed,
+        )?;
+
+        println!("build result Ok");
 
         // - Sets the initator s, e, rs and re variables to the corresponding
         //   arguments.
@@ -405,11 +458,14 @@ impl DataLinkContext {
             //TODO: for now keep keys separated from the state.
             local_static_seckey: local_static_key,
 
+            local_ephemeral_seckey: ephemeral_seed,
+
             noise_step: NoiseStep::StepOne,
             noise_phase: NoisePhase::HandShake,
 
-            noise_handshake: Some(noise_stack.unwrap()),
+            noise_handshake: Some(handshake_state),
             noise_transport: None,
+
             sending_nonce: 0,
             receiving_nonce: 0,
 
