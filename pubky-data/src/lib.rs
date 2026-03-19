@@ -229,16 +229,9 @@ impl PubkyDataEncryptor {
         })
     }
 
-    /// Check if this encryptor is still in the Noise Handshake phase.
-    ///
-    /// # Errors:
-    ///      - Returns [`PubkyDataError::OtherError`] if already transitioned to transport.
-    pub fn is_handshake(&self) -> Result<(), PubkyDataError> {
-        if self.context.is_handshake() {
-            Ok(())
-        } else {
-            Err(PubkyDataError::OtherError)
-        }
+    /// Returns `true` if the Noise handshake has completed.
+    pub fn is_handshake_complete(&self) -> bool {
+        !self.context.is_handshake()
     }
 
     /// Handle the forwarding and processing of Noise handshake messages.
@@ -318,7 +311,7 @@ impl PubkyDataEncryptor {
 
     /// Transition from Noise Handshake phase to Transport phase.
     ///
-    /// Call this once `is_handshake()` returns `Err(OtherError)`.
+    /// Call this once `is_handshake_complete()` returns `true`.
     /// Returns the `LinkId` derived from the handshake transcript hash.
     ///
     /// # Errors:
@@ -335,27 +328,21 @@ impl PubkyDataEncryptor {
 
     /// Encrypt and send plaintext over the established transport.
     ///
-    /// # Parameters:
-    ///      - `plaintext`: Arbitrary byte payload to encrypt and send.
-    ///
-    /// # Returns:
-    ///      - `true` on success, `false` on failure.
-    pub async fn send_message(&mut self, plaintext: Vec<u8>) -> Result<(), PubkyDataError> {
+    /// Returns `true` on success, `false` on failure.
+    pub async fn send_message(&mut self, plaintext: &[u8]) -> bool {
         // Phase guard: must be in transport mode
         if !self.context.is_transport() {
-            return Err(PubkyDataError::IsHandshake);
+            return false;
         }
 
         let mut out = [0; PUBKY_DATA_MSG_LEN];
-        let len = self
-            .context
-            .write_act(&plaintext, &mut out)
-            .map_err(|_| PubkyDataError::OtherError)?;
+        let len = match self.context.write_act(plaintext, &mut out) {
+            Ok(len) => len,
+            Err(_) => return false,
+        };
 
         let packet = encode_packet(&out, len);
 
-        // This code path is enabled only for testing
-        // of the correct enciphering of a payload.
         if self.simulate_tampering {
             self.last_ciphertext = Some(packet);
         }
@@ -371,22 +358,20 @@ impl PubkyDataEncryptor {
             .await
             .is_err()
         {
-            return Err(PubkyDataError::HomeserverResponseError);
+            return false;
         }
         self.context.increment_counter();
-        Ok(())
+        true
     }
 
     /// Receive and decrypt a message from the remote peer.
     ///
     /// # Returns:
     ///      - A vector of decrypted payloads (empty on failure).
-    pub async fn receive_message(
-        &mut self,
-    ) -> Result<Vec<[u8; PUBKY_DATA_MSG_LEN]>, PubkyDataError> {
+    pub async fn receive_message(&mut self) -> Vec<[u8; PUBKY_DATA_MSG_LEN]> {
         // Phase guard: must be in transport mode
         if !self.context.is_transport() {
-            return Err(PubkyDataError::IsHandshake);
+            return Vec::new();
         }
 
         let mut results = Vec::new();
@@ -403,28 +388,21 @@ impl PubkyDataEncryptor {
         {
             if response.status().is_success() {
                 if let Ok(ciphertext) = response.bytes().await {
-                    let (mut message, len) = decode_packet(&ciphertext)?;
-                    let mut payload = [0; PUBKY_DATA_MSG_LEN];
+                    if let Ok((mut message, len)) = decode_packet(&ciphertext) {
+                        let mut payload = [0; PUBKY_DATA_MSG_LEN];
 
-                    // This code path is enabled only for testing
-                    // of the correct deciphering of a payload.
-                    if self.simulate_tampering {
-                        message[1] = 0xff;
+                        if self.simulate_tampering {
+                            message[1] = 0xff;
+                        }
+
+                        let _ = self.context.read_act(&mut message, &mut payload, len);
+                        results.push(payload);
+                        self.context.increment_counter();
                     }
-
-                    let _ = self
-                        .context
-                        .read_act(&mut message, &mut payload, len);
-                    results.push(payload);
-                    self.context.increment_counter();
                 }
-            } else {
-                return Err(PubkyDataError::HomeserverResponseError);
             }
-        } else {
-            return Err(PubkyDataError::HomeserverResponseError);
         }
-        Ok(results)
+        results
     }
 
     /// Close and clean up this encryptor's Noise session.
