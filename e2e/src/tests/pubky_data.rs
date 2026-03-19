@@ -1,58 +1,40 @@
 use std::sync::Arc;
 
-use pubky_testnet::{pubky::Keypair, EphemeralTestnet};
+use pubky_testnet::{
+    pubky::{Keypair, PublicKey},
+    EphemeralTestnet,
+};
 
 use pubky_data::serializer::PubkyDataSessionState;
 use pubky_data::snow_crypto::{HandshakePattern, PUBKY_DATA_MSG_LEN};
 use pubky_data::{PubkyDataConfig, PubkyDataEncryptor, PubkyDataError};
 
-//TODO:
-//	- test max message size limit
-//	- test minimal message size
-//	- test single-message multiple ciphertexts
-//	- test multiple data encryptor parallel
-//	- test PubkySession not signed up ?
-
-fn cipher_check(plaintext: Vec<u8>, ciphertext: &[u8; PUBKY_DATA_MSG_LEN + 2]) {
+fn cipher_check(plaintext: &[u8], ciphertext: &[u8; PUBKY_DATA_MSG_LEN + 2]) {
     let plaintext_len = plaintext.len();
     let mut match_check = 0;
     for counter in 0..plaintext_len {
-        let ciphered_byte = ciphertext[counter];
-        if plaintext[counter] == ciphered_byte {
+        if plaintext[counter] == ciphertext[counter] {
             match_check += 1;
         }
     }
     // i.e plaintext == ciphertext byte-for-byte
     if match_check == plaintext_len {
-        panic!()
+        panic!("plaintext matches ciphertext byte-for-byte — encryption failed")
     }
 }
 
-#[tokio::test]
-#[should_panic]
-async fn pubky_data_cipher_check_utility_positive() {
-    let plaintext = [b'A'; PUBKY_DATA_MSG_LEN + 2];
-    let ciphertext = plaintext;
-    cipher_check(plaintext.to_vec(), &ciphertext);
+/// Test fixture: a pair of encryptors with their configs, ready for handshake.
+struct EncryptorPair {
+    initiator: PubkyDataEncryptor,
+    responder: PubkyDataEncryptor,
+    initiator_config: Arc<PubkyDataConfig>,
+    responder_config: Arc<PubkyDataConfig>,
+    initiator_public_key: PublicKey,
+    responder_public_key: PublicKey,
 }
 
-#[tokio::test]
-async fn pubky_data_cipher_check_utility_negative() {
-    let plaintext = [b'A'; PUBKY_DATA_MSG_LEN + 2];
-    let mut ciphertext = plaintext;
-    ciphertext[0] = b'B';
-    cipher_check(plaintext.to_vec(), &ciphertext);
-}
-
-#[tokio::test]
-async fn pubky_data_snow_test_initiator_first() {
-    // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
-
+/// Create a pair of encryptors on the same homeserver.
+async fn setup_encryptors(testnet: &EphemeralTestnet, pattern: &str) -> EncryptorPair {
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -75,7 +57,7 @@ async fn pubky_data_snow_test_initiator_first() {
     let initiator_config = PubkyDataConfig::new(
         initiator_keypair.secret_key(),
         0,
-        "NN".to_string(),
+        pattern,
         initiator_session.clone(),
         server_path_string.clone(),
         initiator_pubky,
@@ -86,9 +68,9 @@ async fn pubky_data_snow_test_initiator_first() {
     let responder_config = PubkyDataConfig::new(
         responder_keypair.secret_key(),
         0,
-        "NN".to_string(),
+        pattern,
         responder_session.clone(),
-        server_path_string.clone(),
+        server_path_string,
         responder_pubky,
     )
     .unwrap();
@@ -96,69 +78,220 @@ async fn pubky_data_snow_test_initiator_first() {
     let initiator_ephemeral_keypair = Keypair::random();
     let responder_ephemeral_keypair = Keypair::random();
 
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
+    let initiator_public_key = initiator_session.info().public_key().clone();
+    let responder_public_key = responder_session.info().public_key().clone();
 
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
+    let initiator = PubkyDataEncryptor::new(
+        initiator_config.clone(),
         initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
         true,
         responder_public_key.clone(),
     )
     .unwrap();
 
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
+    let responder = PubkyDataEncryptor::new(
+        responder_config.clone(),
         responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
         false,
         initiator_public_key.clone(),
     )
     .unwrap();
 
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
+    EncryptorPair {
+        initiator,
+        responder,
+        initiator_config,
+        responder_config,
+        initiator_public_key,
+        responder_public_key,
+    }
+}
 
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
+/// Create a pair of encryptors on separate homeservers.
+async fn setup_encryptors_dual_server(testnet: &EphemeralTestnet, pattern: &str) -> EncryptorPair {
+    let first_server = testnet.homeserver_app();
+    let second_server = testnet.homeserver_app();
 
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
+    let initiator_pubky = testnet.sdk().unwrap();
+    let responder_pubky = testnet.sdk().unwrap();
 
-    // Transport
-    let data_payload = String::from("Hello_World_Pubky_Data");
-    let raw_bytes = data_payload.as_bytes().to_vec();
+    let initiator_signer = initiator_pubky.signer(Keypair::random());
+    let initiator_session = initiator_signer
+        .signup(&first_server.public_key(), None)
+        .await
+        .unwrap();
 
-    initiator_encryptor.send_message(raw_bytes).await.unwrap();
+    let responder_signer = responder_pubky.signer(Keypair::random());
+    let responder_session = responder_signer
+        .signup(&second_server.public_key(), None)
+        .await
+        .unwrap();
 
-    let results = responder_encryptor.receive_message().await.unwrap();
+    let server_path_string = "/pub/data".to_string();
 
+    let initiator_keypair = Keypair::random();
+    let initiator_config = PubkyDataConfig::new(
+        initiator_keypair.secret_key(),
+        0,
+        pattern,
+        initiator_session.clone(),
+        server_path_string.clone(),
+        initiator_pubky,
+    )
+    .unwrap();
+
+    let responder_keypair = Keypair::random();
+    let responder_config = PubkyDataConfig::new(
+        responder_keypair.secret_key(),
+        0,
+        pattern,
+        responder_session.clone(),
+        server_path_string,
+        responder_pubky,
+    )
+    .unwrap();
+
+    let initiator_ephemeral_keypair = Keypair::random();
+    let responder_ephemeral_keypair = Keypair::random();
+
+    let initiator_public_key = initiator_session.info().public_key().clone();
+    let responder_public_key = responder_session.info().public_key().clone();
+
+    let initiator = PubkyDataEncryptor::new(
+        initiator_config.clone(),
+        initiator_ephemeral_keypair.secret_key(),
+        true,
+        responder_public_key.clone(),
+    )
+    .unwrap();
+
+    let responder = PubkyDataEncryptor::new(
+        responder_config.clone(),
+        responder_ephemeral_keypair.secret_key(),
+        false,
+        initiator_public_key.clone(),
+    )
+    .unwrap();
+
+    EncryptorPair {
+        initiator,
+        responder,
+        initiator_config,
+        responder_config,
+        initiator_public_key,
+        responder_public_key,
+    }
+}
+
+/// Create a pair of encryptors with tampering enabled on both sides.
+async fn setup_encryptors_with_tampering(
+    testnet: &EphemeralTestnet,
+    pattern: &str,
+) -> EncryptorPair {
+    let mut pair = setup_encryptors(testnet, pattern).await;
+    pair.initiator.test_enable_tampering();
+    pair.responder.test_enable_tampering();
+    pair
+}
+
+/// Complete an NN handshake and transition both sides to transport.
+async fn complete_nn_handshake(pair: &mut EncryptorPair) {
+    let _ = pair.initiator.handle_handshake().await;
+    let _ = pair.responder.handle_handshake().await;
+    let _ = pair.initiator.handle_handshake().await;
+
+    assert!(pair.initiator.is_handshake_complete());
+    assert!(pair.responder.is_handshake_complete());
+
+    pair.initiator.transition_transport().unwrap();
+    pair.responder.transition_transport().unwrap();
+}
+
+/// Complete an XX handshake and transition both sides to transport.
+async fn complete_xx_handshake(pair: &mut EncryptorPair) {
+    let _ = pair.initiator.handle_handshake().await;
+    let _ = pair.responder.handle_handshake().await;
+    let _ = pair.initiator.handle_handshake().await;
+    let _ = pair.responder.handle_handshake().await;
+
+    assert!(pair.initiator.is_handshake_complete());
+    assert!(pair.responder.is_handshake_complete());
+
+    pair.initiator.transition_transport().unwrap();
+    pair.responder.transition_transport().unwrap();
+}
+
+/// Send a message from sender to receiver and verify it arrives correctly.
+async fn send_and_verify(
+    sender: &mut PubkyDataEncryptor,
+    receiver: &mut PubkyDataEncryptor,
+    message: &str,
+) {
+    sender.send_message(message.as_bytes()).await;
+    let results = receiver.receive_message().await;
+    assert!(!results.is_empty());
+    let padded_msg = String::from_utf8(results[0].to_vec()).unwrap();
+    let (msg, _) = padded_msg.split_at(message.len());
+    assert_eq!(msg, message);
+}
+
+/// Send a message and verify the receiver gets tampered (non-UTF8) data.
+async fn send_and_verify_tampered(
+    sender: &mut PubkyDataEncryptor,
+    receiver: &mut PubkyDataEncryptor,
+    message: &str,
+) {
+    let raw_bytes = message.as_bytes();
+    sender.send_message(raw_bytes).await;
+
+    let results = receiver.receive_message().await;
     assert!(!results.is_empty());
     for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
-        let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello_World_Pubky_Data");
+        let padded_msg = String::from_utf8(ret.to_vec());
+        assert!(padded_msg.is_err());
     }
 
-    let data_payload = String::from("Pubky_Data_Rocks");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-    responder_encryptor.send_message(raw_bytes).await.unwrap();
-
-    let results = initiator_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
-        let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Pubky_Data_Rocks");
+    let last_ciphertext = sender.test_last_ciphertext();
+    if let Some(ct) = last_ciphertext {
+        cipher_check(raw_bytes, &ct);
+    } else {
+        panic!("Expected last_ciphertext to be Some after send");
     }
+}
+
+#[tokio::test]
+#[should_panic]
+async fn pubky_data_cipher_check_utility_positive() {
+    let plaintext = [b'A'; PUBKY_DATA_MSG_LEN + 2];
+    let ciphertext = plaintext;
+    cipher_check(&plaintext, &ciphertext);
+}
+
+#[tokio::test]
+async fn pubky_data_cipher_check_utility_negative() {
+    let plaintext = [b'A'; PUBKY_DATA_MSG_LEN + 2];
+    let mut ciphertext = plaintext;
+    ciphertext[0] = b'B';
+    cipher_check(&plaintext, &ciphertext);
+}
+
+#[tokio::test]
+async fn pubky_data_snow_test_initiator_first() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+
+    send_and_verify(
+        &mut pair.initiator,
+        &mut pair.responder,
+        "Hello_World_Pubky_Data",
+    )
+    .await;
+    send_and_verify(&mut pair.responder, &mut pair.initiator, "Pubky_Data_Rocks").await;
 }
 
 #[tokio::test]
@@ -170,114 +303,17 @@ async fn pubky_data_snow_test_responder_first() {
         .await
         .unwrap();
 
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = testnet.sdk().unwrap();
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
 
-    let server = testnet.homeserver_app();
-
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
+    // Responder sends first
+    send_and_verify(
+        &mut pair.responder,
+        &mut pair.initiator,
+        "Hello World Pubky Data",
     )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
-
-    // Transport
-    let data_payload = String::from("Hello World Pubky Data");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-
-    responder_encryptor.send_message(raw_bytes).await.unwrap();
-
-    let results = initiator_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
-        let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello World Pubky Data");
-    }
-
-    let data_payload = String::from("Pubky Data Rocks");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-
-    initiator_encryptor.send_message(raw_bytes).await.unwrap();
-
-    let results = responder_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
-        let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Pubky Data Rocks");
-    }
+    .await;
+    send_and_verify(&mut pair.initiator, &mut pair.responder, "Pubky Data Rocks").await;
 }
 
 #[tokio::test]
@@ -288,108 +324,16 @@ async fn pubky_data_snow_test_responder_tampering() {
         .build()
         .await
         .unwrap();
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = testnet.sdk().unwrap();
+    let mut pair = setup_encryptors_with_tampering(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
 
-    let server = testnet.homeserver_app();
-
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
+    // Responder sends tampered message, initiator receives garbage
+    send_and_verify_tampered(
+        &mut pair.responder,
+        &mut pair.initiator,
+        "Hello World Pubky Data",
     )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-    initiator_encryptor.test_enable_tampering();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-    responder_encryptor.test_enable_tampering();
-
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
-
-    // Transport
-    let data_payload = String::from("Hello World Pubky Data");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-    println!("RAW BYTES {:?}", raw_bytes);
-    responder_encryptor.send_message(raw_bytes.clone()).await.unwrap();
-
-    let results = initiator_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec());
-        assert!(padded_msg.is_err());
-    }
-
-    let last_ciphertext = responder_encryptor.test_last_ciphertext();
-    if let Some(ct) = last_ciphertext {
-        cipher_check(raw_bytes, &ct);
-    } else {
-        panic!();
-    }
+    .await;
 }
 
 #[tokio::test]
@@ -400,109 +344,16 @@ async fn pubky_data_snow_test_initiator_tampering() {
         .build()
         .await
         .unwrap();
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = testnet.sdk().unwrap();
+    let mut pair = setup_encryptors_with_tampering(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
 
-    let server = testnet.homeserver_app();
-
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
+    // Initiator sends tampered message, responder receives garbage
+    send_and_verify_tampered(
+        &mut pair.initiator,
+        &mut pair.responder,
+        "Hello World Pubky Data",
     )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-    initiator_encryptor.test_enable_tampering();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-    responder_encryptor.test_enable_tampering();
-
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-
-    // yield Err(PubkyDataError::IsTransport)
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
-
-    // Transport
-    let data_payload = String::from("Hello World Pubky Data");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-    println!("RAW BYTES {:?}", raw_bytes);
-    initiator_encryptor.send_message(raw_bytes.clone()).await.unwrap();
-
-    let results = responder_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec());
-        assert!(padded_msg.is_err());
-    }
-
-    let last_ciphertext = initiator_encryptor.test_last_ciphertext();
-    if let Some(ct) = last_ciphertext {
-        cipher_check(raw_bytes, &ct);
-    } else {
-        panic!();
-    }
+    .await;
 }
 
 #[tokio::test]
@@ -513,100 +364,10 @@ async fn pubky_data_snow_null_message() {
         .build()
         .await
         .unwrap();
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = testnet.sdk().unwrap();
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
 
-    let server = testnet.homeserver_app();
-
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
-    )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-
-    // yield Err(PubkyDataError::IsTransport)
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
-
-    // Transport
-    let data_payload = String::from("");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-    responder_encryptor.send_message(raw_bytes).await.unwrap();
-
-    let results = initiator_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
-        let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "");
-    }
+    send_and_verify(&mut pair.responder, &mut pair.initiator, "").await;
 }
 
 // //#[tokio::test]
@@ -751,9 +512,9 @@ async fn pubky_data_snow_test_unknown_pattern() {
     let init_config_ret = PubkyDataConfig::new(
         initiator_keypair.secret_key(),
         0,
-        "BA".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
+        "BA",
+        initiator_session,
+        server_path_string,
         initiator_pubky,
     );
     assert!(init_config_ret.is_err());
@@ -790,9 +551,9 @@ async fn pubky_data_snow_test_snow_noise_build_error() {
     let mut config = PubkyDataConfig::new(
         initiator_keypair.secret_key(),
         0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
+        "NN",
+        initiator_session,
+        server_path_string,
         initiator_pubky,
     )
     .unwrap();
@@ -801,14 +562,12 @@ async fn pubky_data_snow_test_snow_noise_build_error() {
     Arc::get_mut(&mut config).unwrap().default_pattern = HandshakePattern::TestOnlyPatternAA;
 
     let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
 
     let responder_public_key = responder_session.info().public_key();
 
     let init_encryptor_ret = PubkyDataEncryptor::new(
         config,
         initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
         true,
         responder_public_key.clone(),
     );
@@ -823,103 +582,19 @@ async fn pubky_data_snow_test_cleaning_sequence() {
         .build()
         .await
         .unwrap();
-    let server = testnet.homeserver_app();
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = initiator_pubky.clone();
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
 
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
+    send_and_verify(
+        &mut pair.initiator,
+        &mut pair.responder,
+        "Hello_World_Pubky_Data",
     )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
-
-    // Transport
-    let data_payload = String::from("Hello_World_Pubky_Data");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-
-    initiator_encryptor.send_message(raw_bytes).await.unwrap();
-
-    let results = responder_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
-        let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello_World_Pubky_Data");
-    }
+    .await;
 
     // Close both encryptors
-    initiator_encryptor.close();
-    responder_encryptor.close();
+    pair.initiator.close();
+    pair.responder.close();
 }
 
 #[tokio::test]
@@ -930,100 +605,17 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
         .build()
         .await
         .unwrap();
-    let server = testnet.homeserver_app();
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = initiator_pubky.clone();
+    let mut pair = setup_encryptors(&testnet, "XX").await;
+    let initiator_public_key = pair.initiator_public_key.clone();
+    let responder_public_key = pair.responder_public_key.clone();
+    complete_xx_handshake(&mut pair).await;
 
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "XX".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
+    send_and_verify(
+        &mut pair.initiator,
+        &mut pair.responder,
+        "Hello_World_Pubky_Data",
     )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "XX".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee, s, es
-    // -> s, se
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
-
-    // Transport
-    let data_payload = String::from("Hello_World_Pubky_Data");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-    initiator_encryptor.send_message(raw_bytes).await.unwrap();
-
-    let results = responder_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
-        let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello_World_Pubky_Data");
-    }
+    .await;
 
     // ===== Verify what's actually stored on the homeserver using pubky SDK =====
     let verify_client = testnet.sdk().unwrap();
@@ -1188,108 +780,15 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
         .build()
         .await
         .unwrap();
-    let server = testnet.homeserver_app();
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = initiator_pubky.clone();
+    let mut pair = setup_encryptors_with_tampering(&testnet, "XX").await;
+    complete_xx_handshake(&mut pair).await;
 
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "XX".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
+    send_and_verify_tampered(
+        &mut pair.initiator,
+        &mut pair.responder,
+        "Hello_World_Pubky_Data",
     )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "XX".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-    initiator_encryptor.test_enable_tampering();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-    responder_encryptor.test_enable_tampering();
-
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee, s, es
-    // -> s, se
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
-
-    // Transport
-    let data_payload = String::from("Hello_World_Pubky_Data");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-    initiator_encryptor.send_message(raw_bytes.clone()).await.unwrap();
-
-    let results = responder_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec());
-        assert!(padded_msg.is_err());
-    }
-
-    let last_ciphertext = initiator_encryptor.test_last_ciphertext();
-    if let Some(ct) = last_ciphertext {
-        cipher_check(raw_bytes, &ct);
-    } else {
-        panic!();
-    }
+    .await;
 }
 
 #[tokio::test]
@@ -1299,103 +798,17 @@ async fn pubky_data_snow_test_simple_backup() {
         .build()
         .await
         .unwrap();
-    let server = testnet.homeserver_app();
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = initiator_pubky.clone();
+    let mut pair = setup_encryptors(&testnet, "XX").await;
+    complete_xx_handshake(&mut pair).await;
 
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "XX".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
+    send_and_verify(
+        &mut pair.initiator,
+        &mut pair.responder,
+        "Hello_World_Pubky_Data",
     )
-    .unwrap();
+    .await;
 
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "XX".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee, s, es
-    // -> s, se
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
-
-    // Transport
-    let data_payload = String::from("Hello_World_Pubky_Data");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-
-    initiator_encryptor.send_message(raw_bytes).await.unwrap();
-
-    let results = responder_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
-        let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello_World_Pubky_Data");
-    }
-
-    let _ = initiator_encryptor.generate_backup(false).await;
+    let _ = pair.initiator.persist_snapshot().await;
 }
 
 #[tokio::test]
@@ -1405,87 +818,8 @@ async fn pubky_data_snow_test_dual_outbox() {
         .build()
         .await
         .unwrap();
-    let first_server = testnet.homeserver_app();
-    let second_server = testnet.homeserver_app();
-
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = testnet.sdk().unwrap();
-
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&first_server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&second_server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
-    )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
 
     //TODO: Alice can write only to her own Homeserver but can read from own
     // and Bob's Homeserver.
@@ -1501,95 +835,11 @@ async fn pubky_data_snow_test_identity_commitment() {
         .await
         .unwrap();
 
-    let first_server = testnet.homeserver_app();
-    let second_server = testnet.homeserver_app();
-
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = testnet.sdk().unwrap();
-
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&first_server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&second_server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
-    )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Initiator sends handshake
-    // -> e
-    // <- e, ee
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
 
     //TODO: initiator receive_message -> identity binding
     //TODO: responder receive_message -> identity binding
-}
-
-#[tokio::test]
-async fn pubky_data_snow_test_identifers() {
-    //TODO: test no collision between session id, context id and peer fingerprint (3 elements)
 }
 
 #[tokio::test]
@@ -1600,104 +850,32 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
         .build()
         .await
         .unwrap();
-    let server = testnet.homeserver_app();
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = initiator_pubky.clone();
+    let mut pair = setup_encryptors(&testnet, "XX").await;
+    let initiator_public_key = pair.initiator_public_key.clone();
+    let responder_public_key = pair.responder_public_key.clone();
 
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
+    // Out of order polling — responder polls before initiator has written
+    let _ = pair.responder.handle_handshake().await;
+    let _ = pair.initiator.handle_handshake().await;
+    let _ = pair.initiator.handle_handshake().await;
+    let _ = pair.initiator.handle_handshake().await;
+    let _ = pair.responder.handle_handshake().await;
+    let _ = pair.initiator.handle_handshake().await;
+    let _ = pair.responder.handle_handshake().await;
+    let _ = pair.responder.handle_handshake().await;
 
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
+    assert!(pair.initiator.is_handshake_complete());
+    assert!(pair.responder.is_handshake_complete());
 
-    let server_path_string = "/pub/data".to_string();
+    pair.initiator.transition_transport().unwrap();
+    pair.responder.transition_transport().unwrap();
 
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "XX".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
+    send_and_verify(
+        &mut pair.initiator,
+        &mut pair.responder,
+        "Hello_World_Pubky_Data",
     )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "XX".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Initiator sends handshake (out of order polling)
-    // -> e
-    // <- e, ee, s, es
-    // -> s, se
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
-
-    // Transport
-    let data_payload = String::from("Hello_World_Pubky_Data");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-    initiator_encryptor.send_message(raw_bytes).await.unwrap();
-
-    let results = responder_encryptor.receive_message().await.unwrap();
-
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec()).unwrap();
-        let (msg, _) = padded_msg.split_at(data_payload.len());
-        assert_eq!(msg, "Hello_World_Pubky_Data");
-    }
+    .await;
 
     // ===== Verify what's actually stored on the homeserver using pubky SDK =====
     let verify_client = testnet.sdk().unwrap();
@@ -1862,85 +1040,21 @@ async fn pubky_data_snow_test_XX_pattern_simple_incomplete_handshake() {
         .build()
         .await
         .unwrap();
-    let server = testnet.homeserver_app();
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = initiator_pubky.clone();
+    let mut pair = setup_encryptors(&testnet, "XX").await;
 
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "XX".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
-    )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "XX".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config,
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Initiator sends handshake (incomplete)
+    // Incomplete handshake — third message never sent
     // -> e
     // <- e, ee, s, es
     // -> s, se  (NOT DONE)
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
+    let _ = pair.initiator.handle_handshake().await;
+    let _ = pair.responder.handle_handshake().await;
+    let _ = pair.responder.handle_handshake().await;
 
-    assert!(initiator_encryptor.is_handshake().is_ok());
-    assert!(responder_encryptor.is_handshake().is_ok());
+    assert!(!pair.initiator.is_handshake_complete());
+    assert!(!pair.responder.is_handshake_complete());
 
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_err());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_err());
+    assert!(pair.initiator.transition_transport().is_err());
+    assert!(pair.responder.transition_transport().is_err());
 }
 
 /// Test restore from transport state: complete handshake, exchange messages,
@@ -1952,104 +1066,22 @@ async fn pubky_data_snow_test_restore() {
         .build()
         .await
         .unwrap();
-    let first_server = testnet.homeserver_app();
-    let second_server = testnet.homeserver_app();
-
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = testnet.sdk().unwrap();
-
-    let initiator_root_keypair = Keypair::random();
-    let initiator_signer = initiator_pubky.signer(initiator_root_keypair);
-    let initiator_session = initiator_signer
-        .signup(&first_server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_root_keypair = Keypair::random();
-    let responder_signer = responder_pubky.signer(responder_root_keypair);
-    let responder_session = responder_signer
-        .signup(&second_server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_application_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_application_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
-    )
-    .unwrap();
-
-    let responder_application_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_application_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config.clone(),
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config.clone(),
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Complete NN handshake
-    // -> e
-    // <- e, ee
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-
-    assert!(initiator_encryptor.is_handshake().is_err());
-    assert!(responder_encryptor.is_handshake().is_err());
-
-    let initiator_link_id = initiator_encryptor.transition_transport();
-    assert!(initiator_link_id.is_ok());
-    let responder_link_id = responder_encryptor.transition_transport();
-    assert!(responder_link_id.is_ok());
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    let initiator_public_key = pair.initiator_public_key.clone();
+    let responder_public_key = pair.responder_public_key.clone();
+    complete_nn_handshake(&mut pair).await;
 
     // Exchange one round of messages before snapshot
-    let data_payload = String::from("Hello_Before_Restore");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-    initiator_encryptor.send_message(raw_bytes).await.unwrap();
-
-    let results = responder_encryptor.receive_message().await.unwrap();
-    assert!(!results.is_empty());
-    let padded_msg = String::from_utf8(results[0].to_vec()).unwrap();
-    let (msg, _) = padded_msg.split_at(data_payload.len());
-    assert_eq!(msg, "Hello_Before_Restore");
+    send_and_verify(
+        &mut pair.initiator,
+        &mut pair.responder,
+        "Hello_Before_Restore",
+    )
+    .await;
 
     // Snapshot both sides
-    let initiator_snapshot = initiator_encryptor.snapshot();
-    let responder_snapshot = responder_encryptor.snapshot();
+    let initiator_snapshot = pair.initiator.snapshot();
+    let responder_snapshot = pair.responder.snapshot();
 
     // Serialize and deserialize (round-trip test)
     let initiator_bytes = initiator_snapshot.serialize();
@@ -2062,14 +1094,14 @@ async fn pubky_data_snow_test_restore() {
 
     // Restore both sides from snapshots
     let mut restored_initiator = PubkyDataEncryptor::restore(
-        initiator_config.clone(),
+        pair.initiator_config.clone(),
         initiator_state,
         responder_public_key.clone(),
     )
     .await
     .unwrap();
     let mut restored_responder = PubkyDataEncryptor::restore(
-        responder_config.clone(),
+        pair.responder_config.clone(),
         responder_state,
         initiator_public_key.clone(),
     )
@@ -2078,35 +1110,27 @@ async fn pubky_data_snow_test_restore() {
 
     // Verify link IDs match
     assert_eq!(
-        initiator_encryptor.get_link_id(),
+        pair.initiator.get_link_id(),
         restored_initiator.get_link_id()
     );
     assert_eq!(
-        responder_encryptor.get_link_id(),
+        pair.responder.get_link_id(),
         restored_responder.get_link_id()
     );
 
     // Exchange messages using restored encryptors
-    let data_payload = String::from("Hello_After_Restore");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-    restored_initiator.send_message(raw_bytes).await.unwrap();
-
-    let results = restored_responder.receive_message().await.unwrap();
-    assert!(!results.is_empty());
-    let padded_msg = String::from_utf8(results[0].to_vec()).unwrap();
-    let (msg, _) = padded_msg.split_at(data_payload.len());
-    assert_eq!(msg, "Hello_After_Restore");
-
-    // And in the other direction
-    let data_payload = String::from("Restored_Responder_Says_Hi");
-    let raw_bytes = data_payload.as_bytes().to_vec();
-    restored_responder.send_message(raw_bytes).await.unwrap();
-
-    let results = restored_initiator.receive_message().await.unwrap();
-    assert!(!results.is_empty());
-    let padded_msg = String::from_utf8(results[0].to_vec()).unwrap();
-    let (msg, _) = padded_msg.split_at(data_payload.len());
-    assert_eq!(msg, "Restored_Responder_Says_Hi");
+    send_and_verify(
+        &mut restored_initiator,
+        &mut restored_responder,
+        "Hello_After_Restore",
+    )
+    .await;
+    send_and_verify(
+        &mut restored_responder,
+        &mut restored_initiator,
+        "Restored_Responder_Says_Hi",
+    )
+    .await;
 }
 
 /// Test that snapshot serialization round-trips correctly.
@@ -2117,90 +1141,19 @@ async fn pubky_data_snow_test_restore_serialization_roundtrip() {
         .build()
         .await
         .unwrap();
-    let server = testnet.homeserver_app();
-
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = initiator_pubky.clone();
-
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
-    )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config.clone(),
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config,
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Complete handshake and transition
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-
-    let _ = initiator_encryptor.transition_transport();
-    let _ = responder_encryptor.transition_transport();
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
 
     // Exchange a few messages to advance nonces
     for i in 0..3 {
         let msg = format!("message_{i}");
-        initiator_encryptor.send_message(msg.into_bytes()).await.unwrap();
-        let results = responder_encryptor.receive_message().await.unwrap();
+        assert!(pair.initiator.send_message(msg.as_bytes()).await);
+        let results = pair.responder.receive_message().await;
         assert!(!results.is_empty());
     }
 
     // Take snapshot and verify round-trip
-    let snapshot = initiator_encryptor.snapshot();
+    let snapshot = pair.initiator.snapshot();
     let bytes = snapshot.serialize();
     let restored = PubkyDataSessionState::deserialize(&bytes).unwrap();
 
@@ -2225,101 +1178,40 @@ async fn pubky_data_snow_test_restore_link_id_matches() {
         .build()
         .await
         .unwrap();
-    let first_server = testnet.homeserver_app();
-    let second_server = testnet.homeserver_app();
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    let initiator_public_key = pair.initiator_public_key.clone();
+    let responder_public_key = pair.responder_public_key.clone();
+    complete_nn_handshake(&mut pair).await;
 
-    let initiator_pubky = testnet.sdk().unwrap();
-    let responder_pubky = testnet.sdk().unwrap();
-
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&first_server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&second_server.public_key(), None)
-        .await
-        .unwrap();
-
-    let server_path_string = "/pub/data".to_string();
-
-    let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
-        initiator_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        initiator_session.clone(),
-        server_path_string.clone(),
-        initiator_pubky,
-    )
-    .unwrap();
-
-    let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
-        responder_keypair.secret_key(),
-        0,
-        "NN".to_string(),
-        responder_session.clone(),
-        server_path_string.clone(),
-        responder_pubky,
-    )
-    .unwrap();
-
-    let initiator_ephemeral_keypair = Keypair::random();
-    let responder_ephemeral_keypair = Keypair::random();
-
-    let initiator_public_key = initiator_session.info().public_key();
-    let responder_public_key = responder_session.info().public_key();
-
-    let mut initiator_encryptor = PubkyDataEncryptor::new(
-        initiator_config.clone(),
-        initiator_ephemeral_keypair.secret_key(),
-        responder_ephemeral_keypair.public_key(),
-        true,
-        responder_public_key.clone(),
-    )
-    .unwrap();
-
-    let mut responder_encryptor = PubkyDataEncryptor::new(
-        responder_config.clone(),
-        responder_ephemeral_keypair.secret_key(),
-        initiator_ephemeral_keypair.public_key(),
-        false,
-        initiator_public_key.clone(),
-    )
-    .unwrap();
-
-    // Complete handshake
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-    let _ = initiator_encryptor.handle_handshake().await;
-    let _ = responder_encryptor.handle_handshake().await;
-
-    let original_init_link = initiator_encryptor.transition_transport().unwrap();
-    let original_resp_link = responder_encryptor.transition_transport().unwrap();
+    let original_init_link = pair.initiator.get_link_id().unwrap();
+    let original_resp_link = pair.responder.get_link_id().unwrap();
 
     // Both sides should agree on the link ID
     assert_eq!(original_init_link, original_resp_link);
 
     // Snapshot and restore initiator
-    let init_snapshot = initiator_encryptor.snapshot();
+    let init_snapshot = pair.initiator.snapshot();
     let init_bytes = init_snapshot.serialize();
     let init_state = PubkyDataSessionState::deserialize(&init_bytes).unwrap();
-    let restored_initiator =
-        PubkyDataEncryptor::restore(initiator_config, init_state, responder_public_key.clone())
-            .await
-            .unwrap();
+    let restored_initiator = PubkyDataEncryptor::restore(
+        pair.initiator_config.clone(),
+        init_state,
+        responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
 
     // Snapshot and restore responder
-    let resp_snapshot = responder_encryptor.snapshot();
+    let resp_snapshot = pair.responder.snapshot();
     let resp_bytes = resp_snapshot.serialize();
     let resp_state = PubkyDataSessionState::deserialize(&resp_bytes).unwrap();
-    let restored_responder =
-        PubkyDataEncryptor::restore(responder_config, resp_state, initiator_public_key.clone())
-            .await
-            .unwrap();
+    let restored_responder = PubkyDataEncryptor::restore(
+        pair.responder_config.clone(),
+        resp_state,
+        initiator_public_key.clone(),
+    )
+    .await
+    .unwrap();
 
     // Restored link IDs must match originals
     assert_eq!(
@@ -2336,60 +1228,3 @@ async fn pubky_data_snow_test_restore_link_id_matches() {
         restored_responder.get_link_id()
     );
 }
-
-// #[tokio::test]
-//async fn pubky_data_snow_test_encryptor_parallel() {
-//     let mut testnet = EphemeralTestnet::start().await.unwrap();
-//     let server = testnet.homeserver();
-//     let alice_pubky = testnet.sdk().unwrap();
-//     let bob_pubky = alice_pubky.clone();
-//     let caroll_pubky = alice_pubky.clone();
-//
-//     let alice_signer = alice_pubky.signer(Keypair::random());
-//     let alice_session = alice_signer.signup(&server.public_key(), None).await.unwrap();
-//
-//     let bob_signer = bob_pubky.signer(Keypair::random());
-//     let bob_session = bob_signer.signup(&server.public_key(), None).await.unwrap();
-//
-//     let caroll_signer = caroll_pubky.signer(Keypair::random());
-//     let caroll_session = caroll_signer.signup(&server.public_key(), None).await.unwrap();
-//
-//     let server_path_string = format!("/pub/data");
-//
-//     let alice_keypair = Keypair::random();
-//     let mut alice_encryptor = PubkyDataEncryptor::init_encryptor_stack(alice_keypair.secret_key(), 0, "NN".to_strin (), alice_session.clone(), server_path_string.clone(), false).unwrap();
-//
-//     let bob_keypair = Keypair::random();
-//     let mut bob_encryptor = PubkyDataEncryptor::init_encryptor_stack(bob_keypair.secret_key(), 0, "NN".to_string(), bob_session.clone(), server_path_string.clone(), false).unwrap();
-//
-//     let caroll_keypair = Keypair::random();
-//     let mut caroll_encryptor = PubkyDataEncryptor::init_encryptor_stack(caroll_keypair.secret_key(), 0, "NN".to_str ng(), caroll_session.clone(), server_path_string.clone(), false).unwrap();
-//     let caroll_session = caroll_signer.signup(&server.public_key(), None).await.unwrap();
-//
-//     let server_path_string = format!("/pub/data");
-//
-//     let alice_keypair = Keypair::random();
-//     let mut alice_encryptor = PubkyDataEncryptor::init_encryptor_stack(alice_keypair.secret_key(), 0, "NN".to_string(), alice_session.clone(), server_path_string.clone(), false).unwrap();
-//
-//     let bob_keypair = Keypair::random();
-//     let mut bob_encryptor = PubkyDataEncryptor::init_encryptor_stack(bob_keypair.secret_key(), 0, "NN".to_string(), bob_session.clone(), server_path_string.clone(), false).unwrap();
-//
-//     let caroll_keypair = Keypair::random();
-//     let mut caroll_encryptor = PubkyDataEncryptor::init_encryptor_stack(caroll_keypair.secret_key(), 0, "NN".to_string(), caroll_session.clone(), server_path_string.clone(), false).unwrap();
-//
-//     let alice_ephemeral_keypair = Keypair::random();
-//     let bob_ephemeral_keypair = Keypair::random();
-//     let caroll_ephemeral_keypair = Keypair::random();
-//
-//     let alice_public_key = alice_session.info().public_key();
-//     let bob_public_key = bob_session.info().public_key();
-//     let caroll_public_key = caroll_session.info().public_key();
-//
-//     // We set up 3 data links:
-//     //      - Alice - Bob
-//     //      - Alice - Caroll
-//     //      - Bob - Caroll
-//
-//     // Alice - Bob
-//     let ab_key_set = PubkyKeySet::new(Some(alice_ephemeral_keypair.secret_key()), Some(bob_ephemeral_keypair.public_key()));
-//     let ab_temporary_link_id = alice_encryptor.init_context(ab_key_set, true, bob_public_key.clone(), alice_pubky.clone()).unwrap();
