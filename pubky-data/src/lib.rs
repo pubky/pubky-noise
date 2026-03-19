@@ -29,7 +29,7 @@ pub enum PubkyDataError {
     BadLengthCiphertext,
     /// the homeserver path error
     HomeserverPathError,
-    /// the homeserver write failure
+    /// the homeserver response is a failure
     HomeserverWriteError,
     HomeserverReadError,
     IsTransport,

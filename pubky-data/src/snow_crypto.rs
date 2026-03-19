@@ -22,7 +22,7 @@ pub enum NoiseStep {
 }
 
 impl NoiseStep {
-    fn next_step(&self) -> NoiseStep {
+    pub fn next_step(&self) -> NoiseStep {
         match self {
             NoiseStep::StepOne => NoiseStep::StepTwo,
             NoiseStep::StepTwo => NoiseStep::Final,
@@ -209,6 +209,17 @@ impl HandshakePattern {
         }
     }
 
+    pub fn needs_local_key(&self) -> bool {
+        match self {
+            HandshakePattern::PatternN => false,
+            HandshakePattern::PatternNN => false,
+            HandshakePattern::PatternXX => true,
+            HandshakePattern::PatternIK => true,
+            HandshakePattern::PatternNK => true,
+            HandshakePattern::TestOnlyPatternAA => false,
+        }
+    }
+
     /// Convert to a u8 for serialization.
     pub fn to_u8(&self) -> u8 {
         match self {
@@ -231,17 +242,6 @@ impl HandshakePattern {
             4 => Some(HandshakePattern::PatternNK),
             255 => Some(HandshakePattern::TestOnlyPatternAA),
             _ => None,
-        }
-    }
-
-    pub fn needs_local_key(&self) -> bool {
-        match self {
-            HandshakePattern::PatternN => false,
-            HandshakePattern::PatternNN => false,
-            HandshakePattern::PatternXX => true,
-            HandshakePattern::PatternIK => true,
-            HandshakePattern::PatternNK => true,
-            HandshakePattern::TestOnlyPatternAA => false,
         }
     }
 }
@@ -386,6 +386,7 @@ pub struct DataLinkContext {
 
     noise_handshake: Option<HandshakeState>,
     noise_transport: Option<StatelessTransportState>,
+
     /// Explicit nonce for outbound transport messages.
     sending_nonce: u64,
     /// Explicit nonce for inbound transport messages.
@@ -407,25 +408,6 @@ pub struct DataLinkContext {
 }
 
 impl DataLinkContext {
-    pub fn new(
-        handshake_pattern: HandshakePattern,
-        initiator: bool,
-        _prologue: Vec<u8>,
-        local_static_key: Option<SecretKey>,
-        endpoint_pubkey: PublicKey,
-        local_pkarr_pubkey: Option<PublicKey>,
-    ) -> Result<DataLinkContext, ContextError> {
-        Self::new_with_ephemeral(
-            handshake_pattern,
-            initiator,
-            _prologue,
-            local_static_key,
-            endpoint_pubkey,
-            local_pkarr_pubkey,
-            None,
-        )
-    }
-
     /// Build the Snow protocol name string for the given pattern.
     /// We're using ChaCha as the stream cipher. Poly1305 as the MAC and SHA256 as a hash function.
     fn build_protocol_name(handshake_pattern: &HandshakePattern) -> Result<String, ContextError> {
@@ -471,6 +453,25 @@ impl DataLinkContext {
         };
 
         noise_stack.map_err(|_| ContextError::Init)
+    }
+
+    pub fn new(
+        handshake_pattern: HandshakePattern,
+        initiator: bool,
+        _prologue: Vec<u8>,
+        local_static_key: Option<SecretKey>,
+        endpoint_pubkey: PublicKey,
+        local_pkarr_pubkey: Option<PublicKey>,
+    ) -> Result<DataLinkContext, ContextError> {
+        Self::new_with_ephemeral(
+            handshake_pattern,
+            initiator,
+            _prologue,
+            local_static_key,
+            endpoint_pubkey,
+            local_pkarr_pubkey,
+            None,
+        )
     }
 
     /// Create a new DataLinkContext, optionally with a pre-set ephemeral key.
@@ -581,6 +582,11 @@ impl DataLinkContext {
             .is_handshake_finished()
     }
 
+    /// Check if this context is in transport phase.
+    pub fn is_transport(&self) -> bool {
+        self.noise_phase == NoisePhase::Transport
+    }
+
     pub fn get_handshake_hash(&self) -> Option<[u8; 32]> {
         if let Some(handshake_state) = &self.noise_handshake {
             let mut buf = [0; 32];
@@ -628,8 +634,8 @@ impl DataLinkContext {
     }
 
     /// Returns the remaining actions for the current step, starting from sub_step_index.
-    /// Uses the stored `initiator` flag — callers no longer need to pass it.
-    /// Does NOT advance noise_step — call `complete_step()` for that.
+    /// Uses the stored `initiator` flag -- callers no longer need to pass it.
+    /// Does NOT advance noise_step -- call `complete_step()` for that.
     pub fn remaining_handshake_actions(&self) -> Vec<HandshakeAction> {
         assert!(
             self.message_patterns == HandshakePattern::PatternNN
@@ -769,11 +775,6 @@ impl DataLinkContext {
         }
 
         Ok(())
-    }
-
-    /// Check if this context is in transport phase.
-    pub fn is_transport(&self) -> bool {
-        self.noise_phase == NoisePhase::Transport
     }
 
     // --- Snapshot / restore accessors ---
