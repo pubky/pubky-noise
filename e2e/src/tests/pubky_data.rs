@@ -135,9 +135,9 @@ async fn pubky_data_snow_test_initiator_first() {
     let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
-    initiator_encryptor.send_message(raw_bytes).await;
+    initiator_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = responder_encryptor.receive_message().await;
+    let results = responder_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -148,9 +148,9 @@ async fn pubky_data_snow_test_initiator_first() {
 
     let data_payload = String::from("Pubky_Data_Rocks");
     let raw_bytes = data_payload.as_bytes().to_vec();
-    responder_encryptor.send_message(raw_bytes).await;
+    responder_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = initiator_encryptor.receive_message().await;
+    let results = initiator_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -253,9 +253,9 @@ async fn pubky_data_snow_test_responder_first() {
     let data_payload = String::from("Hello World Pubky Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
-    responder_encryptor.send_message(raw_bytes).await;
+    responder_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = initiator_encryptor.receive_message().await;
+    let results = initiator_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -267,9 +267,9 @@ async fn pubky_data_snow_test_responder_first() {
     let data_payload = String::from("Pubky Data Rocks");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
-    initiator_encryptor.send_message(raw_bytes).await;
+    initiator_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = responder_encryptor.receive_message().await;
+    let results = responder_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -373,9 +373,9 @@ async fn pubky_data_snow_test_responder_tampering() {
     let data_payload = String::from("Hello World Pubky Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
     println!("RAW BYTES {:?}", raw_bytes);
-    responder_encryptor.send_message(raw_bytes.clone()).await;
+    responder_encryptor.send_message(raw_bytes.clone()).await.unwrap();
 
-    let results = initiator_encryptor.receive_message().await;
+    let results = initiator_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -486,9 +486,9 @@ async fn pubky_data_snow_test_initiator_tampering() {
     let data_payload = String::from("Hello World Pubky Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
     println!("RAW BYTES {:?}", raw_bytes);
-    initiator_encryptor.send_message(raw_bytes.clone()).await;
+    initiator_encryptor.send_message(raw_bytes.clone()).await.unwrap();
 
-    let results = responder_encryptor.receive_message().await;
+    let results = responder_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -596,9 +596,9 @@ async fn pubky_data_snow_null_message() {
     // Transport
     let data_payload = String::from("");
     let raw_bytes = data_payload.as_bytes().to_vec();
-    responder_encryptor.send_message(raw_bytes).await;
+    responder_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = initiator_encryptor.receive_message().await;
+    let results = initiator_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -905,9 +905,9 @@ async fn pubky_data_snow_test_cleaning_sequence() {
     let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
-    initiator_encryptor.send_message(raw_bytes).await;
+    initiator_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = responder_encryptor.receive_message().await;
+    let results = responder_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -1013,9 +1013,9 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
     // Transport
     let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
-    initiator_encryptor.send_message(raw_bytes).await;
+    initiator_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = responder_encryptor.receive_message().await;
+    let results = responder_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -1273,9 +1273,9 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
     // Transport
     let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
-    initiator_encryptor.send_message(raw_bytes.clone()).await;
+    initiator_encryptor.send_message(raw_bytes.clone()).await.unwrap();
 
-    let results = responder_encryptor.receive_message().await;
+    let results = responder_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -1383,9 +1383,9 @@ async fn pubky_data_snow_test_simple_backup() {
     let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
-    initiator_encryptor.send_message(raw_bytes).await;
+    initiator_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = responder_encryptor.receive_message().await;
+    let results = responder_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -1687,9 +1687,9 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
     // Transport
     let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
-    initiator_encryptor.send_message(raw_bytes).await;
+    initiator_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = responder_encryptor.receive_message().await;
+    let results = responder_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -2056,9 +2056,9 @@ async fn pubky_data_snow_test_restore() {
     let data_payload = String::from("Hello_World_Pubky_Data");
     let raw_bytes = data_payload.as_bytes().to_vec();
 
-    initiator_encryptor.send_message(raw_bytes).await;
+    initiator_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = responder_encryptor.receive_message().await;
+    let results = responder_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {
@@ -2069,9 +2069,9 @@ async fn pubky_data_snow_test_restore() {
 
     let data_payload = String::from("Pubky_Data_Rocks");
     let raw_bytes = data_payload.as_bytes().to_vec();
-    responder_encryptor.send_message(raw_bytes).await;
+    responder_encryptor.send_message(raw_bytes).await.unwrap();
 
-    let results = initiator_encryptor.receive_message().await;
+    let results = initiator_encryptor.receive_message().await.unwrap();
 
     assert!(!results.is_empty());
     for ret in results {

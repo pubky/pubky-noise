@@ -29,8 +29,9 @@ pub enum PubkyDataError {
     BadLengthCiphertext,
     /// the homeserver path error
     HomeserverPathError,
-    /// the homeserver response is a failure
-    HomeserverResponseError,
+    /// the homeserver write failure
+    HomeserverWriteError,
+    HomeserverReadError,
     IsTransport,
     IsHandshake,
     /// Restore failed: handshake replay error.
@@ -39,7 +40,15 @@ pub enum PubkyDataError {
     RestoreHashMismatch,
     /// Restore failed: deserialization error.
     RestoreDeserializeError,
+    NoiseContextError,
     OtherError,
+}
+
+// TODO: impl from ContextError for PubkyDataError
+impl From<snow_crypto::ContextError> for PubkyDataError {
+    fn from(_: snow_crypto::ContextError) -> Self {
+        PubkyDataError::NoiseContextError
+    }
 }
 
 #[derive(Eq, Hash, PartialEq, Debug)]
@@ -274,7 +283,7 @@ impl PubkyDataEncryptor {
                                     self.context
                                         .read_act(&mut message, &mut payload, len as usize);
                             } else {
-                                return Err(PubkyDataError::HomeserverResponseError);
+                                return Err(PubkyDataError::HomeserverReadError);
                             }
                             self.context.increment_counter();
                             self.context.advance_sub_step();
@@ -347,14 +356,17 @@ impl PubkyDataEncryptor {
     ///
     /// # Returns:
     ///      - `true` on success, `false` on failure.
-    pub async fn send_message(&mut self, plaintext: Vec<u8>) -> bool {
+    pub async fn send_message(&mut self, plaintext: Vec<u8>) -> Result<(), PubkyDataError> {
         println!("in send message");
 
+        // Phase guard: must be in transport mode
+        if !self.context.is_transport() {
+            println!("send_message called but not in transport phase");
+            return Err(PubkyDataError::IsHandshake);
+        }
+
         let mut out = [0; PUBKY_DATA_MSG_LEN];
-        let len = match self.context.write_act(plaintext, &mut out) {
-            Ok(len) => len,
-            Err(_) => return false,
-        };
+        let len = self.context.write_act(plaintext, &mut out)?;
 
         println!("FWD LEN {len} CIPHER {out:?}");
         let mut packet = [0; PUBKY_DATA_MSG_LEN + 2];
@@ -381,17 +393,25 @@ impl PubkyDataEncryptor {
             .await
             .is_err()
         {
-            return false;
+            return Err(PubkyDataError::HomeserverWriteError);
         }
         self.context.increment_counter();
-        true
+        Ok(())
     }
 
     /// Receive and decrypt a message from the remote peer.
     ///
     /// # Returns:
     ///      - A vector of decrypted payloads (empty on failure).
-    pub async fn receive_message(&mut self) -> Vec<[u8; PUBKY_DATA_MSG_LEN]> {
+    pub async fn receive_message(
+        &mut self,
+    ) -> Result<Vec<[u8; PUBKY_DATA_MSG_LEN]>, PubkyDataError> {
+        println!("in receive message");
+        // Phase guard: must be in transport mode
+        if !self.context.is_transport() {
+            return Err(PubkyDataError::IsHandshake);
+        }
+
         let mut results = Vec::new();
         let path = self.config.read_path.as_str();
         let counter = self.context.get_counter();
@@ -432,9 +452,13 @@ impl PubkyDataEncryptor {
                     results.push(payload);
                     self.context.increment_counter();
                 }
+            } else {
+                return Err(PubkyDataError::HomeserverReadError);
             }
+        } else {
+            return Err(PubkyDataError::HomeserverReadError);
         }
-        results
+        Ok(results)
     }
 
     /// Close and clean up this encryptor's Noise session.
