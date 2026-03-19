@@ -2,6 +2,7 @@ pub mod identity_payload;
 pub mod path_derivation;
 pub mod serializer;
 pub mod snow_crypto;
+pub mod snow_crypto_resolver;
 
 use std::sync::Arc;
 
