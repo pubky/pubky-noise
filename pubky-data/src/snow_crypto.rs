@@ -2,30 +2,51 @@ use ed25519_dalek::SecretKey;
 use pubky::PublicKey;
 
 use snow::Builder;
-use snow::{HandshakeState, TransportState};
+use snow::{HandshakeState, StatelessTransportState};
+
+use crate::snow_crypto_resolver::ReplayResolver;
 
 pub const PUBKY_DATA_MSG_LEN: usize = 1000;
 
-#[derive(PartialEq, Debug)]
-enum NoisePhase {
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum NoisePhase {
     HandShake,
     Transport,
 }
 
 #[derive(PartialEq, Copy, Clone, Debug)]
-enum NoiseStep {
+pub enum NoiseStep {
     StepOne,
     StepTwo,
     Final,
 }
 
 impl NoiseStep {
-    fn next_step(&self) -> NoiseStep {
+    pub fn next_step(&self) -> NoiseStep {
         match self {
             NoiseStep::StepOne => NoiseStep::StepTwo,
             NoiseStep::StepTwo => NoiseStep::Final,
             // if final echo final
             NoiseStep::Final => NoiseStep::Final,
+        }
+    }
+
+    /// Convert to a u8 for serialization.
+    pub fn to_u8(&self) -> u8 {
+        match self {
+            NoiseStep::StepOne => 0,
+            NoiseStep::StepTwo => 1,
+            NoiseStep::Final => 2,
+        }
+    }
+
+    /// Convert from a u8 for deserialization.
+    pub fn from_u8(val: u8) -> Option<NoiseStep> {
+        match val {
+            0 => Some(NoiseStep::StepOne),
+            1 => Some(NoiseStep::StepTwo),
+            2 => Some(NoiseStep::Final),
+            _ => None,
         }
     }
 }
@@ -164,7 +185,7 @@ pub enum PatternError {
 }
 
 impl HandshakePattern {
-    fn pattern_to_string(&self) -> Result<String, ()> {
+    pub fn pattern_to_string(&self) -> Result<String, ()> {
         match self {
             HandshakePattern::PatternN => Ok(String::from("N")),
             HandshakePattern::PatternNN => Ok(String::from("NN")),
@@ -198,9 +219,34 @@ impl HandshakePattern {
             HandshakePattern::TestOnlyPatternAA => false,
         }
     }
+
+    /// Convert to a u8 for serialization.
+    pub fn to_u8(&self) -> u8 {
+        match self {
+            HandshakePattern::PatternN => 0,
+            HandshakePattern::PatternNN => 1,
+            HandshakePattern::PatternXX => 2,
+            HandshakePattern::PatternIK => 3,
+            HandshakePattern::PatternNK => 4,
+            HandshakePattern::TestOnlyPatternAA => 255,
+        }
+    }
+
+    /// Convert from a u8 for deserialization.
+    pub fn from_u8(val: u8) -> Option<HandshakePattern> {
+        match val {
+            0 => Some(HandshakePattern::PatternN),
+            1 => Some(HandshakePattern::PatternNN),
+            2 => Some(HandshakePattern::PatternXX),
+            3 => Some(HandshakePattern::PatternIK),
+            4 => Some(HandshakePattern::PatternNK),
+            255 => Some(HandshakePattern::TestOnlyPatternAA),
+            _ => None,
+        }
+    }
 }
 
-fn resolve_pattern_nn(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
+pub fn resolve_pattern_nn(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
     let mut steps_to_be_done: Vec<HandshakeAction> = Vec::new();
     if initiator {
         match noise_step {
@@ -233,7 +279,7 @@ fn resolve_pattern_nn(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAc
     steps_to_be_done
 }
 
-fn resolve_pattern_xx(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
+pub fn resolve_pattern_xx(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
     let mut steps_to_be_done: Vec<HandshakeAction> = Vec::new();
     if initiator {
         match noise_step {
@@ -282,6 +328,37 @@ fn resolve_pattern_nk(_noise_step: NoiseStep, _initiator: bool) -> Vec<Handshake
     vec![]
 }
 
+/// Return the flat sequence of Write/Read actions for a complete handshake,
+/// given the pattern and role (initiator/respnder). Used by the replay logic
+/// to know which operations to perform when re-feeding persisted messages.
+/// # Parameters:
+///      - `patthern`: a handshake pattern
+///      - `initiator`: boolean parameter which indicates who is initiator and who is responder
+pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec<HandshakeAction> {
+    let resolve = match pattern {
+        HandshakePattern::PatternNN => resolve_pattern_nn,
+        HandshakePattern::PatternXX => resolve_pattern_xx,
+        HandshakePattern::PatternIK => resolve_pattern_ik,
+        HandshakePattern::PatternNK => resolve_pattern_nk,
+        _ => panic!("unsupported handshake pattern for full_handshake_actions"),
+    };
+
+    let mut actions = Vec::new();
+    let steps = [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final];
+    for step in &steps {
+        let step_actions = resolve(*step, initiator);
+        for action in step_actions {
+            match action {
+                HandshakeAction::Write | HandshakeAction::Read => actions.push(action),
+                HandshakeAction::Pending | HandshakeAction::Terminal => {
+                    // Skip control actions; we only care about Write/Read for replay
+                }
+            }
+        }
+    }
+    actions
+}
+
 //TODO: more granularity for errors
 pub enum ContextError {
     Init,
@@ -300,11 +377,20 @@ pub struct DataLinkContext {
     // ephemeral key always handled by the snow
     local_static_seckey: Option<SecretKey>,
 
+    /// The local ephemeral secret key used for this session.
+    /// Captured at construction time so it can be persisted for restore.
+    local_ephemeral_seckey: [u8; 32],
+
     noise_step: NoiseStep,
     noise_phase: NoisePhase,
 
     noise_handshake: Option<HandshakeState>,
-    noise_transport: Option<TransportState>,
+    noise_transport: Option<StatelessTransportState>,
+
+    /// Explicit nonce for outbound transport messages.
+    sending_nonce: u64,
+    /// Explicit nonce for inbound transport messages.
+    receiving_nonce: u64,
 
     endpoint_pubkey: PublicKey,
 
@@ -322,55 +408,42 @@ pub struct DataLinkContext {
 }
 
 impl DataLinkContext {
-    pub fn new(
-        handshake_pattern: HandshakePattern,
-        initiator: bool,
-        _prologue: Vec<u8>,
-        local_static_key: Option<SecretKey>,
-        endpoint_pubkey: PublicKey,
-        local_pkarr_pubkey: Option<PublicKey>,
-    ) -> Result<DataLinkContext, ContextError> {
-        // Section 5.3 The Handshake Object
-        //
-        // Perform the following steps:
-        // - Derives a protocol_name byte sequence by combining the names for
-        //   the handshake pattern and crypto functions, as specified in Section 8.
-        //   Calls InitializeSymmetric(protocol_name).
-
-        let mut protocol_name = String::from("Noise");
-        protocol_name.push('_');
-        let pattern_string = if let Ok(pattern_string) = handshake_pattern.pattern_to_string() {
-            pattern_string
-        } else {
-            return Err(ContextError::Init);
-        };
+    /// Build the Snow protocol name string for the given pattern.
+    /// We're using ChaCha as the stream cipher. Poly1305 as the MAC and SHA256 as a hash function.
+    fn build_protocol_name(handshake_pattern: &HandshakePattern) -> Result<String, ContextError> {
+        let mut protocol_name = String::from("Noise_");
+        let pattern_string = handshake_pattern
+            .pattern_to_string()
+            .map_err(|_| ContextError::Init)?;
         protocol_name.push_str(&pattern_string);
-        let basic_string = String::from("_25519_ChaChaPoly_SHA256");
-        protocol_name.push_str(&basic_string);
+        protocol_name.push_str("_25519_ChaChaPoly_SHA256");
+        Ok(protocol_name)
+    }
 
-        println!("Current Protocol Name {protocol_name}");
+    /// Build a Snow HandshakeState using the ReplayResolver with the given ephemeral seed.
+    fn build_handshake_state(
+        protocol_name: &str,
+        handshake_pattern: &HandshakePattern,
+        initiator: bool,
+        local_static_key: &Option<SecretKey>,
+        ephemeral_seed: &[u8; 32],
+    ) -> Result<HandshakeState, ContextError> {
+        let params = protocol_name.parse().map_err(|_| ContextError::Init)?;
 
-        let builder_init = protocol_name.clone().parse();
-        if builder_init.is_err() {
-            return Err(ContextError::Init);
-        }
-        let builder_init = builder_init.unwrap();
-
-        let builder = Builder::new(builder_init);
+        let resolver = ReplayResolver::new(*ephemeral_seed);
+        let builder = Builder::with_resolver(params, resolver);
 
         let noise_stack = if handshake_pattern.needs_local_key() {
-            if local_static_key.is_none() {
-                return Err(ContextError::Init);
-            }
+            let key = local_static_key.as_ref().ok_or(ContextError::Init)?;
             if initiator {
                 builder
-                    .local_private_key(&local_static_key.unwrap())
-                    .unwrap()
+                    .local_private_key(key)
+                    .map_err(|_| ContextError::Init)?
                     .build_initiator()
             } else {
                 builder
-                    .local_private_key(&local_static_key.unwrap())
-                    .unwrap()
+                    .local_private_key(key)
+                    .map_err(|_| ContextError::Init)?
                     .build_responder()
             }
         } else if initiator {
@@ -379,10 +452,70 @@ impl DataLinkContext {
             builder.build_responder()
         };
 
-        println!("build result {noise_stack:?}");
-        if noise_stack.is_err() {
-            return Err(ContextError::Init);
-        }
+        noise_stack.map_err(|_| ContextError::Init)
+    }
+
+    pub fn new(
+        handshake_pattern: HandshakePattern,
+        initiator: bool,
+        _prologue: Vec<u8>,
+        local_static_key: Option<SecretKey>,
+        endpoint_pubkey: PublicKey,
+        local_pkarr_pubkey: Option<PublicKey>,
+    ) -> Result<DataLinkContext, ContextError> {
+        Self::new_with_ephemeral(
+            handshake_pattern,
+            initiator,
+            _prologue,
+            local_static_key,
+            endpoint_pubkey,
+            local_pkarr_pubkey,
+            None,
+        )
+    }
+
+    /// Create a new DataLinkContext, optionally with a pre-set ephemeral key.
+    ///
+    /// When `ephemeral_secret` is `None`, a fresh 32-byte random seed is generated.
+    /// When `Some`, the provided seed is used (for session restore / replay).
+    pub fn new_with_ephemeral(
+        handshake_pattern: HandshakePattern,
+        initiator: bool,
+        _prologue: Vec<u8>,
+        local_static_key: Option<SecretKey>,
+        endpoint_pubkey: PublicKey,
+        local_pkarr_pubkey: Option<PublicKey>,
+        ephemeral_secret: Option<[u8; 32]>,
+    ) -> Result<DataLinkContext, ContextError> {
+        // Section 5.3 The Handshake Object
+        //
+        // Perform the following steps:
+        // - Derives a protocol_name byte sequence by combining the names for
+        //   the handshake pattern and crypto functions, as specified in Section 8.
+        //   Calls InitializeSymmetric(protocol_name).
+
+        let protocol_name = Self::build_protocol_name(&handshake_pattern)?;
+        println!("Current Protocol Name {protocol_name}");
+
+        // Generate or use provided ephemeral seed
+        let ephemeral_seed = match ephemeral_secret {
+            Some(seed) => seed,
+            None => {
+                let mut seed = [0u8; 32];
+                getrandom::fill(&mut seed).map_err(|_| ContextError::Init)?;
+                seed
+            }
+        };
+
+        let handshake_state = Self::build_handshake_state(
+            &protocol_name,
+            &handshake_pattern,
+            initiator,
+            &local_static_key,
+            &ephemeral_seed,
+        )?;
+
+        println!("build result Ok");
 
         // - Sets the initator s, e, rs and re variables to the corresponding
         //   arguments.
@@ -401,11 +534,16 @@ impl DataLinkContext {
             //TODO: for now keep keys separated from the state.
             local_static_seckey: local_static_key,
 
+            local_ephemeral_seckey: ephemeral_seed,
+
             noise_step: NoiseStep::StepOne,
             noise_phase: NoisePhase::HandShake,
 
-            noise_handshake: Some(noise_stack.unwrap()),
+            noise_handshake: Some(handshake_state),
             noise_transport: None,
+
+            sending_nonce: 0,
+            receiving_nonce: 0,
 
             endpoint_pubkey,
 
@@ -444,6 +582,11 @@ impl DataLinkContext {
             .is_handshake_finished()
     }
 
+    /// Check if this context is in transport phase.
+    pub fn is_transport(&self) -> bool {
+        self.noise_phase == NoisePhase::Transport
+    }
+
     pub fn get_handshake_hash(&self) -> Option<[u8; 32]> {
         if let Some(handshake_state) = &self.noise_handshake {
             let mut buf = [0; 32];
@@ -472,12 +615,18 @@ impl DataLinkContext {
         {
             return Err(ContextError::OngoingHandshake);
         }
-        let transport = self.noise_handshake.take().unwrap().into_transport_mode();
+        let transport = self
+            .noise_handshake
+            .take()
+            .unwrap()
+            .into_stateless_transport_mode();
         if let Ok(transport) = transport {
             println!("TRANSPORT OK");
             //TODO: zeroize HandshakeState
             self.noise_transport = Some(transport);
             self.noise_phase = NoisePhase::Transport;
+            self.sending_nonce = 0;
+            self.receiving_nonce = 0;
             return Ok(());
         }
         println!("TRANSPORT NOT OK");
@@ -485,8 +634,8 @@ impl DataLinkContext {
     }
 
     /// Returns the remaining actions for the current step, starting from sub_step_index.
-    /// Uses the stored `initiator` flag — callers no longer need to pass it.
-    /// Does NOT advance noise_step — call `complete_step()` for that.
+    /// Uses the stored `initiator` flag -- callers no longer need to pass it.
+    /// Does NOT advance noise_step -- call `complete_step()` for that.
     pub fn remaining_handshake_actions(&self) -> Vec<HandshakeAction> {
         assert!(
             self.message_patterns == HandshakePattern::PatternNN
@@ -554,13 +703,15 @@ impl DataLinkContext {
                 payload.len(),
                 message.len()
             );
-            let result = self
-                .noise_transport
-                .as_mut()
-                .unwrap()
-                .write_message(&payload, message.as_mut());
+            let nonce = self.sending_nonce;
+            let result = self.noise_transport.as_ref().unwrap().write_message(
+                nonce,
+                &payload,
+                message.as_mut(),
+            );
             match result {
                 Ok(write_size) => {
+                    self.sending_nonce += 1;
                     return Ok(write_size);
                 }
                 Err(_e) => {
@@ -606,13 +757,15 @@ impl DataLinkContext {
             }
         } else if self.noise_phase == NoisePhase::Transport {
             println!("READ TRANSPORT");
-            let ret = self
-                .noise_transport
-                .as_mut()
-                .unwrap()
-                .read_message(&message[..index], payload);
+            let nonce = self.receiving_nonce;
+            let ret = self.noise_transport.as_ref().unwrap().read_message(
+                nonce,
+                &message[..index],
+                payload,
+            );
             match ret {
                 Ok(_) => {
+                    self.receiving_nonce += 1;
                     return Ok(());
                 }
                 Err(_e) => {
@@ -622,5 +775,77 @@ impl DataLinkContext {
         }
 
         Ok(())
+    }
+
+    // --- Snapshot / restore accessors ---
+
+    /// Get the current noise phase.
+    pub fn get_phase(&self) -> NoisePhase {
+        self.noise_phase
+    }
+
+    /// Get the handshake pattern.
+    pub fn get_pattern(&self) -> HandshakePattern {
+        self.message_patterns
+    }
+
+    /// Whether this side is the initiator.
+    pub fn is_initiator(&self) -> bool {
+        self.initiator
+    }
+
+    /// Get the local ephemeral secret key (for backup/restore).
+    pub fn get_ephemeral_secret(&self) -> &[u8; 32] {
+        &self.local_ephemeral_seckey
+    }
+
+    /// Get the local static secret key (for backup/restore).
+    pub fn get_static_secret(&self) -> Option<&SecretKey> {
+        self.local_static_seckey.as_ref()
+    }
+
+    /// Get the current noise step.
+    pub fn get_noise_step(&self) -> NoiseStep {
+        self.noise_step
+    }
+
+    /// Get the current sub-step index.
+    pub fn get_sub_step_index(&self) -> usize {
+        self.sub_step_index
+    }
+
+    /// Get the sending nonce (transport phase).
+    pub fn get_sending_nonce(&self) -> u64 {
+        self.sending_nonce
+    }
+
+    /// Get the receiving nonce (transport phase).
+    pub fn get_receiving_nonce(&self) -> u64 {
+        self.receiving_nonce
+    }
+
+    /// Set the counter (used during restore).
+    pub fn set_counter(&mut self, counter: u32) {
+        self.counter = counter;
+    }
+
+    /// Set the noise step (used during restore).
+    pub fn set_noise_step(&mut self, step: NoiseStep) {
+        self.noise_step = step;
+    }
+
+    /// Set the sub-step index (used during restore).
+    pub fn set_sub_step_index(&mut self, index: usize) {
+        self.sub_step_index = index;
+    }
+
+    /// Set the sending nonce (used during restore after transport transition).
+    pub fn set_sending_nonce(&mut self, nonce: u64) {
+        self.sending_nonce = nonce;
+    }
+
+    /// Set the receiving nonce (used during restore after transport transition).
+    pub fn set_receiving_nonce(&mut self, nonce: u64) {
+        self.receiving_nonce = nonce;
     }
 }
