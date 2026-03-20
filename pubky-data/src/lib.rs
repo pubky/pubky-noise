@@ -240,6 +240,30 @@ impl PubkyDataEncryptor {
     /// the initiator or responder in any order. If the peer's message is not
     /// yet available, returns `HandshakeResult::Pending` without advancing state.
     ///
+    /// # Outbox reliability and recovery
+    ///
+    /// In the outbox model, two kinds of interruption can occur:
+    ///
+    /// - **Read failure** (Responder fails to read from Initiator's outbox):
+    ///   The method returns `Pending` without advancing `step`, `sub_step`, or
+    ///   `counter`. Subsequent calls will retry the same read and succeed once
+    ///   the message appears. No special recovery is needed.
+    ///
+    /// - **Write failure** (Initiator fails to write to her outbox):
+    ///   Because the `put()` result is currently not checked, the internal
+    ///   `step`/`sub_step`/`counter` **advance even when the message never
+    ///   reaches the homeserver**. The Responder will keep polling and find
+    ///   nothing, while the Initiator waits for a reply that will never come —
+    ///   the handshake is stuck.
+    ///
+    ///   **Recovery**: callers should [`snapshot()`](Self::snapshot) (or
+    ///   [`persist_snapshot()`](Self::persist_snapshot)) **before** each call
+    ///   to `handle_handshake`. If the application detects a stuck handshake
+    ///   or restarts, it can [`restore()`](Self::restore) from the last
+    ///   persisted snapshot. The replay mechanism will rebuild the Noise state
+    ///   from what is actually on the homeservers, correcting the erroneous
+    ///   advance and allowing the handshake to resume from the right position.
+    ///
     /// # Errors:
     ///      - Returns [`PubkyDataError::BadLengthCiphertext`] on malformed messages.
     ///      - Returns [`PubkyDataError::HomeserverResponseError`] on response parse failure.
@@ -414,6 +438,12 @@ impl PubkyDataEncryptor {
     ///
     /// This snapshot contains everything needed to restore the session later
     /// by replaying persisted handshake messages.
+    ///
+    /// **Recommended usage**: call `snapshot()` (or
+    /// [`persist_snapshot()`](Self::persist_snapshot)) **before** each call to
+    /// [`handle_handshake()`](Self::handle_handshake). If a write to the local
+    /// homeserver is lost, the snapshot provides a correct pre-failure state
+    /// that [`restore()`](Self::restore) can use to rebuild the session.
     pub fn snapshot(&self) -> PubkyDataSessionState {
         let phase = self.context.get_phase();
         let handshake_hash = self.context.get_handshake_hash();
