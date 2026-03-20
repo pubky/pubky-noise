@@ -332,7 +332,7 @@ fn resolve_pattern_nk(_noise_step: NoiseStep, _initiator: bool) -> Vec<Handshake
 /// given the pattern and role (initiator/respnder). Used by the replay logic
 /// to know which operations to perform when re-feeding persisted messages.
 /// # Parameters:
-///      - `patthern`: a handshake pattern
+///      - `pattern`: a handshake pattern
 ///      - `initiator`: boolean parameter which indicates who is initiator and who is responder
 pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec<HandshakeAction> {
     let resolve = match pattern {
