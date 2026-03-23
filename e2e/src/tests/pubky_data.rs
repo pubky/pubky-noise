@@ -1430,19 +1430,22 @@ async fn pubky_data_snow_test_NN_initiator_write_failure_and_replay_recovery() {
     let initiator_public_key = pair.initiator_public_key.clone();
     let responder_public_key = pair.responder_public_key.clone();
 
-    // ── Phase 1: Capture pre-write snapshot (the "last persisted good state") ──
+    // ── Phase 1: Initiator writes slot 0, then we "lose" the message ──
 
-    let pre_write_snapshot = pair.initiator.snapshot();
-    assert_eq!(pre_write_snapshot.counter, 0);
-    assert_eq!(pre_write_snapshot.noise_step, NoiseStep::StepOne);
-    assert_eq!(pre_write_snapshot.sub_step_index, 0);
-
-    // ── Phase 2: Initiator writes slot 0, then we "lose" the message ──
+    // last_good_snapshot() is None before any handle_handshake call
+    assert!(pair.initiator.last_good_snapshot().is_none());
 
     let result = pair.initiator.handle_handshake().await.unwrap();
     assert_eq!(result, HandshakeResult::Pending);
 
-    // Verify Initiator's state IS advanced (this is the erroneous advance)
+    // handle_handshake captured the pre-mutation snapshot automatically.
+    // It should reflect the state BEFORE the write (counter=0, StepOne).
+    let pre_write_snapshot = pair.initiator.last_good_snapshot().unwrap().clone();
+    assert_eq!(pre_write_snapshot.counter, 0);
+    assert_eq!(pre_write_snapshot.noise_step, NoiseStep::StepOne);
+    assert_eq!(pre_write_snapshot.sub_step_index, 0);
+
+    // Verify Initiator's current state IS advanced (this is the erroneous advance)
     let post_write_snapshot = pair.initiator.snapshot();
     assert_eq!(post_write_snapshot.counter, 1);
     assert_eq!(post_write_snapshot.noise_step, NoiseStep::StepTwo);
@@ -1462,7 +1465,7 @@ async fn pubky_data_snow_test_NN_initiator_write_failure_and_replay_recovery() {
     let response = verify_client.public_storage().get(path).await;
     assert!(response.is_err(), "Slot 0 should be gone after delete");
 
-    // ── Phase 3: Handshake is stuck ──
+    // ── Phase 2: Handshake is stuck ──
 
     // Responder tries to read slot 0 — nothing there → Pending
     for _ in 0..3 {
@@ -1481,7 +1484,7 @@ async fn pubky_data_snow_test_NN_initiator_write_failure_and_replay_recovery() {
     assert!(!pair.initiator.is_handshake_complete());
     assert!(!pair.responder.is_handshake_complete());
 
-    // ── Phase 4: Recovery via "app restart" — restore from pre-write snapshot ──
+    // ── Phase 3: Recovery via "app restart" — restore from last_good_snapshot ──
 
     let pre_write_bytes = pre_write_snapshot.serialize();
     let pre_write_state = PubkyDataSessionState::deserialize(&pre_write_bytes).unwrap();
@@ -1500,7 +1503,7 @@ async fn pubky_data_snow_test_NN_initiator_write_failure_and_replay_recovery() {
     assert_eq!(restored_snapshot.noise_step, NoiseStep::StepOne);
     assert_eq!(restored_snapshot.sub_step_index, 0);
 
-    // ── Phase 5: Re-do the handshake from the restored state ──
+    // ── Phase 4: Re-do the handshake from the restored state ──
 
     // Restored Initiator StepOne: [Write, Pending] → writes slot 0
     // (same ephemeral key → same message), returns Pending
@@ -1520,7 +1523,7 @@ async fn pubky_data_snow_test_NN_initiator_write_failure_and_replay_recovery() {
     restored_initiator.transition_transport().unwrap();
     pair.responder.transition_transport().unwrap();
 
-    // ── Phase 6: Verify transport works after recovery ──
+    // ── Phase 5: Verify transport works after recovery ──
 
     send_and_verify(
         &mut restored_initiator,
@@ -1572,21 +1575,19 @@ async fn pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery() {
     let result = pair.responder.handle_handshake().await.unwrap();
     assert_eq!(result, HandshakeResult::Pending);
 
-    // ── Phase 2: Snapshot Initiator before the second write ──
-
-    // At this point Initiator is at StepTwo, sub_step=0, counter=1
-    // (needs to Read slot 1, then Write slot 2)
-    let pre_second_write_snapshot = pair.initiator.snapshot();
-    assert_eq!(pre_second_write_snapshot.counter, 1);
-    assert_eq!(pre_second_write_snapshot.noise_step, NoiseStep::StepTwo);
-    assert_eq!(pre_second_write_snapshot.sub_step_index, 0);
-
-    // ── Phase 3: Initiator reads slot 1 and writes slot 2, then we lose slot 2 ──
+    // ── Phase 2: Initiator reads slot 1 and writes slot 2, then we lose slot 2 ──
 
     // Initiator StepTwo: [Read, Write] → reads slot 1, writes slot 2 (-> s, se).
     // complete_step moves to Final. Snow has processed all 3 XX messages.
     let _ = pair.initiator.handle_handshake().await.unwrap();
     assert!(pair.initiator.is_handshake_complete());
+
+    // handle_handshake captured the pre-mutation snapshot automatically.
+    // It should reflect the state BEFORE the Read+Write (counter=1, StepTwo).
+    let pre_second_write_snapshot = pair.initiator.last_good_snapshot().unwrap().clone();
+    assert_eq!(pre_second_write_snapshot.counter, 1);
+    assert_eq!(pre_second_write_snapshot.noise_step, NoiseStep::StepTwo);
+    assert_eq!(pre_second_write_snapshot.sub_step_index, 0);
 
     // Verify state advanced: counter=3 (read slot 1 + write slot 2), step=Final
     let post_write_snapshot = pair.initiator.snapshot();
@@ -1607,7 +1608,7 @@ async fn pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery() {
     let response = verify_client.public_storage().get(path).await;
     assert!(response.is_err(), "Slot 2 should be gone after delete");
 
-    // ── Phase 4: Handshake is stuck ──
+    // ── Phase 3: Handshake is stuck ──
 
     // Responder tries to read slot 2 — nothing there → Pending
     for _ in 0..3 {
@@ -1618,7 +1619,7 @@ async fn pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery() {
     // Responder has NOT completed the handshake
     assert!(!pair.responder.is_handshake_complete());
 
-    // ── Phase 5: Recovery via restore from pre-second-write snapshot ──
+    // ── Phase 4: Recovery via restore from last_good_snapshot ──
 
     let snapshot_bytes = pre_second_write_snapshot.serialize();
     let snapshot_state = PubkyDataSessionState::deserialize(&snapshot_bytes).unwrap();
@@ -1644,7 +1645,7 @@ async fn pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery() {
         pre_second_write_snapshot.sub_step_index
     );
 
-    // ── Phase 6: Re-do the handshake from the restored state ──
+    // ── Phase 5: Re-do the handshake from the restored state ──
 
     // Restored Initiator StepTwo: [Read, Write] → reads slot 1 (still on
     // homeserver), writes slot 2. Snow finishes on initiator side.
@@ -1658,7 +1659,7 @@ async fn pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery() {
     restored_initiator.transition_transport().unwrap();
     pair.responder.transition_transport().unwrap();
 
-    // ── Phase 7: Verify transport works after recovery ──
+    // ── Phase 6: Verify transport works after recovery ──
 
     send_and_verify(
         &mut restored_initiator,
@@ -1672,4 +1673,76 @@ async fn pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery() {
         "XX_write_failure_reverse",
     )
     .await;
+}
+
+/// Verify that `last_good_snapshot()` correctly captures pre-mutation state
+/// at the start of each `handle_handshake()` call.
+///
+/// Checks:
+/// - Returns `None` before any `handle_handshake` call.
+/// - After each call, contains the state from *before* that call.
+/// - Updates on every subsequent call (tracks the latest pre-mutation state).
+#[tokio::test]
+async fn pubky_data_snow_test_last_good_snapshot_tracks_pre_mutation_state() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+
+    // ── Before any handshake call: last_good_snapshot is None ──
+
+    assert!(pair.initiator.last_good_snapshot().is_none());
+    assert!(pair.responder.last_good_snapshot().is_none());
+
+    // ── Initiator call 1: StepOne [Write, Pending] ──
+
+    let _ = pair.initiator.handle_handshake().await.unwrap();
+
+    // last_good_snapshot should reflect the state BEFORE the call
+    let snap = pair.initiator.last_good_snapshot().unwrap();
+    assert_eq!(snap.counter, 0);
+    assert_eq!(snap.noise_step, NoiseStep::StepOne);
+    assert_eq!(snap.sub_step_index, 0);
+    assert_eq!(snap.phase, NoisePhase::HandShake);
+
+    // Current state should be AFTER the call (advanced)
+    let current = pair.initiator.snapshot();
+    assert_eq!(current.counter, 1);
+    assert_eq!(current.noise_step, NoiseStep::StepTwo);
+    assert_eq!(current.sub_step_index, 0);
+
+    // ── Responder call 1: StepOne [Read, Write] ──
+
+    let _ = pair.responder.handle_handshake().await.unwrap();
+
+    let snap = pair.responder.last_good_snapshot().unwrap();
+    assert_eq!(snap.counter, 0);
+    assert_eq!(snap.noise_step, NoiseStep::StepOne);
+    assert_eq!(snap.sub_step_index, 0);
+
+    // Responder advanced: read slot 0 + write slot 1 = counter 2, step StepTwo
+    let current = pair.responder.snapshot();
+    assert_eq!(current.counter, 2);
+    assert_eq!(current.noise_step, NoiseStep::StepTwo);
+
+    // ── Initiator call 2: StepTwo [Read] ──
+
+    let _ = pair.initiator.handle_handshake().await.unwrap();
+
+    // last_good_snapshot updated to reflect state BEFORE this second call
+    let snap = pair.initiator.last_good_snapshot().unwrap();
+    assert_eq!(snap.counter, 1);
+    assert_eq!(snap.noise_step, NoiseStep::StepTwo);
+    assert_eq!(snap.sub_step_index, 0);
+
+    // Current state: read slot 1, step advanced to Final
+    let current = pair.initiator.snapshot();
+    assert_eq!(current.counter, 2);
+    assert_eq!(current.noise_step, NoiseStep::Final);
+
+    // Handshake is complete on both sides
+    assert!(pair.initiator.is_handshake_complete());
+    assert!(pair.responder.is_handshake_complete());
 }

@@ -189,6 +189,11 @@ pub struct PubkyDataEncryptor {
     link_id: Option<LinkId>,
     endpoint_pubkey: PublicKey,
 
+    /// Snapshot captured automatically at the start of each
+    /// [`handle_handshake()`](Self::handle_handshake) call, before any
+    /// state-mutating work. See [`last_good_snapshot()`](Self::last_good_snapshot).
+    last_good_snapshot: Option<PubkyDataSessionState>,
+
     // test-only fields
     simulate_tampering: bool,
     last_ciphertext: Option<[u8; PUBKY_DATA_MSG_LEN + 2]>,
@@ -224,6 +229,7 @@ impl PubkyDataEncryptor {
             context: data_link_context,
             link_id: None,
             endpoint_pubkey,
+            last_good_snapshot: None,
             simulate_tampering: false,
             last_ciphertext: None,
         })
@@ -256,18 +262,22 @@ impl PubkyDataEncryptor {
     ///   nothing, while the Initiator waits for a reply that will never come —
     ///   the handshake is stuck.
     ///
-    ///   **Recovery**: callers should [`snapshot()`](Self::snapshot) (or
-    ///   [`persist_snapshot()`](Self::persist_snapshot)) **before** each call
-    ///   to `handle_handshake`. If the application detects a stuck handshake
-    ///   or restarts, it can [`restore()`](Self::restore) from the last
-    ///   persisted snapshot. The replay mechanism will rebuild the Noise state
-    ///   from what is actually on the homeservers, correcting the erroneous
-    ///   advance and allowing the handshake to resume from the right position.
+    ///   **Recovery**: each call to `handle_handshake` automatically captures
+    ///   a pre-mutation snapshot accessible via
+    ///   [`last_good_snapshot()`](Self::last_good_snapshot). Callers should
+    ///   persist this snapshot (e.g. via [`persist_snapshot()`](Self::persist_snapshot))
+    ///   so that on restart they can pass it to [`restore()`](Self::restore).
+    ///   The replay mechanism will rebuild the Noise state from what is
+    ///   actually on the homeservers, correcting the erroneous advance and
+    ///   allowing the handshake to resume from the right position.
     ///
     /// # Errors:
     ///      - Returns [`PubkyDataError::BadLengthCiphertext`] on malformed messages.
     ///      - Returns [`PubkyDataError::HomeserverResponseError`] on response parse failure.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyDataError> {
+        // Capture pre-mutation snapshot so callers can recover from write failures.
+        self.last_good_snapshot = Some(self.snapshot());
+
         let remaining_actions = self.context.remaining_handshake_actions();
         for action in remaining_actions {
             match action {
@@ -439,11 +449,11 @@ impl PubkyDataEncryptor {
     /// This snapshot contains everything needed to restore the session later
     /// by replaying persisted handshake messages.
     ///
-    /// **Recommended usage**: call `snapshot()` (or
-    /// [`persist_snapshot()`](Self::persist_snapshot)) **before** each call to
-    /// [`handle_handshake()`](Self::handle_handshake). If a write to the local
-    /// homeserver is lost, the snapshot provides a correct pre-failure state
-    /// that [`restore()`](Self::restore) can use to rebuild the session.
+    /// During the handshake phase, a pre-mutation snapshot is captured
+    /// automatically by [`handle_handshake()`](Self::handle_handshake) and
+    /// is accessible via [`last_good_snapshot()`](Self::last_good_snapshot).
+    /// This method remains useful for taking snapshots at arbitrary points
+    /// (e.g. after transitioning to transport or after exchanging messages).
     pub fn snapshot(&self) -> PubkyDataSessionState {
         let phase = self.context.get_phase();
         let handshake_hash = self.context.get_handshake_hash();
@@ -648,6 +658,7 @@ impl PubkyDataEncryptor {
             context,
             link_id,
             endpoint_pubkey,
+            last_good_snapshot: None,
             simulate_tampering: false,
             last_ciphertext: None,
         })
@@ -656,6 +667,20 @@ impl PubkyDataEncryptor {
     /// Get the LinkId for this session (available after transition_transport).
     pub fn get_link_id(&self) -> Option<LinkId> {
         self.link_id
+    }
+
+    /// Returns the snapshot captured at the start of the last
+    /// [`handle_handshake()`](Self::handle_handshake) call, before any
+    /// state-mutating work.
+    ///
+    /// This represents the last known-good state. If a write to the local
+    /// homeserver was lost during the handshake, the caller can persist this
+    /// snapshot and later pass it to [`restore()`](Self::restore) to recover
+    /// the session.
+    ///
+    /// Returns `None` if `handle_handshake` has never been called.
+    pub fn last_good_snapshot(&self) -> Option<&PubkyDataSessionState> {
+        self.last_good_snapshot.as_ref()
     }
 
     /// Test-only: enable ciphertext tampering simulation.
