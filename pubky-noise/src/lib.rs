@@ -220,7 +220,7 @@ impl PubkyNoiseEncryptor {
     ///      - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
     pub fn new(
         config: Arc<PubkyNoiseConfig>,
-        holder_skey: [u8; 32],
+        mut holder_skey: [u8; 32],
         initiator: bool,
         endpoint_pubkey: PublicKey,
     ) -> Result<Self, PubkyNoiseError> {
@@ -231,6 +231,10 @@ impl PubkyNoiseEncryptor {
             endpoint_pubkey.clone(),
         )
         .map_err(|_| PubkyNoiseError::SnowNoiseBuildError)?;
+
+        // zeroize holder_skey after DataLinkContext load.
+        holder_skey.copy_from_slice(&[0; 32][..]);
+        //TODO: add assert on holder_skey byte pattern
 
         Ok(PubkyNoiseEncryptor {
             config,
@@ -491,6 +495,11 @@ impl PubkyNoiseEncryptor {
     /// Close and clean up this encryptor's Noise session.
     pub fn close(&mut self) {
         self.context.delete();
+        // when the last atomically reference counted pointer
+        // to the config including the pubky_root_seckey, the
+        // inner value allocation is destroyed.
+        // TODO: verify the Arc implementation to check what
+        // is mean by destroyed, it the memory free'd ?
     }
 
     /// Capture the current session state as a serializable snapshot.
