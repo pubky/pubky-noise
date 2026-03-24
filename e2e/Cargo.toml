@@ -5,7 +5,7 @@ version = "0.6.0-rc.6"
 publish = false
 
 [dependencies]
-pubky-testnet = { git = "https://github.com/pubky/pubky-core", tag = "v0.7.0-rc.3", features = ["embedded-postgres"] }
+pubky-testnet = { version = "0.7.0", features = ["embedded-postgres"] }
 pubky-data = { path = "../pubky-data" }
 tokio = { version = "1.47.1", features = ["full", "test-util"] }
 tracing-subscriber = "0.3.20"

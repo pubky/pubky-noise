@@ -8,13 +8,13 @@ use crate::snow_crypto_resolver::ReplayResolver;
 
 pub const PUBKY_DATA_MSG_LEN: usize = 1000;
 
-#[derive(PartialEq, Debug, Copy, Clone)]
+#[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum NoisePhase {
     HandShake,
     Transport,
 }
 
-#[derive(PartialEq, Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum NoiseStep {
     StepOne,
     StepTwo,
@@ -51,7 +51,7 @@ impl NoiseStep {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum HandshakeAction {
     Read,
     Write,
@@ -64,52 +64,52 @@ pub enum HandshakeAction {
 /// 0. **No authentication**. This payload may have been sent by any party, including an active attacker.
 ///
 /// 1. **Sender authentication vulnerable to key-compromise impersonation (KCI)**. The sender authentication
-/// is based on a static-static DH ("ss") involving both parties' static key pairs. If the recipient's
-/// long-term private key has been compromised, this authentication can be forged. Note that a future
-/// version of Noise might include signatures, which could improve this security property, but brings
-/// other trade-offs.
+///    is based on a static-static DH ("ss") involving both parties' static key pairs. If the recipient's
+///    long-term private key has been compromised, this authentication can be forged. Note that a future
+///    version of Noise might include signatures, which could improve this security property, but brings
+///    other trade-offs.
 ///
 /// 2. **Sender authentication resistant to key-compromise impersonation (KCI)**. The sender authentication
-/// is based on an ephemeral-static DH ("es" or "se") between the sender's static key pair and the recipient's
-/// ephemeral key pair. Assuming the corresponding private keys are secure, this authentication cannot be
-/// forged.
+///    is based on an ephemeral-static DH ("es" or "se") between the sender's static key pair and the recipient's
+///    ephemeral key pair. Assuming the corresponding private keys are secure, this authentication cannot be
+///    forged.
 ///
 /// The destination properties are:
 ///
 /// 0. **No confidentiality**. This payload is sent in cleartext.
 ///
 /// 1. **Encryption to an ephemeral recipient**. This payload has forward secrecy, since encryption involves
-/// an ephemeral-ephemeral DH ("ee"). However, the sender has not authenticated the recipient, so this payload
-/// might be sent to any party, including an active attacker.
+///    an ephemeral-ephemeral DH ("ee"). However, the sender has not authenticated the recipient, so this payload
+///    might be sent to any party, including an active attacker.
 ///
 /// 2. **Encryption to a known recipient, forward secrecy for sender compromise only, vulnerable to replay**.
-/// This payload is encrypted based only on DHs involving the recipient's static key pair. If the recipient's
-/// static private key is compromised, even at a later date, this payload can be decrypted. This message can
-/// also be replayed, since there's no ephemeral contribution from the recipient.
+///    This payload is encrypted based only on DHs involving the recipient's static key pair. If the recipient's
+///    static private key is compromised, even at a later date, this payload can be decrypted. This message can
+///    also be replayed, since there's no ephemeral contribution from the recipient.
 ///
 /// 3. **Encryption to a known recipient, weak forward secrecy**. This payload is encrypted based on an
-/// ephemeral-ephemeral DH and also an ephemeral-static DH involving the recipient's static key pair. However,
-/// the binding between the recipient's alleged ephemeral public key and the recipient's static public key
-/// hasn't been verified by the sender, so the recipient's alleged ephemeral public key may have been forged
-/// by an active attacker. In this case, the attacker could later compromise the recipient's static private
-/// key to decrypt the payload. Note that a future version of Noise might include signatures, which could
-/// improve this security property, but brings other trade-offs.
+///    ephemeral-ephemeral DH and also an ephemeral-static DH involving the recipient's static key pair. However,
+///    the binding between the recipient's alleged ephemeral public key and the recipient's static public key
+///    hasn't been verified by the sender, so the recipient's alleged ephemeral public key may have been forged
+///    by an active attacker. In this case, the attacker could later compromise the recipient's static private
+///    key to decrypt the payload. Note that a future version of Noise might include signatures, which could
+///    improve this security property, but brings other trade-offs.
 ///
 /// 4. **Encryption to a known recipient, weak forward secrecy if the sender's private key has been compromised**.
-/// This payload is encrypted based on an ephemeral-ephemeral DH, and also based on an ephemeral-static DH
-/// involving the recipient's static key pair. However, the binding between the recipient's alleged ephemeral
-/// public and the recipient's static public key has only been verified based on DHs involving both those public
-/// keys and the sender's static private key. Thus, if the sender's static private key was previously compromised,
-/// the recipient's alleged ephemeral public key may have been forged by an active attacker. In this case, the
-/// attacker could later compromise the intended recipient's static private key to decrypt the payload (this is
-/// a variant of a "KCI" attack enabling a "weak forward secrecy" attack). Note that a future version of Noise
-/// might include signatures, which could improve this security property, but brings other trade-offs.
+///    This payload is encrypted based on an ephemeral-ephemeral DH, and also based on an ephemeral-static DH
+///    involving the recipient's static key pair. However, the binding between the recipient's alleged ephemeral
+///    public and the recipient's static public key has only been verified based on DHs involving both those public
+///    keys and the sender's static private key. Thus, if the sender's static private key was previously compromised,
+///    the recipient's alleged ephemeral public key may have been forged by an active attacker. In this case, the
+///    attacker could later compromise the intended recipient's static private key to decrypt the payload (this is
+///    a variant of a "KCI" attack enabling a "weak forward secrecy" attack). Note that a future version of Noise
+///    might include signatures, which could improve this security property, but brings other trade-offs.
 ///
 /// 5. **Encryption to a known recipient, strong forward secrecy**. This payload is encrypted based on an
-/// ephemeral-ephemeral DH as well as an ephemeral-static DH with the recipient's static key pair. Assuming
-/// the ephemeral private keys are secure, and the recipient is not being actively impersonated by an attacker
-/// that has stolen its static private key, this payload cannot be decrypted.
-#[derive(PartialEq, Copy, Clone, Debug)]
+///    ephemeral-ephemeral DH as well as an ephemeral-static DH with the recipient's static key pair. Assuming
+///    the ephemeral private keys are secure, and the recipient is not being actively impersonated by an attacker
+///    that has stolen its static private key, this payload cannot be decrypted.
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum HandshakePattern {
     /// <- s                      0                0
     /// ...
@@ -181,31 +181,33 @@ pub enum HandshakePattern {
 }
 
 pub enum PatternError {
-    UnknownLitteralPattern,
+    UnknownLiteralPattern,
 }
 
-impl HandshakePattern {
-    pub fn pattern_to_string(&self) -> Result<String, ()> {
-        match self {
-            HandshakePattern::PatternN => Ok(String::from("N")),
-            HandshakePattern::PatternNN => Ok(String::from("NN")),
-            HandshakePattern::PatternXX => Ok(String::from("XX")),
-            HandshakePattern::PatternIK => Ok(String::from("IK")),
-            HandshakePattern::PatternNK => Ok(String::from("NK")),
-            HandshakePattern::TestOnlyPatternAA => Ok(String::from("AA")),
-        }
-    }
+impl std::str::FromStr for HandshakePattern {
+    type Err = PatternError;
 
-    //TODO: fix
-    pub fn from_string(pattern_string: String) -> Result<Self, PatternError> {
-        match pattern_string.as_str() {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
             "N" => Ok(HandshakePattern::PatternN),
             "NN" => Ok(HandshakePattern::PatternNN),
             "XX" => Ok(HandshakePattern::PatternXX),
             "IK" => Ok(HandshakePattern::PatternIK),
             "NK" => Ok(HandshakePattern::PatternNK),
-            "AA" => Ok(HandshakePattern::TestOnlyPatternAA),
-            _ => Err(PatternError::UnknownLitteralPattern),
+            _ => Err(PatternError::UnknownLiteralPattern),
+        }
+    }
+}
+
+impl HandshakePattern {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HandshakePattern::PatternN => "N",
+            HandshakePattern::PatternNN => "NN",
+            HandshakePattern::PatternXX => "XX",
+            HandshakePattern::PatternIK => "IK",
+            HandshakePattern::PatternNK => "NK",
+            HandshakePattern::TestOnlyPatternAA => "AA",
         }
     }
 
@@ -247,85 +249,62 @@ impl HandshakePattern {
 }
 
 pub fn resolve_pattern_nn(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
-    let mut steps_to_be_done: Vec<HandshakeAction> = Vec::new();
     if initiator {
         match noise_step {
-            NoiseStep::StepOne => {
-                steps_to_be_done.push(HandshakeAction::Write);
-                steps_to_be_done.push(HandshakeAction::Pending);
-            }
-            NoiseStep::StepTwo => {
-                steps_to_be_done.push(HandshakeAction::Read);
-            }
-            NoiseStep::Final => {
-                steps_to_be_done.push(HandshakeAction::Terminal);
-            }
+            NoiseStep::StepOne => vec![HandshakeAction::Write, HandshakeAction::Pending],
+            NoiseStep::StepTwo => vec![HandshakeAction::Read],
+            NoiseStep::Final => vec![HandshakeAction::Terminal],
         }
     } else {
-        // == responder
         match noise_step {
-            NoiseStep::StepOne => {
-                steps_to_be_done.push(HandshakeAction::Read);
-                steps_to_be_done.push(HandshakeAction::Write);
-            }
-            NoiseStep::StepTwo => {
-                steps_to_be_done.push(HandshakeAction::Terminal);
-            }
-            NoiseStep::Final => {
-                steps_to_be_done.push(HandshakeAction::Terminal);
-            }
+            NoiseStep::StepOne => vec![HandshakeAction::Read, HandshakeAction::Write],
+            NoiseStep::StepTwo => vec![HandshakeAction::Terminal],
+            NoiseStep::Final => vec![HandshakeAction::Terminal],
         }
     }
-    steps_to_be_done
 }
 
 pub fn resolve_pattern_xx(noise_step: NoiseStep, initiator: bool) -> Vec<HandshakeAction> {
-    let mut steps_to_be_done: Vec<HandshakeAction> = Vec::new();
     if initiator {
         match noise_step {
-            NoiseStep::StepOne => {
-                // write -> e
-                steps_to_be_done.push(HandshakeAction::Write);
-                steps_to_be_done.push(HandshakeAction::Pending);
-            }
-            NoiseStep::StepTwo => {
-                // read <- e, s
-                steps_to_be_done.push(HandshakeAction::Read);
-                // write -> s
-                steps_to_be_done.push(HandshakeAction::Write);
-            }
-            NoiseStep::Final => {
-                steps_to_be_done.push(HandshakeAction::Terminal);
-            }
+            NoiseStep::StepOne => vec![HandshakeAction::Write, HandshakeAction::Pending],
+            NoiseStep::StepTwo => vec![HandshakeAction::Read, HandshakeAction::Write],
+            NoiseStep::Final => vec![HandshakeAction::Terminal],
         }
     } else {
-        // == responder
         match noise_step {
             NoiseStep::StepOne => {
-                // read -> e
-                steps_to_be_done.push(HandshakeAction::Read);
-                // write <- e, s
-                steps_to_be_done.push(HandshakeAction::Write);
-                steps_to_be_done.push(HandshakeAction::Pending);
+                vec![
+                    HandshakeAction::Read,
+                    HandshakeAction::Write,
+                    HandshakeAction::Pending,
+                ]
             }
-            NoiseStep::StepTwo => {
-                // read -> s
-                steps_to_be_done.push(HandshakeAction::Read);
-            }
-            NoiseStep::Final => {
-                steps_to_be_done.push(HandshakeAction::Terminal);
-            }
+            NoiseStep::StepTwo => vec![HandshakeAction::Read],
+            NoiseStep::Final => vec![HandshakeAction::Terminal],
         }
     }
-    steps_to_be_done
 }
 
-fn resolve_pattern_ik(_noise_step: NoiseStep, _initiator: bool) -> Vec<HandshakeAction> {
-    vec![]
-}
-
-fn resolve_pattern_nk(_noise_step: NoiseStep, _initiator: bool) -> Vec<HandshakeAction> {
-    vec![]
+/// Resolve the handshake actions for a given pattern, step, and role.
+///
+/// Only NN and XX patterns are currently implemented. IK and NK will
+/// panic with "not yet implemented" if called.
+fn resolve_pattern(
+    pattern: HandshakePattern,
+    noise_step: NoiseStep,
+    initiator: bool,
+) -> Vec<HandshakeAction> {
+    match pattern {
+        HandshakePattern::PatternNN => resolve_pattern_nn(noise_step, initiator),
+        HandshakePattern::PatternXX => resolve_pattern_xx(noise_step, initiator),
+        HandshakePattern::PatternN | HandshakePattern::PatternIK | HandshakePattern::PatternNK => {
+            unimplemented!("handshake pattern {:?} is not yet implemented", pattern)
+        }
+        HandshakePattern::TestOnlyPatternAA => {
+            panic!("TestOnlyPatternAA cannot be resolved to handshake actions")
+        }
+    }
 }
 
 /// Return the flat sequence of Write/Read actions for a complete handshake,
@@ -335,18 +314,10 @@ fn resolve_pattern_nk(_noise_step: NoiseStep, _initiator: bool) -> Vec<Handshake
 ///      - `pattern`: a handshake pattern
 ///      - `initiator`: boolean parameter which indicates who is initiator and who is responder
 pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec<HandshakeAction> {
-    let resolve = match pattern {
-        HandshakePattern::PatternNN => resolve_pattern_nn,
-        HandshakePattern::PatternXX => resolve_pattern_xx,
-        HandshakePattern::PatternIK => resolve_pattern_ik,
-        HandshakePattern::PatternNK => resolve_pattern_nk,
-        _ => panic!("unsupported handshake pattern for full_handshake_actions"),
-    };
-
     let mut actions = Vec::new();
     let steps = [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final];
     for step in &steps {
-        let step_actions = resolve(*step, initiator);
+        let step_actions = resolve_pattern(pattern, *step, initiator);
         for action in step_actions {
             match action {
                 HandshakeAction::Write | HandshakeAction::Read => actions.push(action),
@@ -400,24 +371,16 @@ pub struct DataLinkContext {
     // When a Read fails (peer hasn't written yet), we return Pending without advancing
     // sub_step_index, so the next poll retries from the same action.
     sub_step_index: usize,
-
-    //TODO: add context creation date ?
-    //TODO: already there for identity binding
-    #[allow(dead_code)]
-    local_pkarr_pubkey: Option<PublicKey>,
 }
 
 impl DataLinkContext {
     /// Build the Snow protocol name string for the given pattern.
     /// We're using ChaCha as the stream cipher. Poly1305 as the MAC and SHA256 as a hash function.
-    fn build_protocol_name(handshake_pattern: &HandshakePattern) -> Result<String, ContextError> {
-        let mut protocol_name = String::from("Noise_");
-        let pattern_string = handshake_pattern
-            .pattern_to_string()
-            .map_err(|_| ContextError::Init)?;
-        protocol_name.push_str(&pattern_string);
-        protocol_name.push_str("_25519_ChaChaPoly_SHA256");
-        Ok(protocol_name)
+    fn build_protocol_name(handshake_pattern: &HandshakePattern) -> String {
+        format!(
+            "Noise_{}_25519_ChaChaPoly_SHA256",
+            handshake_pattern.as_str()
+        )
     }
 
     /// Build a Snow HandshakeState using the ReplayResolver with the given ephemeral seed.
@@ -458,18 +421,14 @@ impl DataLinkContext {
     pub fn new(
         handshake_pattern: HandshakePattern,
         initiator: bool,
-        _prologue: Vec<u8>,
         local_static_key: Option<SecretKey>,
         endpoint_pubkey: PublicKey,
-        local_pkarr_pubkey: Option<PublicKey>,
     ) -> Result<DataLinkContext, ContextError> {
         Self::new_with_ephemeral(
             handshake_pattern,
             initiator,
-            _prologue,
             local_static_key,
             endpoint_pubkey,
-            local_pkarr_pubkey,
             None,
         )
     }
@@ -481,10 +440,8 @@ impl DataLinkContext {
     pub fn new_with_ephemeral(
         handshake_pattern: HandshakePattern,
         initiator: bool,
-        _prologue: Vec<u8>,
         local_static_key: Option<SecretKey>,
         endpoint_pubkey: PublicKey,
-        local_pkarr_pubkey: Option<PublicKey>,
         ephemeral_secret: Option<[u8; 32]>,
     ) -> Result<DataLinkContext, ContextError> {
         // Section 5.3 The Handshake Object
@@ -494,8 +451,7 @@ impl DataLinkContext {
         //   the handshake pattern and crypto functions, as specified in Section 8.
         //   Calls InitializeSymmetric(protocol_name).
 
-        let protocol_name = Self::build_protocol_name(&handshake_pattern)?;
-        println!("Current Protocol Name {protocol_name}");
+        let protocol_name = Self::build_protocol_name(&handshake_pattern);
 
         // Generate or use provided ephemeral seed
         let ephemeral_seed = match ephemeral_secret {
@@ -514,8 +470,6 @@ impl DataLinkContext {
             &local_static_key,
             &ephemeral_seed,
         )?;
-
-        println!("build result Ok");
 
         // - Sets the initator s, e, rs and re variables to the corresponding
         //   arguments.
@@ -550,8 +504,6 @@ impl DataLinkContext {
             counter: 0,
 
             sub_step_index: 0,
-
-            local_pkarr_pubkey,
         })
     }
 
@@ -575,11 +527,10 @@ impl DataLinkContext {
     }
 
     pub fn is_handshake(&self) -> bool {
-        !self
-            .noise_handshake
-            .as_ref()
-            .unwrap()
-            .is_handshake_finished()
+        match &self.noise_handshake {
+            Some(hs) => !hs.is_handshake_finished(),
+            None => false,
+        }
     }
 
     /// Check if this context is in transport phase.
@@ -599,57 +550,31 @@ impl DataLinkContext {
     }
 
     pub fn to_transport(&mut self) -> Result<(), ContextError> {
-        println!(
-            "TO TRANSPORT HANDSHAKE FINISHED {} INITIATOR {}",
-            self.noise_handshake
-                .as_ref()
-                .unwrap()
-                .is_handshake_finished(),
-            self.initiator
-        );
-        if !self
+        let hs = self
             .noise_handshake
             .as_ref()
-            .unwrap()
-            .is_handshake_finished()
-        {
+            .ok_or(ContextError::OngoingHandshake)?;
+        if !hs.is_handshake_finished() {
             return Err(ContextError::OngoingHandshake);
         }
         let transport = self
             .noise_handshake
             .take()
             .unwrap()
-            .into_stateless_transport_mode();
-        if let Ok(transport) = transport {
-            println!("TRANSPORT OK");
-            //TODO: zeroize HandshakeState
-            self.noise_transport = Some(transport);
-            self.noise_phase = NoisePhase::Transport;
-            self.sending_nonce = 0;
-            self.receiving_nonce = 0;
-            return Ok(());
-        }
-        println!("TRANSPORT NOT OK");
-        Err(ContextError::InternalSnowTransitionErr)
+            .into_stateless_transport_mode()
+            .map_err(|_| ContextError::InternalSnowTransitionErr)?;
+        self.noise_transport = Some(transport);
+        self.noise_phase = NoisePhase::Transport;
+        self.sending_nonce = 0;
+        self.receiving_nonce = 0;
+        Ok(())
     }
 
     /// Returns the remaining actions for the current step, starting from sub_step_index.
     /// Uses the stored `initiator` flag -- callers no longer need to pass it.
     /// Does NOT advance noise_step -- call `complete_step()` for that.
     pub fn remaining_handshake_actions(&self) -> Vec<HandshakeAction> {
-        assert!(
-            self.message_patterns == HandshakePattern::PatternNN
-                || self.message_patterns == HandshakePattern::PatternXX
-        );
-        let all_actions = match self.message_patterns {
-            HandshakePattern::PatternNN => resolve_pattern_nn(self.noise_step, self.initiator),
-            HandshakePattern::PatternXX => resolve_pattern_xx(self.noise_step, self.initiator),
-            HandshakePattern::PatternIK => resolve_pattern_ik(self.noise_step, self.initiator),
-            HandshakePattern::PatternNK => resolve_pattern_nk(self.noise_step, self.initiator),
-            _ => {
-                panic!("unsupported handshake pattern for resolution");
-            }
-        };
+        let all_actions = resolve_pattern(self.message_patterns, self.noise_step, self.initiator);
         all_actions.into_iter().skip(self.sub_step_index).collect()
     }
 
@@ -666,61 +591,28 @@ impl DataLinkContext {
 
     pub fn write_act(
         &mut self,
-        payload: Vec<u8>,
+        payload: &[u8],
         message: &mut [u8; PUBKY_DATA_MSG_LEN],
     ) -> Result<usize, ContextError> {
-        //TODO: care better about error
-        // Section 5.3 The HandshakeState object
-        //
-        // For "e": Sets e (which must be empty) to GENERATE_KEYPAIR().
-        // Appends e.public_key to the buffer. Calls MixHash(e.public_key).
-        //
-        // For "ee": Calls MixKey(DH(e, re))
-        //
-        // For "es": Calls MixKey (DH(e, rs)) if initiator, MixKey(DH(s, re)
-        // if responder.
-        println!("SNOW WRITE {payload:?}");
-        let ret = 0;
-        if self.noise_phase == NoisePhase::HandShake {
-            //TODO: determinate_transition()
-            let result = self
+        match self.noise_phase {
+            NoisePhase::HandShake => self
                 .noise_handshake
                 .as_mut()
                 .unwrap()
-                .write_message(&payload, message.as_mut());
-            match result {
-                Ok(write_size) => {
-                    return Ok(write_size);
-                }
-                Err(_e) => {
-                    return Err(ContextError::InternalSnowWriteErr);
-                }
-            }
-        } else if self.noise_phase == NoisePhase::Transport {
-            println!("WRITE TRANSPORT");
-            println!(
-                "payload size {} message size {}",
-                payload.len(),
-                message.len()
-            );
-            let nonce = self.sending_nonce;
-            let result = self.noise_transport.as_ref().unwrap().write_message(
-                nonce,
-                &payload,
-                message.as_mut(),
-            );
-            match result {
-                Ok(write_size) => {
-                    self.sending_nonce += 1;
-                    return Ok(write_size);
-                }
-                Err(_e) => {
-                    return Err(ContextError::InternalSnowWriteErr);
-                }
+                .write_message(payload, message.as_mut())
+                .map_err(|_| ContextError::InternalSnowWriteErr),
+            NoisePhase::Transport => {
+                let nonce = self.sending_nonce;
+                let size = self
+                    .noise_transport
+                    .as_ref()
+                    .unwrap()
+                    .write_message(nonce, payload, message.as_mut())
+                    .map_err(|_| ContextError::InternalSnowWriteErr)?;
+                self.sending_nonce += 1;
+                Ok(size)
             }
         }
-
-        Ok(ret)
     }
 
     pub fn read_act(
@@ -729,52 +621,25 @@ impl DataLinkContext {
         payload: &mut [u8; PUBKY_DATA_MSG_LEN],
         index: usize,
     ) -> Result<(), ContextError> {
-        // Section 5.3 The HandshakeState Object
-        //
-        // For "e": Sets re (which must be empty) to the next DHLEN bytes
-        // from the message. Calls MixHash(re.public_keys).
-        //
-        // For "ee": Calls MixKey (DH(e, re)).
-        //
-        // For "es": Calls MixKey (DH(e, rs)) if initiator, MixKey(DH(s, re))
-        // if responder.
-        println!("SNOW READ");
-        //TODO: improv ret error management
-        if self.noise_phase == NoisePhase::HandShake {
-            println!("INDEX {index}");
-            let ret = self
-                .noise_handshake
-                .as_mut()
-                .unwrap()
-                .read_message(&message[..index], payload);
-            match ret {
-                Ok(_) => {
-                    return Ok(());
-                }
-                Err(_e) => {
-                    return Err(ContextError::InternalSnowReadErr);
-                }
+        match self.noise_phase {
+            NoisePhase::HandShake => {
+                self.noise_handshake
+                    .as_mut()
+                    .unwrap()
+                    .read_message(&message[..index], payload)
+                    .map_err(|_| ContextError::InternalSnowReadErr)?;
+                Ok(())
             }
-        } else if self.noise_phase == NoisePhase::Transport {
-            println!("READ TRANSPORT");
-            let nonce = self.receiving_nonce;
-            let ret = self.noise_transport.as_ref().unwrap().read_message(
-                nonce,
-                &message[..index],
-                payload,
-            );
-            match ret {
-                Ok(_) => {
-                    self.receiving_nonce += 1;
-                    return Ok(());
-                }
-                Err(_e) => {
-                    return Err(ContextError::InternalSnowReadErr);
-                }
+            NoisePhase::Transport => {
+                self.noise_transport
+                    .as_ref()
+                    .unwrap()
+                    .read_message(self.receiving_nonce, &message[..index], payload)
+                    .map_err(|_| ContextError::InternalSnowReadErr)?;
+                self.receiving_nonce += 1;
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     // --- Snapshot / restore accessors ---

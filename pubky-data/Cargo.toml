@@ -9,7 +9,7 @@ keywords = ["pubky", "noise"]
 categories = ["authentication", "encryption"]
 
 [dependencies]
-pubky = { git = "https://github.com/pubky/pubky-core", tag = "v0.7.0-rc.3" }
+pubky = "0.7.0"
 ed25519-dalek = { version = "=3.0.0-pre.5" }
 curve25519-dalek = { version = "=5.0.0-pre.5" }
 snow = { version = "0.10.0", features = ["use-sha2"] }
