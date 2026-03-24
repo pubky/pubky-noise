@@ -673,10 +673,14 @@ impl PubkyDataEncryptor {
     /// [`handle_handshake()`](Self::handle_handshake) call, before any
     /// state-mutating work.
     ///
-    /// This represents the last known-good state. If a write to the local
-    /// homeserver was lost during the handshake, the caller can persist this
-    /// snapshot and later pass it to [`restore()`](Self::restore) to recover
-    /// the session.
+    /// The snapshot always reflects the state just before the **most recent**
+    /// `handle_handshake` call — each call overwrites the previous snapshot.
+    /// Callers that need to preserve a specific pre-failure snapshot should
+    /// clone or persist it before the next `handle_handshake` call.
+    ///
+    /// If a write to the local homeserver was lost during the handshake, the
+    /// caller can pass the persisted snapshot to [`restore()`](Self::restore)
+    /// to recover the session.
     ///
     /// Returns `None` if `handle_handshake` has never been called.
     pub fn last_good_snapshot(&self) -> Option<&PubkyDataSessionState> {
