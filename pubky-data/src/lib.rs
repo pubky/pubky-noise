@@ -54,6 +54,10 @@ pub enum PubkyDataError {
     BadLengthCiphertext,
     /// the homeserver response is a failure
     HomeserverResponseError,
+    /// Handshake write failed to reach the homeserver.
+    /// The Noise state has already advanced irreversibly; recovery requires
+    /// restoring from [`PubkyDataEncryptor::last_good_snapshot()`].
+    HomeserverWriteError,
     IsHandshake,
     /// Restore failed: handshake replay error.
     RestoreReplayError,
@@ -196,6 +200,7 @@ pub struct PubkyDataEncryptor {
 
     // test-only fields
     simulate_tampering: bool,
+    simulate_write_failure: bool,
     last_ciphertext: Option<[u8; PUBKY_DATA_MSG_LEN + 2]>,
 }
 
@@ -231,6 +236,7 @@ impl PubkyDataEncryptor {
             endpoint_pubkey,
             last_good_snapshot: None,
             simulate_tampering: false,
+            simulate_write_failure: false,
             last_ciphertext: None,
         })
     }
@@ -256,11 +262,12 @@ impl PubkyDataEncryptor {
     ///   the message appears. No special recovery is needed.
     ///
     /// - **Write failure** (Initiator fails to write to her outbox):
-    ///   Because the `put()` result is currently not checked, the internal
-    ///   `step`/`sub_step`/`counter` **advance even when the message never
-    ///   reaches the homeserver**. The Responder will keep polling and find
-    ///   nothing, while the Initiator waits for a reply that will never come —
-    ///   the handshake is stuck.
+    ///   If the homeserver `put()` call fails, this method returns
+    ///   [`PubkyDataError::HomeserverWriteError`]. Because Snow's internal
+    ///   `HandshakeState` has already been irreversibly advanced by
+    ///   `write_message`, the encryptor is in a corrupted state and **cannot**
+    ///   simply retry. The caller must recover by restoring from the
+    ///   pre-mutation snapshot captured at the start of this call.
     ///
     ///   **Recovery**: each call to `handle_handshake` automatically captures
     ///   a pre-mutation snapshot accessible via
@@ -268,12 +275,20 @@ impl PubkyDataEncryptor {
     ///   persist this snapshot (e.g. via [`persist_snapshot()`](Self::persist_snapshot))
     ///   so that on restart they can pass it to [`restore()`](Self::restore).
     ///   The replay mechanism will rebuild the Noise state from what is
-    ///   actually on the homeservers, correcting the erroneous advance and
-    ///   allowing the handshake to resume from the right position.
+    ///   actually on the homeservers, correcting the state and allowing the
+    ///   handshake to resume from the right position.
+    ///
+    ///   Note: if the `put()` succeeds but the data is subsequently lost
+    ///   (e.g. homeserver crash after acknowledgment), the same snapshot-based
+    ///   recovery path applies — but the failure is not detectable by this
+    ///   method.
     ///
     /// # Errors:
     ///      - Returns [`PubkyDataError::BadLengthCiphertext`] on malformed messages.
     ///      - Returns [`PubkyDataError::HomeserverResponseError`] on response parse failure.
+    ///      - Returns [`PubkyDataError::HomeserverWriteError`] if the homeserver
+    ///        write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
+    ///        and [`restore()`](Self::restore) is required.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyDataError> {
         // Capture pre-mutation snapshot so callers can recover from write failures.
         self.last_good_snapshot = Some(self.snapshot());
@@ -318,12 +333,24 @@ impl PubkyDataEncryptor {
                         let counter = self.context.get_counter();
                         let formatted_path = format!("{path}/{counter}");
                         let packet = encode_packet(&message, len);
-                        let _ = self
-                            .config
-                            .local_session
-                            .storage()
-                            .put(formatted_path, packet.to_vec())
-                            .await;
+                        // Check for simulated write failure (test-only) or
+                        // actual homeserver write failure.
+                        let write_failed = if self.simulate_write_failure {
+                            true
+                        } else {
+                            self.config
+                                .local_session
+                                .storage()
+                                .put(formatted_path, packet.to_vec())
+                                .await
+                                .is_err()
+                        };
+                        if write_failed {
+                            // Snow's HandshakeState has already advanced
+                            // irreversibly. The caller must recover via
+                            // last_good_snapshot() + restore().
+                            return Err(PubkyDataError::HomeserverWriteError);
+                        }
                         self.context.increment_counter();
                         self.context.advance_sub_step();
                     }
@@ -394,6 +421,10 @@ impl PubkyDataEncryptor {
         {
             return false;
         }
+        // Advance the sending nonce only after the write is confirmed.
+        // write_act() no longer increments the nonce internally, so that
+        // a failed put() does not desynchronize the nonce with the receiver.
+        self.context.increment_sending_nonce();
         self.context.increment_counter();
         true
     }
@@ -660,6 +691,7 @@ impl PubkyDataEncryptor {
             endpoint_pubkey,
             last_good_snapshot: None,
             simulate_tampering: false,
+            simulate_write_failure: false,
             last_ciphertext: None,
         })
     }
@@ -690,6 +722,14 @@ impl PubkyDataEncryptor {
     /// Test-only: enable ciphertext tampering simulation.
     pub fn test_enable_tampering(&mut self) {
         self.simulate_tampering = true;
+    }
+
+    /// Test-only: simulate homeserver write failures during handshake.
+    ///
+    /// When enabled, `handle_handshake` will skip the `put()` call and
+    /// return `Err(PubkyDataError::HomeserverWriteError)` on Write actions.
+    pub fn test_enable_write_failure(&mut self) {
+        self.simulate_write_failure = true;
     }
 
     /// Test-only: get the last ciphertext produced by send_message.

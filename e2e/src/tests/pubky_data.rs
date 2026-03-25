@@ -1239,12 +1239,24 @@ async fn pubky_data_snow_test_restore_link_id_matches() {
 // Case (b): Responder's step/sub_step must NOT advance on read failure.
 //           Retry should succeed once the message appears.
 //
-// Case (a): The current code erroneously advances Initiator's step/sub_step
-//           even when the write never reaches the homeserver (because the
-//           put() result is discarded with `let _ =`). The handshake gets
-//           stuck. Recovery is possible by restoring from a pre-failure
-//           snapshot (simulating "app restart" loading last persisted state),
-//           which replays the handshake from the correct position.
+// Case (a) has two sub-cases:
+//
+//   (a1) put() returns an error (network timeout, server rejection):
+//        handle_handshake() now returns Err(HomeserverWriteError).
+//        Snow's HandshakeState has already advanced irreversibly, so the
+//        caller must recover via last_good_snapshot() + restore().
+//        See: pubky_data_snow_test_NN_initiator_put_failure_returns_error
+//             pubky_data_snow_test_XX_initiator_put_failure_returns_error
+//
+//   (a2) put() succeeds but data is subsequently lost (e.g. homeserver
+//        crash after acknowledgment, storage corruption):
+//        handle_handshake() returns Ok(Pending) — the loss is undetectable
+//        at the protocol level. The handshake gets stuck. Recovery is
+//        possible by restoring from a pre-failure snapshot (simulating
+//        "app restart" loading last persisted state), which replays the
+//        handshake from the correct position.
+//        See: pubky_data_snow_test_NN_initiator_write_failure_and_replay_recovery
+//             pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery
 // =============================================================================
 
 /// NN pattern: Responder fails to read from Initiator's outbox.
@@ -1745,4 +1757,195 @@ async fn pubky_data_snow_test_last_good_snapshot_tracks_pre_mutation_state() {
     // Handshake is complete on both sides
     assert!(pair.initiator.is_handshake_complete());
     assert!(pair.responder.is_handshake_complete());
+}
+
+/// NN pattern: Initiator's put() fails (Case a1).
+///
+/// Demonstrates that handle_handshake returns Err(HomeserverWriteError) when
+/// the homeserver write fails, and that recovery via last_good_snapshot +
+/// restore works correctly.
+///
+/// Steps:
+/// 1. Enable simulated write failure on the initiator.
+/// 2. Call handle_handshake — returns Err(HomeserverWriteError).
+/// 3. Verify last_good_snapshot captured the pre-mutation state.
+/// 4. Disable write failure, restore from snapshot, complete handshake.
+/// 5. Verify transport works after recovery.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn pubky_data_snow_test_NN_initiator_put_failure_returns_error() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    let responder_public_key = pair.responder_public_key.clone();
+
+    // ── Phase 1: Simulate put() failure on initiator ──
+
+    pair.initiator.test_enable_write_failure();
+
+    let result = pair.initiator.handle_handshake().await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), PubkyDataError::HomeserverWriteError);
+
+    // ── Phase 2: Verify last_good_snapshot captured pre-mutation state ──
+
+    let pre_failure_snapshot = pair.initiator.last_good_snapshot().unwrap().clone();
+    assert_eq!(pre_failure_snapshot.counter, 0);
+    assert_eq!(pre_failure_snapshot.noise_step, NoiseStep::StepOne);
+    assert_eq!(pre_failure_snapshot.sub_step_index, 0);
+    assert_eq!(pre_failure_snapshot.phase, NoisePhase::HandShake);
+
+    // ── Phase 3: Restore from snapshot (no write failure this time) ──
+
+    let snapshot_bytes = pre_failure_snapshot.serialize();
+    let snapshot_state = PubkyDataSessionState::deserialize(&snapshot_bytes).unwrap();
+
+    let mut restored_initiator = PubkyDataEncryptor::restore(
+        pair.initiator_config.clone(),
+        snapshot_state,
+        responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Verify restored state matches the pre-failure snapshot
+    let restored_snapshot = restored_initiator.snapshot();
+    assert_eq!(restored_snapshot.counter, 0);
+    assert_eq!(restored_snapshot.noise_step, NoiseStep::StepOne);
+    assert_eq!(restored_snapshot.sub_step_index, 0);
+
+    // ── Phase 4: Complete the handshake normally ──
+
+    // Restored Initiator StepOne: [Write, Pending] → writes slot 0
+    let result = restored_initiator.handle_handshake().await.unwrap();
+    assert_eq!(result, HandshakeResult::Pending);
+
+    // Responder StepOne: [Read, Write] → reads slot 0, writes slot 1
+    let _ = pair.responder.handle_handshake().await.unwrap();
+    assert!(pair.responder.is_handshake_complete());
+
+    // Restored Initiator StepTwo: [Read] → reads slot 1
+    let _ = restored_initiator.handle_handshake().await.unwrap();
+    assert!(restored_initiator.is_handshake_complete());
+
+    restored_initiator.transition_transport().unwrap();
+    pair.responder.transition_transport().unwrap();
+
+    // ── Phase 5: Verify transport works ──
+
+    send_and_verify(
+        &mut restored_initiator,
+        &mut pair.responder,
+        "NN_put_failure_recovered",
+    )
+    .await;
+    send_and_verify(
+        &mut pair.responder,
+        &mut restored_initiator,
+        "NN_put_failure_reverse",
+    )
+    .await;
+}
+
+/// XX pattern: Initiator's put() fails at slot 2 (Case a1, mid-handshake).
+///
+/// The failure occurs during the Initiator's SECOND write in the XX pattern:
+///   - Slot 0: Initiator → e (written successfully)
+///   - Slot 1: Responder → e, ee, s, es (written successfully)
+///   - Slot 2: Initiator → s, se (put() FAILS → HomeserverWriteError)
+///
+/// Steps:
+/// 1. Complete the first two handshake steps normally.
+/// 2. Enable simulated write failure before the third step.
+/// 3. Call handle_handshake — returns Err(HomeserverWriteError).
+/// 4. Restore from last_good_snapshot, complete handshake, verify transport.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn pubky_data_snow_test_XX_initiator_put_failure_returns_error() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+    let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
+    let responder_public_key = pair.responder_public_key.clone();
+
+    // ── Phase 1: Complete the first two steps of the XX handshake ──
+
+    // Initiator writes slot 0 (-> e), returns Pending
+    let result = pair.initiator.handle_handshake().await.unwrap();
+    assert_eq!(result, HandshakeResult::Pending);
+
+    // Responder reads slot 0, writes slot 1 (<- e, ee, s, es), returns Pending
+    let result = pair.responder.handle_handshake().await.unwrap();
+    assert_eq!(result, HandshakeResult::Pending);
+
+    // ── Phase 2: Simulate put() failure on initiator's second write ──
+
+    pair.initiator.test_enable_write_failure();
+
+    // Initiator StepTwo: [Read, Write] → reads slot 1 OK, but Write fails
+    let result = pair.initiator.handle_handshake().await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), PubkyDataError::HomeserverWriteError);
+
+    // ── Phase 3: Verify last_good_snapshot captured pre-StepTwo state ──
+
+    let pre_failure_snapshot = pair.initiator.last_good_snapshot().unwrap().clone();
+    assert_eq!(pre_failure_snapshot.counter, 1);
+    assert_eq!(pre_failure_snapshot.noise_step, NoiseStep::StepTwo);
+    assert_eq!(pre_failure_snapshot.sub_step_index, 0);
+
+    // ── Phase 4: Restore from snapshot ──
+
+    let snapshot_bytes = pre_failure_snapshot.serialize();
+    let snapshot_state = PubkyDataSessionState::deserialize(&snapshot_bytes).unwrap();
+
+    let mut restored_initiator = PubkyDataEncryptor::restore(
+        pair.initiator_config.clone(),
+        snapshot_state,
+        responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Verify restored state
+    let restored_snapshot = restored_initiator.snapshot();
+    assert_eq!(restored_snapshot.counter, pre_failure_snapshot.counter);
+    assert_eq!(restored_snapshot.noise_step, pre_failure_snapshot.noise_step);
+    assert_eq!(
+        restored_snapshot.sub_step_index,
+        pre_failure_snapshot.sub_step_index
+    );
+
+    // ── Phase 5: Complete the handshake from restored state ──
+
+    // Restored Initiator StepTwo: [Read, Write] → reads slot 1, writes slot 2
+    let _ = restored_initiator.handle_handshake().await.unwrap();
+    assert!(restored_initiator.is_handshake_complete());
+
+    // Responder StepTwo: [Read] → reads slot 2
+    let _ = pair.responder.handle_handshake().await.unwrap();
+    assert!(pair.responder.is_handshake_complete());
+
+    restored_initiator.transition_transport().unwrap();
+    pair.responder.transition_transport().unwrap();
+
+    // ── Phase 6: Verify transport works ──
+
+    send_and_verify(
+        &mut restored_initiator,
+        &mut pair.responder,
+        "XX_put_failure_recovered",
+    )
+    .await;
+    send_and_verify(
+        &mut pair.responder,
+        &mut restored_initiator,
+        "XX_put_failure_reverse",
+    )
+    .await;
 }

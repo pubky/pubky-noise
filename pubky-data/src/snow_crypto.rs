@@ -609,7 +609,10 @@ impl DataLinkContext {
                     .unwrap()
                     .write_message(nonce, payload, message.as_mut())
                     .map_err(|_| ContextError::InternalSnowWriteErr)?;
-                self.sending_nonce += 1;
+                // NOTE: sending_nonce is NOT incremented here. The caller
+                // must call increment_sending_nonce() after confirming the
+                // write reached the homeserver. This prevents nonce desync
+                // when put() fails after a successful encryption.
                 Ok(size)
             }
         }
@@ -702,6 +705,15 @@ impl DataLinkContext {
     /// Set the sub-step index (used during restore).
     pub fn set_sub_step_index(&mut self, index: usize) {
         self.sub_step_index = index;
+    }
+
+    /// Advance the sending nonce by 1.
+    ///
+    /// Call this **after** confirming the encrypted message was successfully
+    /// written to the homeserver. This ensures the nonce stays in sync with
+    /// what the receiver expects, even if a write fails.
+    pub fn increment_sending_nonce(&mut self) {
+        self.sending_nonce += 1;
     }
 
     /// Set the sending nonce (used during restore after transport transition).
