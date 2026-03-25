@@ -176,7 +176,8 @@ pub enum HandshakePattern {
     //   <-                        2                5
     // IX
     //
-    // test-only pattern to inject build fault
+    /// Test-only pattern to inject build fault.
+    #[cfg(feature = "test-utils")]
     TestOnlyPatternAA,
 }
 
@@ -207,6 +208,7 @@ impl HandshakePattern {
             HandshakePattern::PatternXX => "XX",
             HandshakePattern::PatternIK => "IK",
             HandshakePattern::PatternNK => "NK",
+            #[cfg(feature = "test-utils")]
             HandshakePattern::TestOnlyPatternAA => "AA",
         }
     }
@@ -218,6 +220,7 @@ impl HandshakePattern {
             HandshakePattern::PatternXX => true,
             HandshakePattern::PatternIK => true,
             HandshakePattern::PatternNK => true,
+            #[cfg(feature = "test-utils")]
             HandshakePattern::TestOnlyPatternAA => false,
         }
     }
@@ -230,6 +233,7 @@ impl HandshakePattern {
             HandshakePattern::PatternXX => 2,
             HandshakePattern::PatternIK => 3,
             HandshakePattern::PatternNK => 4,
+            #[cfg(feature = "test-utils")]
             HandshakePattern::TestOnlyPatternAA => 255,
         }
     }
@@ -242,6 +246,7 @@ impl HandshakePattern {
             2 => Some(HandshakePattern::PatternXX),
             3 => Some(HandshakePattern::PatternIK),
             4 => Some(HandshakePattern::PatternNK),
+            #[cfg(feature = "test-utils")]
             255 => Some(HandshakePattern::TestOnlyPatternAA),
             _ => None,
         }
@@ -301,6 +306,7 @@ fn resolve_pattern(
         HandshakePattern::PatternN | HandshakePattern::PatternIK | HandshakePattern::PatternNK => {
             unimplemented!("handshake pattern {:?} is not yet implemented", pattern)
         }
+        #[cfg(feature = "test-utils")]
         HandshakePattern::TestOnlyPatternAA => {
             panic!("TestOnlyPatternAA cannot be resolved to handshake actions")
         }

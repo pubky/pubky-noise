@@ -198,9 +198,12 @@ pub struct PubkyDataEncryptor {
     /// state-mutating work. See [`last_good_snapshot()`](Self::last_good_snapshot).
     last_good_snapshot: Option<PubkyDataSessionState>,
 
-    // test-only fields
+    // test-only fields — stripped from production builds
+    #[cfg(feature = "test-utils")]
     simulate_tampering: bool,
+    #[cfg(feature = "test-utils")]
     simulate_write_failure: bool,
+    #[cfg(feature = "test-utils")]
     last_ciphertext: Option<[u8; PUBKY_DATA_MSG_LEN + 2]>,
 }
 
@@ -235,8 +238,11 @@ impl PubkyDataEncryptor {
             link_id: None,
             endpoint_pubkey,
             last_good_snapshot: None,
+            #[cfg(feature = "test-utils")]
             simulate_tampering: false,
+            #[cfg(feature = "test-utils")]
             simulate_write_failure: false,
+            #[cfg(feature = "test-utils")]
             last_ciphertext: None,
         })
     }
@@ -335,6 +341,7 @@ impl PubkyDataEncryptor {
                         let packet = encode_packet(&message, len);
                         // Check for simulated write failure (test-only) or
                         // actual homeserver write failure.
+                        #[cfg(feature = "test-utils")]
                         let write_failed = if self.simulate_write_failure {
                             true
                         } else {
@@ -345,6 +352,14 @@ impl PubkyDataEncryptor {
                                 .await
                                 .is_err()
                         };
+                        #[cfg(not(feature = "test-utils"))]
+                        let write_failed = self
+                            .config
+                            .local_session
+                            .storage()
+                            .put(formatted_path, packet.to_vec())
+                            .await
+                            .is_err();
                         if write_failed {
                             // Snow's HandshakeState has already advanced
                             // irreversibly. The caller must recover via
@@ -404,6 +419,7 @@ impl PubkyDataEncryptor {
 
         let packet = encode_packet(&out, len);
 
+        #[cfg(feature = "test-utils")]
         if self.simulate_tampering {
             self.last_ciphertext = Some(packet);
         }
@@ -456,6 +472,7 @@ impl PubkyDataEncryptor {
                     if let Ok((mut message, len)) = decode_packet(&ciphertext) {
                         let mut payload = [0; PUBKY_DATA_MSG_LEN];
 
+                        #[cfg(feature = "test-utils")]
                         if self.simulate_tampering {
                             message[1] = 0xff;
                         }
@@ -690,8 +707,11 @@ impl PubkyDataEncryptor {
             link_id,
             endpoint_pubkey,
             last_good_snapshot: None,
+            #[cfg(feature = "test-utils")]
             simulate_tampering: false,
+            #[cfg(feature = "test-utils")]
             simulate_write_failure: false,
+            #[cfg(feature = "test-utils")]
             last_ciphertext: None,
         })
     }
@@ -720,6 +740,7 @@ impl PubkyDataEncryptor {
     }
 
     /// Test-only: enable ciphertext tampering simulation.
+    #[cfg(feature = "test-utils")]
     pub fn test_enable_tampering(&mut self) {
         self.simulate_tampering = true;
     }
@@ -728,11 +749,13 @@ impl PubkyDataEncryptor {
     ///
     /// When enabled, `handle_handshake` will skip the `put()` call and
     /// return `Err(PubkyDataError::HomeserverWriteError)` on Write actions.
+    #[cfg(feature = "test-utils")]
     pub fn test_enable_write_failure(&mut self) {
         self.simulate_write_failure = true;
     }
 
     /// Test-only: get the last ciphertext produced by send_message.
+    #[cfg(feature = "test-utils")]
     pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_DATA_MSG_LEN + 2]> {
         self.last_ciphertext
     }

@@ -8,6 +8,9 @@ repository = ""
 keywords = ["pubky", "noise"]
 categories = ["authentication", "encryption"]
 
+[features]
+test-utils = []
+
 [dependencies]
 pubky = "0.7.0"
 ed25519-dalek = { version = "=3.0.0-pre.5" }
