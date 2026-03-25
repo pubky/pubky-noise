@@ -279,7 +279,8 @@ impl PubkyDataEncryptor {
     ///   a pre-mutation snapshot accessible via
     ///   [`last_good_snapshot()`](Self::last_good_snapshot). Callers should
     ///   persist this snapshot (e.g. via [`persist_snapshot()`](Self::persist_snapshot))
-    ///   so that on restart they can pass it to [`restore()`](Self::restore).
+    ///   so that on restart they can pass it to if there has been a failure
+    ///   [`restore()`](Self::restore).
     ///   The replay mechanism will rebuild the Noise state from what is
     ///   actually on the homeservers, correcting the state and allowing the
     ///   handshake to resume from the right position.
