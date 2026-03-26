@@ -1,38 +1,401 @@
 # Pubky Data
 
-A ready-to-use pubky-sdk integrated A&E communication library, wrapping in a clean interface the Noise snow library.
+A fully-integrated [Noise protocol](https://noiseprotocol.org/) framework for encrypted peer-to-peer messaging over [Pubky](https://pubky.org) homeservers.
 
-Peers homeservers are used as outbox from where to read exchanges messages among the 2 peers clients.
+Peers use their homeservers as outboxes: each party writes encrypted Noise messages to their own homeserver, and reads from the remote peer's homeserver. The library wraps the [Snow](https://github.com/mcginty/snow) Noise implementation in a clean async interface with built-in session backup and restore.
 
 ## Install
 
 ```toml
 # Cargo.toml
 [dependencies]
-pkarr = { path = "../../pkarr/pkarr", features = ["full"] }
-pubky = { path = "../../pubky-core/pubky-sdk", version = "0.6.0-rc.6" }
-pubky-common = { path = "../../pubky-core/pubky-common", version = "0.6.0-rc.6" }
-ed25519-dalek = { version = "2.1.1" }
-sha256 = { version = "1.6.0" }
-rust-crypto = { version = "0.2.36" }
-x25519-dalek = { version = "2.0.0-rc.3", features = ["static_secrets"] }
-chacha20poly1305 = { version = "0.10.1" }
-curve25519-dalek = { version = "4.1.3" }
-snow = { version = "0.10.0", features = ["use-sha2"] }
-rand = "0.9.0"
+pubky-data = "0.0.1"
 ```
 
-## Quick start
+### Actual dependencies (for reference)
 
-```rust no_run
+| Crate | Version | Purpose |
+|---|---|---|
+| `pubky` | 0.7.0 | Pubky SDK (homeserver client, sessions, keys) |
+| `snow` | 0.10.0 | Noise protocol implementation |
+| `ed25519-dalek` | 3.0.0-pre.5 | Ed25519 signatures and key conversions |
+| `curve25519-dalek` | 5.0.0-pre.5 | X25519 Diffie-Hellman for path derivation |
+| `sha2` | 0.11.0-rc.4 | SHA-256 hashing (path derivation, Noise suite) |
+| `getrandom` | 0.3 | Cryptographic RNG |
+| `hex` | 0.4 | Hex encoding for derived paths |
+| `rand` | 0.9.0 | Random key generation |
+
+## Quick Start
+
+```rust,no_run
+use std::sync::Arc;
+use pubky::prelude::*;
+use pubky_data::{PubkyDataConfig, PubkyDataEncryptor, HandshakeResult};
+
+// 1. Create shared configuration
+//    (requires an authenticated PubkySession and a Pubky HTTP client)
+let config = PubkyDataConfig::new(
+    root_secret_key,          // [u8; 32] - root Ed25519 secret key
+    0,                        // protocol version
+    "XX",                     // Noise handshake pattern
+    homeserver_session,       // authenticated PubkySession
+    "/pub/data".to_string(),  // storage path prefix
+    pubky_client,             // Pubky HTTP client
+).unwrap();
+
+// 2. Create encryptors for each side
+let mut initiator = PubkyDataEncryptor::new(
+    config.clone(),
+    ephemeral_secret_key,     // [u8; 32] - per-session key
+    true,                     // initiator = true
+    responder_public_key,     // remote peer's PublicKey
+).unwrap();
+
+// 3. Run the handshake (polling-safe, call repeatedly)
+loop {
+    match initiator.handle_handshake().await.unwrap() {
+        HandshakeResult::Pending => { /* poll again later */ },
+        HandshakeResult::Terminal => break,
+    }
+}
+
+// 4. Transition to transport phase
+let link_id = initiator.transition_transport().unwrap();
+
+// 5. Send and receive encrypted messages
+initiator.send_message(b"Hello, peer!").await;
+let messages = initiator.receive_message().await;
+
+// 6. Clean up
+initiator.close();
 ```
 
-## Mental model
+## Architecture
 
-- `PubkyDataEncryptor` - facade, start by this one! Owns and manage Noise communication link state
-- `LinkId` - 
-- `ConversationId` - 
-- `PairContextId`
+### Outbox Model
+
+Each peer writes to their **own** homeserver and reads from the **remote** peer's homeserver:
+
+```text
+Alice's Homeserver          Bob's Homeserver
+  /pub/data/0  <-- Alice writes    /pub/data/1  <-- Bob writes
+  /pub/data/2  <-- Alice writes    Bob reads from Alice's homeserver
+  Alice reads from Bob's homeserver
+```
+
+Messages are stored at incrementing slot indices (`/path/{counter}`). The counter advances after each successful read or write.
+
+### Wire Format
+
+Messages use a length-prefixed packet format:
+
+```text
+[len_hi, len_lo, payload...]
+```
+
+- `len`: big-endian u16 indicating payload length
+- `payload`: up to 1000 bytes (`PUBKY_DATA_MSG_LEN`)
+- Total packet size: 1002 bytes
+
+### Crypto Primitives
+
+The Noise protocol name is:
+
+```text
+Noise_{pattern}_25519_ChaChaPoly_SHA256
+```
+
+| Primitive | Algorithm | Purpose |
+|---|---|---|
+| Key exchange | X25519 | Diffie-Hellman |
+| Stream cipher | ChaCha20-Poly1305 | Authenticated encryption |
+| Hash | SHA-256 | Handshake transcript hashing |
+| Transport mode | Stateless | Explicit nonce per message |
+
+## Mental Model
+
+### Core Types
+
+- **`PubkyDataConfig`** -- Shared configuration and resources for multiple sessions. Holds the HTTP client, authenticated homeserver session, read/write paths, root keypair, and default Noise pattern. Wrap in `Arc` and share across encryptors.
+
+- **`PubkyDataEncryptor`** -- A single-session Noise encryptor. Each instance manages exactly one Noise session (handshake + transport) with a single remote peer. Create multiple instances sharing the same `Arc<PubkyDataConfig>` for concurrent sessions.
+
+- **`LinkId`** -- A 32-byte identifier derived from the Noise handshake transcript hash. Changes after every handshake when ephemeral keys are used. Available after calling `transition_transport()`.
+
+- **`PubkyDataSessionState`** -- Serializable snapshot of a session (189 bytes). Contains everything needed to restore a session by replaying persisted handshake messages through a fresh Noise state.
+
+- **`DataLinkContext`** -- Internal Noise state machine managing the handshake and transport phases. Not used directly by consumers.
+
+### Lifecycle
+
+```text
+new() --> handle_handshake() [loop] --> transition_transport() --> send/receive --> close()
+        |                                     |
+    last_good_snapshot                     snapshot() --> persist_snapshot()
+        |                                     |
+    restore() [on crash recovery]     restore() [on crash recovery]
+```
+
+## Noise Handshake Patterns
+
+| Pattern | Status | Auth | Description |
+|---|---|---|---|
+| `NN` | Implemented | None | No authentication, anonymous ephemeral keys |
+| `XX` | Implemented | Mutual | Mutual authentication, both sides reveal static keys |
+| `N` | Declared | One-way | Sender authenticates to known recipient |
+| `IK` | Declared | Mutual | Initiator knows responder's static key upfront |
+| `NK` | Declared | One-way | Initiator authenticates to known responder |
+
+Patterns marked "Declared" are defined in the enum but will panic if used (not yet implemented).
+
+### Handshake Flow (XX Pattern)
+
+```text
+Initiator                          Responder
+    |                                  |
+    |-- Step 1: -> e ----------------->|
+    |                                  |
+    |<-- Step 2: <- e, ee, s, es ------|
+    |                                  |
+    |-- Step 3: -> s, se ------------>|
+    |                                  |
+    [transition_transport()]    [transition_transport()]
+    |                                  |
+    |<======= encrypted transport ====>|
+```
+
+### Polling-Safe Handshake
+
+`handle_handshake()` is designed for polling: it can be called repeatedly by either side in any order. If the peer's message is not yet available, it returns `HandshakeResult::Pending` without advancing state. This makes it safe for use in event loops and async contexts.
+
+## Asymmetric Path Derivation
+
+For per-peer-pair path privacy, use `derive_asymmetric_paths()` to compute distinct write/read paths from a DH shared secret:
+
+```rust,ignore
+use pubky_data::path_derivation::derive_asymmetric_paths;
+
+let (write_path, read_path) = derive_asymmetric_paths(
+    &my_secret_key,
+    &their_pubkey,
+    b"paykit-path-v0",                // domain separation
+    "/pub/paykit.app/v0/private",     // base path
+);
+// write_path = "/pub/paykit.app/v0/private/a1b2c3d4...64 hex chars"
+// read_path  = "/pub/paykit.app/v0/private/e5f6a7b8...64 hex chars"
+```
+
+**Correctness guarantee**: For parties Alice and Bob:
+- `derive(alice_sk, bob_pk, ...).write_path == derive(bob_sk, alice_pk, ...).read_path`
+- `derive(alice_sk, bob_pk, ...).read_path == derive(bob_sk, alice_pk, ...).write_path`
+
+This holds because `X25519(a, B) == X25519(b, A)` (DH commutativity).
+
+**Derivation formula**:
+```text
+dh_secret   = X25519(to_scalar_bytes(ed25519_seed), to_montgomery(remote_ed25519_pk))
+write_path  = "{base_path}/{hex(SHA-256(domain || dh_secret || local_ed25519_pk))}"
+read_path   = "{base_path}/{hex(SHA-256(domain || dh_secret || remote_ed25519_pk))}"
+```
+
+Use `PubkyDataConfig::new_with_paths()` to supply separate write/read paths.
+
+## Session Backup & Restore
+
+Sessions can be snapshotted, serialized, and restored to recover from crashes or write failures.
+
+### Snapshot Format
+
+`PubkyDataSessionState` serializes to a compact 189-byte binary format:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | version |
+| 1 | 1 | phase (0=Handshake, 1=Transport) |
+| 2 | 1 | pattern |
+| 3 | 1 | initiator flag |
+| 4-35 | 32 | ephemeral secret key |
+| 36 | 1 | has static secret flag |
+| 37-68 | 32 | static secret key |
+| 69-72 | 4 | counter (u32 big-endian) |
+| 73 | 1 | noise step |
+| 74 | 1 | sub-step index |
+| 75 | 1 | has handshake hash flag |
+| 76-107 | 32 | handshake hash |
+| 108 | 1 | has link ID flag |
+| 109-140 | 32 | link ID |
+| 141-148 | 8 | sending nonce (u64 big-endian) |
+| 149-156 | 8 | receiving nonce (u64 big-endian) |
+| 157-188 | 32 | endpoint public key |
+
+### Recovery Flow
+
+```rust,ignore
+// Take a snapshot (automatic during handle_handshake, or manual)
+let snapshot = encryptor.snapshot();
+let bytes = snapshot.serialize();
+// ... persist bytes to storage ...
+
+// On crash/failure, deserialize and restore
+let state = PubkyDataSessionState::deserialize(&bytes).unwrap();
+let mut restored = PubkyDataEncryptor::restore(config, state, endpoint_pubkey).await.unwrap();
+// Continue from where you left off
+```
+
+### Write Failure Recovery
+
+During handshake, if a homeserver write fails:
+
+1. `handle_handshake()` returns `Err(HomeserverWriteError)`.
+2. Snow's internal state has already advanced irreversibly.
+3. Retrieve the pre-mutation snapshot via `last_good_snapshot()`.
+4. Persist it and pass to `restore()` to rebuild the session from the correct position.
+
+The restore mechanism replays all handshake messages from the homeservers through a fresh Noise state built with the same ephemeral key material.
+
+### Handshake Recovery with `last_good_snapshot`
+
+Every call to `handle_handshake()` automatically captures a pre-mutation snapshot before doing any work. If the call fails (or if a written message is subsequently lost), this snapshot is the recovery point.
+
+#### Why recovery is needed
+
+Snow's `HandshakeState` is a one-way ratchet: once `write_message()` is called, the internal state advances irreversibly. If the homeserver `put()` then fails, the encryptor's Noise state no longer matches what is actually stored on the homeservers. The encryptor cannot simply retry -- it must be rebuilt from scratch.
+
+#### Recovery sequence diagram
+
+```text
+                    Initiator                    Homeserver                  Responder
+                        |                            |                          |
+  [snapshot captured]   |                            |                          |
+                        |--- handle_handshake() ---->|                          |
+                        |   Snow advances state      |                          |
+                        |   put() FAILS              |                          |
+                        |<-- Err(HomeserverWrite) ---|                          |
+                        |                            |                          |
+  [encryptor is now     |                            |                          |
+   corrupted -- Snow    |                            |                          |
+   advanced but message |                            |                          |
+   never reached the    |                            |                          |
+   homeserver]          |                            |                          |
+                        |                            |                          |
+  [get last_good_       |                            |                          |
+   snapshot, serialize, |                            |                          |
+   persist to storage]  |                            |                          |
+                        |                            |                          |
+  [discard corrupted    |                            |                          |
+   encryptor]           |                            |                          |
+                        |                            |                          |
+  [restore() from       |                            |                          |
+   persisted snapshot:  |                            |                          |
+   - builds fresh Snow  |                            |                          |
+     with same          |                            |                          |
+     ephemeral key      |                            |                          |
+   - replays all        |<------ reads existing ---->|                          |
+     handshake messages |       messages from        |                          |
+     from homeservers   |       homeservers          |                          |
+   - state now matches  |                            |                          |
+     what is on disk]   |                            |                          |
+                        |                            |                          |
+  [restored encryptor]  |--- handle_handshake() ---->| (write succeeds)         |
+                        |                            |--- message available --->|
+                        |                            |                          |
+                        |          ... handshake continues normally ...         |
+```
+
+#### Code example
+
+```rust,ignore
+use pubky_data::{PubkyDataEncryptor, PubkyDataConfig, PubkyDataError, HandshakeResult};
+use pubky_data::serializer::PubkyDataSessionState;
+
+// Persist the last good snapshot after every handshake call.
+// This is the safety net for crash recovery.
+async fn handshake_with_recovery(
+    encryptor: &mut PubkyDataEncryptor,
+    config: Arc<PubkyDataConfig>,
+    endpoint_pubkey: PublicKey,
+) -> Result<HandshakeResult, PubkyDataError> {
+    match encryptor.handle_handshake().await {
+        Ok(result) => {
+            // Success -- persist the pre-mutation snapshot for future recovery.
+            // (Each call overwrites the previous snapshot, so persist after every call.)
+            if let Some(snapshot) = encryptor.last_good_snapshot() {
+                let bytes = snapshot.serialize();
+                save_to_disk(&bytes); // your persistence logic
+            }
+            Ok(result)
+        }
+        Err(PubkyDataError::HomeserverWriteError) => {
+            // The encryptor is now corrupted. Recover from the snapshot
+            // that was captured at the START of this failed call.
+            let snapshot = encryptor
+                .last_good_snapshot()
+                .expect("always Some after handle_handshake")
+                .clone();
+
+            let bytes = snapshot.serialize();
+            let state = PubkyDataSessionState::deserialize(&bytes).unwrap();
+
+            // Restore rebuilds the Noise state by replaying handshake
+            // messages that are actually on the homeservers.
+            *encryptor = PubkyDataEncryptor::restore(
+                config,
+                state,
+                endpoint_pubkey,
+            )
+            .await?;
+
+            // The restored encryptor is back to the pre-failure position.
+            // The caller can retry handle_handshake() on the next poll.
+            Ok(HandshakeResult::Pending)
+        }
+        Err(e) => Err(e),
+    }
+}
+```
+
+#### Lost-message recovery (Case a2)
+
+If `put()` succeeds but the data is subsequently lost (e.g., homeserver crash after acknowledgment), `handle_handshake()` returns `Ok(Pending)` -- the loss is undetectable at the protocol level. The handshake gets stuck: the responder keeps polling but finds nothing to read, and the initiator waits for a reply that will never come.
+
+Recovery follows the same path: load the last persisted snapshot (from before the lost write), call `restore()`, and re-run the handshake. Because `restore()` replays only the messages that are actually present on the homeservers, it rebuilds the correct state and the re-issued write fills the missing slot.
+
+#### Key invariants
+
+- `last_good_snapshot()` returns `None` before the first `handle_handshake()` call.
+- Each `handle_handshake()` call overwrites the previous snapshot with the state from the start of *that* call.
+- The snapshot contains the ephemeral secret key, which is the critical piece that allows `restore()` to re-derive the same transport keys via replay.
+- `restore()` verifies the handshake hash matches the saved one (for transport-phase restores), returning `RestoreHashMismatch` on mismatch.
+
+## Error Handling
+
+| Error | Cause | Recovery |
+|---|---|---|
+| `UnknownNoisePattern` | Invalid pattern string | Use a supported pattern: "NN", "XX" |
+| `SnowNoiseBuildError` | Noise stack failed to initialize | Check key material and pattern compatibility |
+| `BadLengthCiphertext` | Received message exceeds max size | Discard message, check sender |
+| `HomeserverResponseError` | Failed to parse homeserver response | Retry |
+| `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
+| `IsHandshake` | Called `transition_transport()` too early | Wait for `is_handshake_complete()` |
+| `RestoreReplayError` | Handshake replay failed during restore | Check that homeserver messages are intact |
+| `RestoreHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
+| `RestoreDeserializeError` | Snapshot deserialization failed | Check data integrity |
+
+## Features
+
+| Feature | Description |
+|---|---|
+| `test-utils` | Enables test-only APIs: ciphertext tampering simulation (`test_enable_tampering`), homeserver write failure simulation (`test_enable_write_failure`), and last ciphertext inspection (`test_last_ciphertext`). |
 
 ## Examples
 
+See the [e2e tests](../e2e/src/tests/pubky_data.rs) for complete working examples including:
+
+- NN and XX pattern handshakes
+- Bidirectional message exchange
+- Ciphertext tampering detection
+- Out-of-order polling
+- Incomplete handshake handling
+- Session backup and restore (transport and handshake phases)
+- Write failure recovery (both immediate error and lost-message scenarios)
+- Dual homeserver setups
