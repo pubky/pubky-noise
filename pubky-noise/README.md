@@ -1,4 +1,4 @@
-# Pubky Data
+# Pubky Noise
 
 A fully-integrated [Noise protocol](https://noiseprotocol.org/) framework for encrypted peer-to-peer messaging over [Pubky](https://pubky.org) homeservers.
 
@@ -9,7 +9,7 @@ Peers use their homeservers as outboxes: each party writes encrypted Noise messa
 ```toml
 # Cargo.toml
 [dependencies]
-pubky-data = "0.0.1"
+pubky-noise = "0.0.1"
 ```
 
 ### Actual dependencies (for reference)
@@ -30,11 +30,11 @@ pubky-data = "0.0.1"
 ```rust,no_run
 use std::sync::Arc;
 use pubky::prelude::*;
-use pubky_data::{PubkyDataConfig, PubkyDataEncryptor, HandshakeResult};
+use pubky_noise::{PubkyNoiseConfig, PubkyNoiseEncryptor, HandshakeResult};
 
 // 1. Create shared configuration
 //    (requires an authenticated PubkySession and a Pubky HTTP client)
-let config = PubkyDataConfig::new(
+let config = PubkyNoiseConfig::new(
     root_secret_key,          // [u8; 32] - root Ed25519 secret key
     0,                        // protocol version
     "XX",                     // Noise handshake pattern
@@ -44,7 +44,7 @@ let config = PubkyDataConfig::new(
 ).unwrap();
 
 // 2. Create encryptors for each side
-let mut initiator = PubkyDataEncryptor::new(
+let mut initiator = PubkyNoiseEncryptor::new(
     config.clone(),
     ephemeral_secret_key,     // [u8; 32] - per-session key
     true,                     // initiator = true
@@ -94,7 +94,7 @@ Messages use a length-prefixed packet format:
 ```
 
 - `len`: big-endian u16 indicating payload length
-- `payload`: up to 1000 bytes (`PUBKY_DATA_MSG_LEN`)
+- `payload`: up to 1000 bytes (`PUBKY_NOISE_MSG_LEN`)
 - Total packet size: 1002 bytes
 
 ### Crypto Primitives
@@ -116,13 +116,13 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 
 ### Core Types
 
-- **`PubkyDataConfig`** -- Shared configuration and resources for multiple sessions. Holds the HTTP client, authenticated homeserver session, read/write paths, root keypair, and default Noise pattern. Wrap in `Arc` and share across encryptors.
+- **`PubkyNoiseConfig`** -- Shared configuration and resources for multiple sessions. Holds the HTTP client, authenticated homeserver session, read/write paths, root keypair, and default Noise pattern. Wrap in `Arc` and share across encryptors.
 
-- **`PubkyDataEncryptor`** -- A single-session Noise encryptor. Each instance manages exactly one Noise session (handshake + transport) with a single remote peer. Create multiple instances sharing the same `Arc<PubkyDataConfig>` for concurrent sessions.
+- **`PubkyNoiseEncryptor`** -- A single-session Noise encryptor. Each instance manages exactly one Noise session (handshake + transport) with a single remote peer. Create multiple instances sharing the same `Arc<PubkyNoiseConfig>` for concurrent sessions.
 
 - **`LinkId`** -- A 32-byte identifier derived from the Noise handshake transcript hash. Changes after every handshake when ephemeral keys are used. Available after calling `transition_transport()`.
 
-- **`PubkyDataSessionState`** -- Serializable snapshot of a session (189 bytes). Contains everything needed to restore a session by replaying persisted handshake messages through a fresh Noise state.
+- **`PubkyNoiseSessionState`** -- Serializable snapshot of a session (189 bytes). Contains everything needed to restore a session by replaying persisted handshake messages through a fresh Noise state.
 
 - **`DataLinkContext`** -- Internal Noise state machine managing the handshake and transport phases. Not used directly by consumers.
 
@@ -173,7 +173,7 @@ Initiator                          Responder
 For per-peer-pair path privacy, use `derive_asymmetric_paths()` to compute distinct write/read paths from a DH shared secret:
 
 ```rust,ignore
-use pubky_data::path_derivation::derive_asymmetric_paths;
+use pubky_noise::path_derivation::derive_asymmetric_paths;
 
 let (write_path, read_path) = derive_asymmetric_paths(
     &my_secret_key,
@@ -198,7 +198,7 @@ write_path  = "{base_path}/{hex(SHA-256(domain || dh_secret || local_ed25519_pk)
 read_path   = "{base_path}/{hex(SHA-256(domain || dh_secret || remote_ed25519_pk))}"
 ```
 
-Use `PubkyDataConfig::new_with_paths()` to supply separate write/read paths.
+Use `PubkyNoiseConfig::new_with_paths()` to supply separate write/read paths.
 
 ## Session Backup & Restore
 
@@ -206,7 +206,7 @@ Sessions can be snapshotted, serialized, and restored to recover from crashes or
 
 ### Snapshot Format
 
-`PubkyDataSessionState` serializes to a compact 189-byte binary format:
+`PubkyNoiseSessionState` serializes to a compact 189-byte binary format:
 
 | Offset | Size | Field |
 |---|---|---|
@@ -237,8 +237,8 @@ let bytes = snapshot.serialize();
 // ... persist bytes to storage ...
 
 // On crash/failure, deserialize and restore
-let state = PubkyDataSessionState::deserialize(&bytes).unwrap();
-let mut restored = PubkyDataEncryptor::restore(config, state, endpoint_pubkey).await.unwrap();
+let state = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
+let mut restored = PubkyNoiseEncryptor::restore(config, state, endpoint_pubkey).await.unwrap();
 // Continue from where you left off
 ```
 
@@ -305,16 +305,16 @@ Snow's `HandshakeState` is a one-way ratchet: once `write_message()` is called, 
 #### Code example
 
 ```rust,ignore
-use pubky_data::{PubkyDataEncryptor, PubkyDataConfig, PubkyDataError, HandshakeResult};
-use pubky_data::serializer::PubkyDataSessionState;
+use pubky_noise::{PubkyNoiseEncryptor, PubkyNoiseConfig, PubkyNoiseError, HandshakeResult};
+use pubky_noise::serializer::PubkyNoiseSessionState;
 
 // Persist the last good snapshot after every handshake call.
 // This is the safety net for crash recovery.
 async fn handshake_with_recovery(
-    encryptor: &mut PubkyDataEncryptor,
-    config: Arc<PubkyDataConfig>,
+    encryptor: &mut PubkyNoiseEncryptor,
+    config: Arc<PubkyNoiseConfig>,
     endpoint_pubkey: PublicKey,
-) -> Result<HandshakeResult, PubkyDataError> {
+) -> Result<HandshakeResult, PubkyNoiseError> {
     match encryptor.handle_handshake().await {
         Ok(result) => {
             // Success -- persist the pre-mutation snapshot for future recovery.
@@ -325,7 +325,7 @@ async fn handshake_with_recovery(
             }
             Ok(result)
         }
-        Err(PubkyDataError::HomeserverWriteError) => {
+        Err(PubkyNoiseError::HomeserverWriteError) => {
             // The encryptor is now corrupted. Recover from the snapshot
             // that was captured at the START of this failed call.
             let snapshot = encryptor
@@ -334,11 +334,11 @@ async fn handshake_with_recovery(
                 .clone();
 
             let bytes = snapshot.serialize();
-            let state = PubkyDataSessionState::deserialize(&bytes).unwrap();
+            let state = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
 
             // Restore rebuilds the Noise state by replaying handshake
             // messages that are actually on the homeservers.
-            *encryptor = PubkyDataEncryptor::restore(
+            *encryptor = PubkyNoiseEncryptor::restore(
                 config,
                 state,
                 endpoint_pubkey,
@@ -389,7 +389,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 
 ## Examples
 
-See the [e2e tests](../e2e/src/tests/pubky_data.rs) for complete working examples including:
+See the [e2e tests](../e2e/src/tests/pubky_noise.rs) for complete working examples including:
 
 - NN and XX pattern handshakes
 - Bidirectional message exchange

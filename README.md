@@ -1,4 +1,4 @@
-# pubky-data-lib
+# pubky-noise
 
 A Rust workspace for encrypted peer-to-peer communication over [Pubky](https://pubky.org) homeservers using the [Noise protocol](https://noiseprotocol.org/).
 
@@ -18,7 +18,7 @@ Key capabilities:
 
 | Crate | Path | Description |
 |---|---|---|
-| [`pubky-data`](./pubky-data/) | `pubky-data/` | Core library: Noise handshake, encrypted transport, session management, path derivation |
+| [`pubky-noise`](./pubky-noise/) | `pubky-noise/` | Core library: Noise handshake, encrypted transport, session management, path derivation |
 | [`e2e`](./e2e/) | `e2e/` | End-to-end integration tests against real Pubky testnets |
 
 ## Building
@@ -32,7 +32,7 @@ cargo build
 ### Unit tests (path derivation, serialization)
 
 ```sh
-cargo nextest -p pubky-data
+cargo nextest -p pubky-noise
 ```
 
 ### End-to-end tests (requires embedded Postgres)

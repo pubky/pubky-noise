@@ -6,7 +6,7 @@ use snow::{HandshakeState, StatelessTransportState};
 
 use crate::snow_crypto_resolver::ReplayResolver;
 
-pub const PUBKY_DATA_MSG_LEN: usize = 1000;
+pub const PUBKY_NOISE_MSG_LEN: usize = 1000;
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum NoisePhase {
@@ -598,7 +598,7 @@ impl DataLinkContext {
     pub fn write_act(
         &mut self,
         payload: &[u8],
-        message: &mut [u8; PUBKY_DATA_MSG_LEN],
+        message: &mut [u8; PUBKY_NOISE_MSG_LEN],
     ) -> Result<usize, ContextError> {
         match self.noise_phase {
             NoisePhase::HandShake => self
@@ -626,8 +626,8 @@ impl DataLinkContext {
 
     pub fn read_act(
         &mut self,
-        message: &mut [u8; PUBKY_DATA_MSG_LEN],
-        payload: &mut [u8; PUBKY_DATA_MSG_LEN],
+        message: &mut [u8; PUBKY_NOISE_MSG_LEN],
+        payload: &mut [u8; PUBKY_NOISE_MSG_LEN],
         index: usize,
     ) -> Result<(), ContextError> {
         match self.noise_phase {

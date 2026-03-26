@@ -1,7 +1,7 @@
 //! Session state serialization for backup and restore.
 //!
-//! [`PubkyDataSessionState`] captures all the information needed to restore a
-//! `PubkyDataEncryptor` session, whether it was interrupted during the handshake
+//! [`PubkyNoiseSessionState`] captures all the information needed to restore a
+//! `PubkyNoiseEncryptor` session, whether it was interrupted during the handshake
 //! or is already in transport mode.
 
 use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
@@ -9,13 +9,13 @@ use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
 /// Current serialization format version.
 const SESSION_STATE_VERSION: u8 = 1;
 
-/// Serializable snapshot of a `PubkyDataEncryptor` session.
+/// Serializable snapshot of a `PubkyNoiseEncryptor` session.
 ///
 /// This struct contains everything needed to reconstruct the Noise session
 /// by replaying persisted handshake messages through a fresh `HandshakeState`
 /// built with the same ephemeral key material.
 #[derive(Debug, Clone)]
-pub struct PubkyDataSessionState {
+pub struct PubkyNoiseSessionState {
     /// Format version for forward compatibility.
     pub version: u8,
     /// Current phase: Handshake or Transport.
@@ -48,7 +48,7 @@ pub struct PubkyDataSessionState {
     pub endpoint_pubkey: [u8; 32],
 }
 
-impl PubkyDataSessionState {
+impl PubkyNoiseSessionState {
     /// Serialize to a compact binary format.
     ///
     /// Layout:
@@ -216,7 +216,7 @@ impl PubkyDataSessionState {
         let mut endpoint_pubkey = [0u8; 32];
         endpoint_pubkey.copy_from_slice(&data[157..189]);
 
-        Ok(PubkyDataSessionState {
+        Ok(PubkyNoiseSessionState {
             version,
             phase,
             pattern,
