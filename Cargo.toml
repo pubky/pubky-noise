@@ -20,3 +20,5 @@ license = "MIT"
 lto = true
 opt-level = 'z'
 
+[workspace.dependencies]
+pkarr = "=5.0.3"
