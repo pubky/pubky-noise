@@ -54,6 +54,10 @@ pub enum PubkyDataError {
     BadLengthCiphertext,
     /// the homeserver response is a failure
     HomeserverResponseError,
+    /// Handshake write failed to reach the homeserver.
+    /// The Noise state has already advanced irreversibly; recovery requires
+    /// restoring from [`PubkyDataEncryptor::last_good_snapshot()`].
+    HomeserverWriteError,
     IsHandshake,
     /// Restore failed: handshake replay error.
     RestoreReplayError,
@@ -189,8 +193,17 @@ pub struct PubkyDataEncryptor {
     link_id: Option<LinkId>,
     endpoint_pubkey: PublicKey,
 
-    // test-only fields
+    /// Snapshot captured automatically at the start of each
+    /// [`handle_handshake()`](Self::handle_handshake) call, before any
+    /// state-mutating work. See [`last_good_snapshot()`](Self::last_good_snapshot).
+    last_good_snapshot: Option<PubkyDataSessionState>,
+
+    // test-only fields — stripped from production builds
+    #[cfg(feature = "test-utils")]
     simulate_tampering: bool,
+    #[cfg(feature = "test-utils")]
+    simulate_write_failure: bool,
+    #[cfg(feature = "test-utils")]
     last_ciphertext: Option<[u8; PUBKY_DATA_MSG_LEN + 2]>,
 }
 
@@ -224,7 +237,12 @@ impl PubkyDataEncryptor {
             context: data_link_context,
             link_id: None,
             endpoint_pubkey,
+            last_good_snapshot: None,
+            #[cfg(feature = "test-utils")]
             simulate_tampering: false,
+            #[cfg(feature = "test-utils")]
+            simulate_write_failure: false,
+            #[cfg(feature = "test-utils")]
             last_ciphertext: None,
         })
     }
@@ -240,10 +258,48 @@ impl PubkyDataEncryptor {
     /// the initiator or responder in any order. If the peer's message is not
     /// yet available, returns `HandshakeResult::Pending` without advancing state.
     ///
+    /// # Outbox reliability and recovery
+    ///
+    /// In the outbox model, two kinds of interruption can occur:
+    ///
+    /// - **Read failure** (Responder fails to read from Initiator's outbox):
+    ///   The method returns `Pending` without advancing `step`, `sub_step`, or
+    ///   `counter`. Subsequent calls will retry the same read and succeed once
+    ///   the message appears. No special recovery is needed.
+    ///
+    /// - **Write failure** (Initiator fails to write to her outbox):
+    ///   If the homeserver `put()` call fails, this method returns
+    ///   [`PubkyDataError::HomeserverWriteError`]. Because Snow's internal
+    ///   `HandshakeState` has already been irreversibly advanced by
+    ///   `write_message`, the encryptor is in a corrupted state and **cannot**
+    ///   simply retry. The caller must recover by restoring from the
+    ///   pre-mutation snapshot captured at the start of this call.
+    ///
+    ///   **Recovery**: each call to `handle_handshake` automatically captures
+    ///   a pre-mutation snapshot accessible via
+    ///   [`last_good_snapshot()`](Self::last_good_snapshot). Callers should
+    ///   persist this snapshot (e.g. via [`persist_snapshot()`](Self::persist_snapshot))
+    ///   so that on restart they can pass it to if there has been a failure
+    ///   [`restore()`](Self::restore).
+    ///   The replay mechanism will rebuild the Noise state from what is
+    ///   actually on the homeservers, correcting the state and allowing the
+    ///   handshake to resume from the right position.
+    ///
+    ///   Note: if the `put()` succeeds but the data is subsequently lost
+    ///   (e.g. homeserver crash after acknowledgment), the same snapshot-based
+    ///   recovery path applies — but the failure is not detectable by this
+    ///   method.
+    ///
     /// # Errors:
     ///      - Returns [`PubkyDataError::BadLengthCiphertext`] on malformed messages.
     ///      - Returns [`PubkyDataError::HomeserverResponseError`] on response parse failure.
+    ///      - Returns [`PubkyDataError::HomeserverWriteError`] if the homeserver
+    ///        write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
+    ///        and [`restore()`](Self::restore) is required.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyDataError> {
+        // Capture pre-mutation snapshot so callers can recover from write failures.
+        self.last_good_snapshot = Some(self.snapshot());
+
         let remaining_actions = self.context.remaining_handshake_actions();
         for action in remaining_actions {
             match action {
@@ -284,12 +340,33 @@ impl PubkyDataEncryptor {
                         let counter = self.context.get_counter();
                         let formatted_path = format!("{path}/{counter}");
                         let packet = encode_packet(&message, len);
-                        let _ = self
+                        // Check for simulated write failure (test-only) or
+                        // actual homeserver write failure.
+                        #[cfg(feature = "test-utils")]
+                        let write_failed = if self.simulate_write_failure {
+                            true
+                        } else {
+                            self.config
+                                .local_session
+                                .storage()
+                                .put(formatted_path, packet.to_vec())
+                                .await
+                                .is_err()
+                        };
+                        #[cfg(not(feature = "test-utils"))]
+                        let write_failed = self
                             .config
                             .local_session
                             .storage()
                             .put(formatted_path, packet.to_vec())
-                            .await;
+                            .await
+                            .is_err();
+                        if write_failed {
+                            // Snow's HandshakeState has already advanced
+                            // irreversibly. The caller must recover via
+                            // last_good_snapshot() + restore().
+                            return Err(PubkyDataError::HomeserverWriteError);
+                        }
                         self.context.increment_counter();
                         self.context.advance_sub_step();
                     }
@@ -343,6 +420,7 @@ impl PubkyDataEncryptor {
 
         let packet = encode_packet(&out, len);
 
+        #[cfg(feature = "test-utils")]
         if self.simulate_tampering {
             self.last_ciphertext = Some(packet);
         }
@@ -360,6 +438,10 @@ impl PubkyDataEncryptor {
         {
             return false;
         }
+        // Advance the sending nonce only after the write is confirmed.
+        // write_act() no longer increments the nonce internally, so that
+        // a failed put() does not desynchronize the nonce with the receiver.
+        self.context.increment_sending_nonce();
         self.context.increment_counter();
         true
     }
@@ -391,6 +473,7 @@ impl PubkyDataEncryptor {
                     if let Ok((mut message, len)) = decode_packet(&ciphertext) {
                         let mut payload = [0; PUBKY_DATA_MSG_LEN];
 
+                        #[cfg(feature = "test-utils")]
                         if self.simulate_tampering {
                             message[1] = 0xff;
                         }
@@ -414,6 +497,12 @@ impl PubkyDataEncryptor {
     ///
     /// This snapshot contains everything needed to restore the session later
     /// by replaying persisted handshake messages.
+    ///
+    /// During the handshake phase, a pre-mutation snapshot is captured
+    /// automatically by [`handle_handshake()`](Self::handle_handshake) and
+    /// is accessible via [`last_good_snapshot()`](Self::last_good_snapshot).
+    /// This method remains useful for taking snapshots at arbitrary points
+    /// (e.g. after transitioning to transport or after exchanging messages).
     pub fn snapshot(&self) -> PubkyDataSessionState {
         let phase = self.context.get_phase();
         let handshake_hash = self.context.get_handshake_hash();
@@ -618,7 +707,12 @@ impl PubkyDataEncryptor {
             context,
             link_id,
             endpoint_pubkey,
+            last_good_snapshot: None,
+            #[cfg(feature = "test-utils")]
             simulate_tampering: false,
+            #[cfg(feature = "test-utils")]
+            simulate_write_failure: false,
+            #[cfg(feature = "test-utils")]
             last_ciphertext: None,
         })
     }
@@ -628,12 +722,41 @@ impl PubkyDataEncryptor {
         self.link_id
     }
 
+    /// Returns the snapshot captured at the start of the last
+    /// [`handle_handshake()`](Self::handle_handshake) call, before any
+    /// state-mutating work.
+    ///
+    /// The snapshot always reflects the state just before the **most recent**
+    /// `handle_handshake` call — each call overwrites the previous snapshot.
+    /// Callers that need to preserve a specific pre-failure snapshot should
+    /// clone or persist it before the next `handle_handshake` call.
+    ///
+    /// If a write to the local homeserver was lost during the handshake, the
+    /// caller can pass the persisted snapshot to [`restore()`](Self::restore)
+    /// to recover the session.
+    ///
+    /// Returns `None` if `handle_handshake` has never been called.
+    pub fn last_good_snapshot(&self) -> Option<&PubkyDataSessionState> {
+        self.last_good_snapshot.as_ref()
+    }
+
     /// Test-only: enable ciphertext tampering simulation.
+    #[cfg(feature = "test-utils")]
     pub fn test_enable_tampering(&mut self) {
         self.simulate_tampering = true;
     }
 
+    /// Test-only: simulate homeserver write failures during handshake.
+    ///
+    /// When enabled, `handle_handshake` will skip the `put()` call and
+    /// return `Err(PubkyDataError::HomeserverWriteError)` on Write actions.
+    #[cfg(feature = "test-utils")]
+    pub fn test_enable_write_failure(&mut self) {
+        self.simulate_write_failure = true;
+    }
+
     /// Test-only: get the last ciphertext produced by send_message.
+    #[cfg(feature = "test-utils")]
     pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_DATA_MSG_LEN + 2]> {
         self.last_ciphertext
     }
