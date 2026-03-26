@@ -1,6 +1,6 @@
 # Pubky Data
 
-A fully-integrated Noise protocol framework for encrypted peer-to-peer messaging over Pubky homeservers.
+A fully-integrated [Noise protocol](https://noiseprotocol.org/) framework for encrypted peer-to-peer messaging over [Pubky](https://pubky.org) homeservers.
 
 Peers use their homeservers as outboxes: each party writes encrypted Noise messages to their own homeserver, and reads from the remote peer's homeserver. The library wraps the [Snow](https://github.com/mcginty/snow) Noise implementation in a clean async interface with built-in session backup and restore.
 
@@ -130,10 +130,10 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 
 ```text
 new() --> handle_handshake() [loop] --> transition_transport() --> send/receive --> close()
-                                              |
-                                         snapshot() --> persist_snapshot()
-                                              |
-                                         restore() [on crash recovery]
+        |                                     |
+    last_good_snapshot                     snapshot() --> persist_snapshot()
+        |                                     |
+    restore() [on crash recovery]     restore() [on crash recovery]
 ```
 
 ## Noise Handshake Patterns
@@ -252,6 +252,120 @@ During handshake, if a homeserver write fails:
 4. Persist it and pass to `restore()` to rebuild the session from the correct position.
 
 The restore mechanism replays all handshake messages from the homeservers through a fresh Noise state built with the same ephemeral key material.
+
+### Handshake Recovery with `last_good_snapshot`
+
+Every call to `handle_handshake()` automatically captures a pre-mutation snapshot before doing any work. If the call fails (or if a written message is subsequently lost), this snapshot is the recovery point.
+
+#### Why recovery is needed
+
+Snow's `HandshakeState` is a one-way ratchet: once `write_message()` is called, the internal state advances irreversibly. If the homeserver `put()` then fails, the encryptor's Noise state no longer matches what is actually stored on the homeservers. The encryptor cannot simply retry -- it must be rebuilt from scratch.
+
+#### Recovery sequence diagram
+
+```text
+                    Initiator                    Homeserver                  Responder
+                        |                            |                          |
+  [snapshot captured]   |                            |                          |
+                        |--- handle_handshake() ---->|                          |
+                        |   Snow advances state      |                          |
+                        |   put() FAILS              |                          |
+                        |<-- Err(HomeserverWrite) ---|                          |
+                        |                            |                          |
+  [encryptor is now     |                            |                          |
+   corrupted -- Snow    |                            |                          |
+   advanced but message |                            |                          |
+   never reached the    |                            |                          |
+   homeserver]          |                            |                          |
+                        |                            |                          |
+  [get last_good_       |                            |                          |
+   snapshot, serialize, |                            |                          |
+   persist to storage]  |                            |                          |
+                        |                            |                          |
+  [discard corrupted    |                            |                          |
+   encryptor]           |                            |                          |
+                        |                            |                          |
+  [restore() from       |                            |                          |
+   persisted snapshot:  |                            |                          |
+   - builds fresh Snow  |                            |                          |
+     with same          |                            |                          |
+     ephemeral key      |                            |                          |
+   - replays all        |<------ reads existing ---->|                          |
+     handshake messages |       messages from        |                          |
+     from homeservers   |       homeservers          |                          |
+   - state now matches  |                            |                          |
+     what is on disk]   |                            |                          |
+                        |                            |                          |
+  [restored encryptor]  |--- handle_handshake() ---->| (write succeeds)         |
+                        |                            |--- message available --->|
+                        |                            |                          |
+                        |          ... handshake continues normally ...         |
+```
+
+#### Code example
+
+```rust,ignore
+use pubky_data::{PubkyDataEncryptor, PubkyDataConfig, PubkyDataError, HandshakeResult};
+use pubky_data::serializer::PubkyDataSessionState;
+
+// Persist the last good snapshot after every handshake call.
+// This is the safety net for crash recovery.
+async fn handshake_with_recovery(
+    encryptor: &mut PubkyDataEncryptor,
+    config: Arc<PubkyDataConfig>,
+    endpoint_pubkey: PublicKey,
+) -> Result<HandshakeResult, PubkyDataError> {
+    match encryptor.handle_handshake().await {
+        Ok(result) => {
+            // Success -- persist the pre-mutation snapshot for future recovery.
+            // (Each call overwrites the previous snapshot, so persist after every call.)
+            if let Some(snapshot) = encryptor.last_good_snapshot() {
+                let bytes = snapshot.serialize();
+                save_to_disk(&bytes); // your persistence logic
+            }
+            Ok(result)
+        }
+        Err(PubkyDataError::HomeserverWriteError) => {
+            // The encryptor is now corrupted. Recover from the snapshot
+            // that was captured at the START of this failed call.
+            let snapshot = encryptor
+                .last_good_snapshot()
+                .expect("always Some after handle_handshake")
+                .clone();
+
+            let bytes = snapshot.serialize();
+            let state = PubkyDataSessionState::deserialize(&bytes).unwrap();
+
+            // Restore rebuilds the Noise state by replaying handshake
+            // messages that are actually on the homeservers.
+            *encryptor = PubkyDataEncryptor::restore(
+                config,
+                state,
+                endpoint_pubkey,
+            )
+            .await?;
+
+            // The restored encryptor is back to the pre-failure position.
+            // The caller can retry handle_handshake() on the next poll.
+            Ok(HandshakeResult::Pending)
+        }
+        Err(e) => Err(e),
+    }
+}
+```
+
+#### Lost-message recovery (Case a2)
+
+If `put()` succeeds but the data is subsequently lost (e.g., homeserver crash after acknowledgment), `handle_handshake()` returns `Ok(Pending)` -- the loss is undetectable at the protocol level. The handshake gets stuck: the responder keeps polling but finds nothing to read, and the initiator waits for a reply that will never come.
+
+Recovery follows the same path: load the last persisted snapshot (from before the lost write), call `restore()`, and re-run the handshake. Because `restore()` replays only the messages that are actually present on the homeservers, it rebuilds the correct state and the re-issued write fills the missing slot.
+
+#### Key invariants
+
+- `last_good_snapshot()` returns `None` before the first `handle_handshake()` call.
+- Each `handle_handshake()` call overwrites the previous snapshot with the state from the start of *that* call.
+- The snapshot contains the ephemeral secret key, which is the critical piece that allows `restore()` to re-derive the same transport keys via replay.
+- `restore()` verifies the handshake hash matches the saved one (for transport-phase restores), returning `RestoreHashMismatch` on mismatch.
 
 ## Error Handling
 

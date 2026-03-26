@@ -19,7 +19,7 @@ Key capabilities:
 | Crate | Path | Description |
 |---|---|---|
 | [`pubky-data`](./pubky-data/) | `pubky-data/` | Core library: Noise handshake, encrypted transport, session management, path derivation |
-| `e2e` | `e2e/` | End-to-end integration tests against real Pubky testnets |
+| [`e2e`](./e2e/) | `e2e/` | End-to-end integration tests against real Pubky testnets |
 
 ## Building
 
@@ -32,13 +32,13 @@ cargo build
 ### Unit tests (path derivation, serialization)
 
 ```sh
-cargo test -p pubky-data
+cargo nextest -p pubky-data
 ```
 
 ### End-to-end tests (requires embedded Postgres)
 
 ```sh
-cargo test -p e2e
+cargo nextest -p e2e
 ```
 
 The E2E tests spin up ephemeral Pubky testnets with embedded Postgres and exercise the full handshake-to-transport lifecycle, including:
