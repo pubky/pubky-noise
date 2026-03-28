@@ -1,5 +1,5 @@
 [package]
-name = "pubky-data"
+name = "pubky-noise"
 description = "Fully-integrated Noise AE framework in pubky-sdk"
 version = "0.0.1"
 edition = "2021"

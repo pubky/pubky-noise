@@ -10,10 +10,10 @@ use std::sync::Arc;
 use pubky::prelude::*;
 use pubky::PubkySession;
 
-use serializer::PubkyDataSessionState;
+use serializer::PubkyNoiseSessionState;
 use snow_crypto::{
     full_handshake_actions, DataLinkContext, HandshakeAction, HandshakePattern, NoisePhase,
-    PUBKY_DATA_MSG_LEN,
+    PUBKY_NOISE_MSG_LEN,
 };
 
 /// A 32-byte identifier derived from the Noise handshake.
@@ -26,12 +26,12 @@ pub struct LinkId(pub [u8; 32]);
 /// Decode a length-prefixed packet into a message buffer and its length.
 ///
 /// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
-fn decode_packet(ciphertext: &[u8]) -> Result<([u8; PUBKY_DATA_MSG_LEN], usize), PubkyDataError> {
-    if ciphertext.len() > PUBKY_DATA_MSG_LEN + 2 {
-        return Err(PubkyDataError::BadLengthCiphertext);
+fn decode_packet(ciphertext: &[u8]) -> Result<([u8; PUBKY_NOISE_MSG_LEN], usize), PubkyNoiseError> {
+    if ciphertext.len() > PUBKY_NOISE_MSG_LEN + 2 {
+        return Err(PubkyNoiseError::BadLengthCiphertext);
     }
     let len = u16::from_be_bytes([ciphertext[0], ciphertext[1]]) as usize;
-    let mut message = [0u8; PUBKY_DATA_MSG_LEN];
+    let mut message = [0u8; PUBKY_NOISE_MSG_LEN];
     message[..len].copy_from_slice(&ciphertext[2..len + 2]);
     Ok((message, len))
 }
@@ -39,8 +39,8 @@ fn decode_packet(ciphertext: &[u8]) -> Result<([u8; PUBKY_DATA_MSG_LEN], usize),
 /// Encode a message into a length-prefixed packet.
 ///
 /// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
-fn encode_packet(data: &[u8], len: usize) -> [u8; PUBKY_DATA_MSG_LEN + 2] {
-    let mut packet = [0u8; PUBKY_DATA_MSG_LEN + 2];
+fn encode_packet(data: &[u8], len: usize) -> [u8; PUBKY_NOISE_MSG_LEN + 2] {
+    let mut packet = [0u8; PUBKY_NOISE_MSG_LEN + 2];
     let be_bytes = (len as u16).to_be_bytes();
     packet[0..2].copy_from_slice(&be_bytes);
     packet[2..len + 2].copy_from_slice(&data[..len]);
@@ -48,7 +48,7 @@ fn encode_packet(data: &[u8], len: usize) -> [u8; PUBKY_DATA_MSG_LEN + 2] {
 }
 
 #[derive(Eq, Hash, PartialEq, Debug)]
-pub enum PubkyDataError {
+pub enum PubkyNoiseError {
     UnknownNoisePattern,
     SnowNoiseBuildError,
     BadLengthCiphertext,
@@ -56,7 +56,7 @@ pub enum PubkyDataError {
     HomeserverResponseError,
     /// Handshake write failed to reach the homeserver.
     /// The Noise state has already advanced irreversibly; recovery requires
-    /// restoring from [`PubkyDataEncryptor::last_good_snapshot()`].
+    /// restoring from [`PubkyNoiseEncryptor::last_good_snapshot()`].
     HomeserverWriteError,
     IsHandshake,
     /// Restore failed: handshake replay error.
@@ -74,7 +74,7 @@ pub enum HandshakeResult {
     Terminal,
 }
 
-/// Shared configuration and resources for multiple `PubkyDataEncryptor` instances.
+/// Shared configuration and resources for multiple `PubkyNoiseEncryptor` instances.
 ///
 /// This struct holds the resources that are common across all Noise sessions for
 /// a given user: the HTTP client, the authenticated homeserver session, the
@@ -86,11 +86,11 @@ pub enum HandshakeResult {
 /// `write_path` is the folder prefix used when writing messages to the local
 /// homeserver. `read_path` is the folder prefix used when reading messages from
 /// the remote homeserver. For symmetric usage (same path for both), pass the
-/// same value to both fields via [`PubkyDataConfig::new`].
+/// same value to both fields via [`PubkyNoiseConfig::new`].
 ///
 /// For per-peer-pair path privacy, use [`path_derivation::derive_asymmetric_paths`]
 /// to compute distinct write/read paths from a DH shared secret.
-pub struct PubkyDataConfig {
+pub struct PubkyNoiseConfig {
     pub outbox_client: Pubky,
     pub local_session: PubkySession,
     /// Folder prefix for writing messages to the local homeserver.
@@ -98,20 +98,20 @@ pub struct PubkyDataConfig {
     /// Folder prefix for reading messages from the remote homeserver.
     pub read_path: String,
     pub pubky_root_keypair: Keypair,
-    pub pubky_data_version: u32,
+    pub pubky_noise_version: u32,
     pub default_pattern: HandshakePattern,
 }
 
-impl PubkyDataConfig {
+impl PubkyNoiseConfig {
     /// Create a new shared configuration with a single symmetric path.
     ///
     /// This is a convenience constructor that uses the same path for both
     /// reading and writing. For per-peer-pair path privacy, use
-    /// [`PubkyDataConfig::new_with_paths`] instead.
+    /// [`PubkyNoiseConfig::new_with_paths`] instead.
     ///
     /// # Parameters:
     ///      - `pubky_root_seckey`: A 32-byte root secret key.
-    ///      - `pubky_data_version`: Protocol version identifier.
+    ///      - `pubky_noise_version`: Protocol version identifier.
     ///      - `pattern_string`: Default Noise pattern (e.g. "NN", "XX").
     ///      - `homeserver_auth_session`: An authenticated PubkySession.
     ///      - `destination_path`: Custom destination prefix for message sharing
@@ -119,18 +119,18 @@ impl PubkyDataConfig {
     ///      - `outbox_client`: HTTP Pubky client.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyDataError::UnknownNoisePattern`] if the pattern string is invalid.
+    ///      - Returns [`PubkyNoiseError::UnknownNoisePattern`] if the pattern string is invalid.
     pub fn new(
         pubky_root_seckey: [u8; 32],
-        pubky_data_version: u32,
+        pubky_noise_version: u32,
         pattern_string: &str,
         homeserver_auth_session: PubkySession,
         destination_path: String,
         outbox_client: Pubky,
-    ) -> Result<Arc<Self>, PubkyDataError> {
+    ) -> Result<Arc<Self>, PubkyNoiseError> {
         Self::new_with_paths(
             pubky_root_seckey,
-            pubky_data_version,
+            pubky_noise_version,
             pattern_string,
             homeserver_auth_session,
             destination_path.clone(),
@@ -147,7 +147,7 @@ impl PubkyDataConfig {
     ///
     /// # Parameters:
     ///      - `pubky_root_seckey`: A 32-byte root secret key.
-    ///      - `pubky_data_version`: Protocol version identifier.
+    ///      - `pubky_noise_version`: Protocol version identifier.
     ///      - `pattern_string`: Default Noise pattern (e.g. "NN", "XX").
     ///      - `homeserver_auth_session`: An authenticated PubkySession.
     ///      - `write_path`: Folder prefix for writing messages to the local homeserver.
@@ -155,40 +155,40 @@ impl PubkyDataConfig {
     ///      - `outbox_client`: HTTP Pubky client.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyDataError::UnknownNoisePattern`] if the pattern string is invalid.
+    ///      - Returns [`PubkyNoiseError::UnknownNoisePattern`] if the pattern string is invalid.
     pub fn new_with_paths(
         pubky_root_seckey: [u8; 32],
-        pubky_data_version: u32,
+        pubky_noise_version: u32,
         pattern_string: &str,
         homeserver_auth_session: PubkySession,
         write_path: String,
         read_path: String,
         outbox_client: Pubky,
-    ) -> Result<Arc<Self>, PubkyDataError> {
+    ) -> Result<Arc<Self>, PubkyNoiseError> {
         let pubky_root_keypair = Keypair::from_secret(&pubky_root_seckey);
         let default_pattern = HandshakePattern::from_str(pattern_string)
-            .map_err(|_| PubkyDataError::UnknownNoisePattern)?;
+            .map_err(|_| PubkyNoiseError::UnknownNoisePattern)?;
 
-        Ok(Arc::new(PubkyDataConfig {
+        Ok(Arc::new(PubkyNoiseConfig {
             outbox_client,
             local_session: homeserver_auth_session,
             write_path,
             read_path,
             pubky_root_keypair,
-            pubky_data_version,
+            pubky_noise_version: pubky_noise_version,
             default_pattern,
         }))
     }
 }
 
-/// A single-session Noise encryptor for Pubky Data.
+/// A single-session Noise encryptor for Pubky Noise.
 ///
 /// Each instance manages exactly one Noise session (handshake + transport) with
 /// a single remote peer. To manage multiple concurrent sessions, create multiple
-/// `PubkyDataEncryptor` instances sharing the same `Arc<PubkyDataConfig>`.
+/// `PubkyNoiseEncryptor` instances sharing the same `Arc<PubkyNoiseConfig>`.
 #[derive(Debug)]
-pub struct PubkyDataEncryptor {
-    config: Arc<PubkyDataConfig>,
+pub struct PubkyNoiseEncryptor {
+    config: Arc<PubkyNoiseConfig>,
     context: DataLinkContext,
     link_id: Option<LinkId>,
     endpoint_pubkey: PublicKey,
@@ -196,7 +196,7 @@ pub struct PubkyDataEncryptor {
     /// Snapshot captured automatically at the start of each
     /// [`handle_handshake()`](Self::handle_handshake) call, before any
     /// state-mutating work. See [`last_good_snapshot()`](Self::last_good_snapshot).
-    last_good_snapshot: Option<PubkyDataSessionState>,
+    last_good_snapshot: Option<PubkyNoiseSessionState>,
 
     // test-only fields — stripped from production builds
     #[cfg(feature = "test-utils")]
@@ -204,10 +204,10 @@ pub struct PubkyDataEncryptor {
     #[cfg(feature = "test-utils")]
     simulate_write_failure: bool,
     #[cfg(feature = "test-utils")]
-    last_ciphertext: Option<[u8; PUBKY_DATA_MSG_LEN + 2]>,
+    last_ciphertext: Option<[u8; PUBKY_NOISE_MSG_LEN + 2]>,
 }
 
-impl PubkyDataEncryptor {
+impl PubkyNoiseEncryptor {
     /// Create a new single-session Noise encryptor.
     ///
     /// # Parameters:
@@ -217,22 +217,22 @@ impl PubkyDataEncryptor {
     ///      - `endpoint_pubkey`: Remote peer's public key used as path suffix.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyDataError::SnowNoiseBuildError`] if the Noise stack fails to build.
+    ///      - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
     pub fn new(
-        config: Arc<PubkyDataConfig>,
+        config: Arc<PubkyNoiseConfig>,
         holder_skey: [u8; 32],
         initiator: bool,
         endpoint_pubkey: PublicKey,
-    ) -> Result<Self, PubkyDataError> {
+    ) -> Result<Self, PubkyNoiseError> {
         let data_link_context = DataLinkContext::new(
             config.default_pattern,
             initiator,
             Some(holder_skey),
             endpoint_pubkey.clone(),
         )
-        .map_err(|_| PubkyDataError::SnowNoiseBuildError)?;
+        .map_err(|_| PubkyNoiseError::SnowNoiseBuildError)?;
 
-        Ok(PubkyDataEncryptor {
+        Ok(PubkyNoiseEncryptor {
             config,
             context: data_link_context,
             link_id: None,
@@ -269,7 +269,7 @@ impl PubkyDataEncryptor {
     ///
     /// - **Write failure** (Initiator fails to write to her outbox):
     ///   If the homeserver `put()` call fails, this method returns
-    ///   [`PubkyDataError::HomeserverWriteError`]. Because Snow's internal
+    ///   [`PubkyNoiseError::HomeserverWriteError`]. Because Snow's internal
     ///   `HandshakeState` has already been irreversibly advanced by
     ///   `write_message`, the encryptor is in a corrupted state and **cannot**
     ///   simply retry. The caller must recover by restoring from the
@@ -291,12 +291,12 @@ impl PubkyDataEncryptor {
     ///   method.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyDataError::BadLengthCiphertext`] on malformed messages.
-    ///      - Returns [`PubkyDataError::HomeserverResponseError`] on response parse failure.
-    ///      - Returns [`PubkyDataError::HomeserverWriteError`] if the homeserver
+    ///      - Returns [`PubkyNoiseError::BadLengthCiphertext`] on malformed messages.
+    ///      - Returns [`PubkyNoiseError::HomeserverResponseError`] on response parse failure.
+    ///      - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
     ///        write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
     ///        and [`restore()`](Self::restore) is required.
-    pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyDataError> {
+    pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyNoiseError> {
         // Capture pre-mutation snapshot so callers can recover from write failures.
         self.last_good_snapshot = Some(self.snapshot());
 
@@ -319,10 +319,10 @@ impl PubkyDataEncryptor {
                         if response.status().is_success() {
                             if let Ok(ciphertext) = response.bytes().await {
                                 let (mut message, len) = decode_packet(&ciphertext)?;
-                                let mut payload = [0; PUBKY_DATA_MSG_LEN];
+                                let mut payload = [0; PUBKY_NOISE_MSG_LEN];
                                 let _ = self.context.read_act(&mut message, &mut payload, len);
                             } else {
-                                return Err(PubkyDataError::HomeserverResponseError);
+                                return Err(PubkyNoiseError::HomeserverResponseError);
                             }
                             self.context.increment_counter();
                             self.context.advance_sub_step();
@@ -334,7 +334,7 @@ impl PubkyDataEncryptor {
                     }
                 }
                 HandshakeAction::Write => {
-                    let mut message = [0; PUBKY_DATA_MSG_LEN];
+                    let mut message = [0; PUBKY_NOISE_MSG_LEN];
                     if let Ok(len) = self.context.write_act(&[], &mut message) {
                         let path = self.config.write_path.as_str();
                         let counter = self.context.get_counter();
@@ -365,7 +365,7 @@ impl PubkyDataEncryptor {
                             // Snow's HandshakeState has already advanced
                             // irreversibly. The caller must recover via
                             // last_good_snapshot() + restore().
-                            return Err(PubkyDataError::HomeserverWriteError);
+                            return Err(PubkyNoiseError::HomeserverWriteError);
                         }
                         self.context.increment_counter();
                         self.context.advance_sub_step();
@@ -392,10 +392,10 @@ impl PubkyDataEncryptor {
     /// Returns the `LinkId` derived from the handshake transcript hash.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyDataError::IsHandshake`] if still in handshake phase.
-    pub fn transition_transport(&mut self) -> Result<LinkId, PubkyDataError> {
+    ///      - Returns [`PubkyNoiseError::IsHandshake`] if still in handshake phase.
+    pub fn transition_transport(&mut self) -> Result<LinkId, PubkyNoiseError> {
         if self.context.is_handshake() {
-            return Err(PubkyDataError::IsHandshake);
+            return Err(PubkyNoiseError::IsHandshake);
         }
         let link_id = LinkId(self.context.get_handshake_hash().unwrap());
         let _ = self.context.to_transport();
@@ -412,7 +412,7 @@ impl PubkyDataEncryptor {
             return false;
         }
 
-        let mut out = [0; PUBKY_DATA_MSG_LEN];
+        let mut out = [0; PUBKY_NOISE_MSG_LEN];
         let len = match self.context.write_act(plaintext, &mut out) {
             Ok(len) => len,
             Err(_) => return false,
@@ -450,7 +450,7 @@ impl PubkyDataEncryptor {
     ///
     /// # Returns:
     ///      - A vector of decrypted payloads (empty on failure).
-    pub async fn receive_message(&mut self) -> Vec<[u8; PUBKY_DATA_MSG_LEN]> {
+    pub async fn receive_message(&mut self) -> Vec<[u8; PUBKY_NOISE_MSG_LEN]> {
         // Phase guard: must be in transport mode
         if !self.context.is_transport() {
             return Vec::new();
@@ -471,7 +471,7 @@ impl PubkyDataEncryptor {
             if response.status().is_success() {
                 if let Ok(ciphertext) = response.bytes().await {
                     if let Ok((mut message, len)) = decode_packet(&ciphertext) {
-                        let mut payload = [0; PUBKY_DATA_MSG_LEN];
+                        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
 
                         #[cfg(feature = "test-utils")]
                         if self.simulate_tampering {
@@ -503,11 +503,11 @@ impl PubkyDataEncryptor {
     /// is accessible via [`last_good_snapshot()`](Self::last_good_snapshot).
     /// This method remains useful for taking snapshots at arbitrary points
     /// (e.g. after transitioning to transport or after exchanging messages).
-    pub fn snapshot(&self) -> PubkyDataSessionState {
+    pub fn snapshot(&self) -> PubkyNoiseSessionState {
         let phase = self.context.get_phase();
         let handshake_hash = self.context.get_handshake_hash();
 
-        PubkyDataSessionState {
+        PubkyNoiseSessionState {
             version: 1,
             phase,
             pattern: self.context.get_pattern(),
@@ -526,7 +526,7 @@ impl PubkyDataEncryptor {
     }
 
     /// Persist the current session snapshot to the homeserver (encrypted path).
-    pub async fn persist_snapshot(&self) -> Result<(), PubkyDataError> {
+    pub async fn persist_snapshot(&self) -> Result<(), PubkyNoiseError> {
         let state = self.snapshot();
         let serialized = state.serialize();
         // TODO: encrypt serialized bytes with a key derived from pubky_root_keypair
@@ -537,11 +537,11 @@ impl PubkyDataEncryptor {
             .storage()
             .put(path, serialized)
             .await
-            .map_err(|_| PubkyDataError::OtherError)?;
+            .map_err(|_| PubkyNoiseError::OtherError)?;
         Ok(())
     }
 
-    /// Restore a `PubkyDataEncryptor` from a previously saved session state.
+    /// Restore a `PubkyNoiseEncryptor` from a previously saved session state.
     ///
     /// This method:
     /// 1. Builds a fresh `DataLinkContext` with the saved ephemeral key
@@ -555,18 +555,18 @@ impl PubkyDataEncryptor {
     ///      - `state`: The saved session state snapshot.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyDataError::SnowNoiseBuildError`] if the Noise stack fails to build.
-    ///      - Returns [`PubkyDataError::RestoreReplayError`] if handshake replay fails.
-    ///      - Returns [`PubkyDataError::RestoreHashMismatch`] if the replayed handshake
+    ///      - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
+    ///      - Returns [`PubkyNoiseError::RestoreReplayError`] if handshake replay fails.
+    ///      - Returns [`PubkyNoiseError::RestoreHashMismatch`] if the replayed handshake
     ///        produces a different hash than the saved one.
     pub async fn restore(
-        config: Arc<PubkyDataConfig>,
-        state: PubkyDataSessionState,
+        config: Arc<PubkyNoiseConfig>,
+        state: PubkyNoiseSessionState,
         endpoint_pubkey: PublicKey,
-    ) -> Result<Self, PubkyDataError> {
+    ) -> Result<Self, PubkyNoiseError> {
         // Verify the caller-provided pubkey matches the snapshot (consistency check)
         if endpoint_pubkey.to_bytes() != state.endpoint_pubkey {
-            return Err(PubkyDataError::RestoreDeserializeError);
+            return Err(PubkyNoiseError::RestoreDeserializeError);
         }
 
         // Build a fresh context with the saved ephemeral key
@@ -577,7 +577,7 @@ impl PubkyDataEncryptor {
             endpoint_pubkey.clone(),
             Some(state.ephemeral_secret),
         )
-        .map_err(|_| PubkyDataError::SnowNoiseBuildError)?;
+        .map_err(|_| PubkyNoiseError::SnowNoiseBuildError)?;
 
         // Determine the full sequence of handshake Write/Read actions
         let all_actions = full_handshake_actions(state.pattern, state.initiator);
@@ -623,10 +623,10 @@ impl PubkyDataEncryptor {
                     // we just call write_message with empty payload (same as original)
                     // and discard the output. The important thing is that Snow's
                     // internal state advances correctly.
-                    let mut message = [0; PUBKY_DATA_MSG_LEN];
+                    let mut message = [0; PUBKY_NOISE_MSG_LEN];
                     context
                         .write_act(&[], &mut message)
-                        .map_err(|_| PubkyDataError::RestoreReplayError)?;
+                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
                     replay_counter += 1;
                 }
                 HandshakeAction::Read => {
@@ -639,23 +639,23 @@ impl PubkyDataEncryptor {
                         .public_storage()
                         .get(formatted_path)
                         .await
-                        .map_err(|_| PubkyDataError::RestoreReplayError)?;
+                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
 
                     if !response.status().is_success() {
-                        return Err(PubkyDataError::RestoreReplayError);
+                        return Err(PubkyNoiseError::RestoreReplayError);
                     }
 
                     let ciphertext = response
                         .bytes()
                         .await
-                        .map_err(|_| PubkyDataError::RestoreReplayError)?;
+                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
 
                     let (mut message, len) = decode_packet(&ciphertext)?;
-                    let mut payload = [0; PUBKY_DATA_MSG_LEN];
+                    let mut payload = [0; PUBKY_NOISE_MSG_LEN];
 
                     context
                         .read_act(&mut message, &mut payload, len)
-                        .map_err(|_| PubkyDataError::RestoreReplayError)?;
+                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
                     replay_counter += 1;
                 }
                 HandshakeAction::Pending | HandshakeAction::Terminal => {
@@ -668,14 +668,14 @@ impl PubkyDataEncryptor {
         let link_id = if state.phase == NoisePhase::Transport {
             // Verify the handshake completed
             if context.is_handshake() {
-                return Err(PubkyDataError::RestoreReplayError);
+                return Err(PubkyNoiseError::RestoreReplayError);
             }
 
             // Verify handshake hash matches (integrity check)
             if let Some(saved_hash) = state.handshake_hash {
                 if let Some(replayed_hash) = context.get_handshake_hash() {
                     if saved_hash != replayed_hash {
-                        return Err(PubkyDataError::RestoreHashMismatch);
+                        return Err(PubkyNoiseError::RestoreHashMismatch);
                     }
                 }
             }
@@ -684,7 +684,7 @@ impl PubkyDataEncryptor {
             let hash = context.get_handshake_hash().unwrap();
             context
                 .to_transport()
-                .map_err(|_| PubkyDataError::RestoreReplayError)?;
+                .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
 
             // Set nonces from saved state
             context.set_sending_nonce(state.sending_nonce);
@@ -702,7 +702,7 @@ impl PubkyDataEncryptor {
             None
         };
 
-        Ok(PubkyDataEncryptor {
+        Ok(PubkyNoiseEncryptor {
             config,
             context,
             link_id,
@@ -736,7 +736,7 @@ impl PubkyDataEncryptor {
     /// to recover the session.
     ///
     /// Returns `None` if `handle_handshake` has never been called.
-    pub fn last_good_snapshot(&self) -> Option<&PubkyDataSessionState> {
+    pub fn last_good_snapshot(&self) -> Option<&PubkyNoiseSessionState> {
         self.last_good_snapshot.as_ref()
     }
 
@@ -749,7 +749,7 @@ impl PubkyDataEncryptor {
     /// Test-only: simulate homeserver write failures during handshake.
     ///
     /// When enabled, `handle_handshake` will skip the `put()` call and
-    /// return `Err(PubkyDataError::HomeserverWriteError)` on Write actions.
+    /// return `Err(PubkyNoiseError::HomeserverWriteError)` on Write actions.
     #[cfg(feature = "test-utils")]
     pub fn test_enable_write_failure(&mut self) {
         self.simulate_write_failure = true;
@@ -757,17 +757,17 @@ impl PubkyDataEncryptor {
 
     /// Test-only: get the last ciphertext produced by send_message.
     #[cfg(feature = "test-utils")]
-    pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_DATA_MSG_LEN + 2]> {
+    pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_NOISE_MSG_LEN + 2]> {
         self.last_ciphertext
     }
 }
 
-impl std::fmt::Debug for PubkyDataConfig {
+impl std::fmt::Debug for PubkyNoiseConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PubkyDataConfig")
+        f.debug_struct("PubkyNoiseConfig")
             .field("write_path", &self.write_path)
             .field("read_path", &self.read_path)
-            .field("pubky_data_version", &self.pubky_data_version)
+            .field("pubky_noise_version", &self.pubky_noise_version)
             .field("default_pattern", &self.default_pattern)
             .finish_non_exhaustive()
     }

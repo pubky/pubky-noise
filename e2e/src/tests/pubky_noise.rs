@@ -5,11 +5,11 @@ use pubky_testnet::{
     EphemeralTestnet,
 };
 
-use pubky_data::serializer::PubkyDataSessionState;
-use pubky_data::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep, PUBKY_DATA_MSG_LEN};
-use pubky_data::{HandshakeResult, PubkyDataConfig, PubkyDataEncryptor, PubkyDataError};
+use pubky_noise::serializer::PubkyNoiseSessionState;
+use pubky_noise::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep, PUBKY_NOISE_MSG_LEN};
+use pubky_noise::{HandshakeResult, PubkyNoiseConfig, PubkyNoiseEncryptor, PubkyNoiseError};
 
-fn cipher_check(plaintext: &[u8], ciphertext: &[u8; PUBKY_DATA_MSG_LEN + 2]) {
+fn cipher_check(plaintext: &[u8], ciphertext: &[u8; PUBKY_NOISE_MSG_LEN + 2]) {
     let plaintext_len = plaintext.len();
     let mut match_check = 0;
     for counter in 0..plaintext_len {
@@ -25,10 +25,10 @@ fn cipher_check(plaintext: &[u8], ciphertext: &[u8; PUBKY_DATA_MSG_LEN + 2]) {
 
 /// Test fixture: a pair of encryptors with their configs, ready for handshake.
 struct EncryptorPair {
-    initiator: PubkyDataEncryptor,
-    responder: PubkyDataEncryptor,
-    initiator_config: Arc<PubkyDataConfig>,
-    responder_config: Arc<PubkyDataConfig>,
+    initiator: PubkyNoiseEncryptor,
+    responder: PubkyNoiseEncryptor,
+    initiator_config: Arc<PubkyNoiseConfig>,
+    responder_config: Arc<PubkyNoiseConfig>,
     initiator_public_key: PublicKey,
     responder_public_key: PublicKey,
 }
@@ -54,7 +54,7 @@ async fn setup_encryptors(testnet: &EphemeralTestnet, pattern: &str) -> Encrypto
     let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
+    let initiator_config = PubkyNoiseConfig::new(
         initiator_keypair.secret_key(),
         0,
         pattern,
@@ -65,7 +65,7 @@ async fn setup_encryptors(testnet: &EphemeralTestnet, pattern: &str) -> Encrypto
     .unwrap();
 
     let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
+    let responder_config = PubkyNoiseConfig::new(
         responder_keypair.secret_key(),
         0,
         pattern,
@@ -81,7 +81,7 @@ async fn setup_encryptors(testnet: &EphemeralTestnet, pattern: &str) -> Encrypto
     let initiator_public_key = initiator_session.info().public_key().clone();
     let responder_public_key = responder_session.info().public_key().clone();
 
-    let initiator = PubkyDataEncryptor::new(
+    let initiator = PubkyNoiseEncryptor::new(
         initiator_config.clone(),
         initiator_ephemeral_keypair.secret_key(),
         true,
@@ -89,7 +89,7 @@ async fn setup_encryptors(testnet: &EphemeralTestnet, pattern: &str) -> Encrypto
     )
     .unwrap();
 
-    let responder = PubkyDataEncryptor::new(
+    let responder = PubkyNoiseEncryptor::new(
         responder_config.clone(),
         responder_ephemeral_keypair.secret_key(),
         false,
@@ -130,7 +130,7 @@ async fn setup_encryptors_dual_server(testnet: &EphemeralTestnet, pattern: &str)
     let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyDataConfig::new(
+    let initiator_config = PubkyNoiseConfig::new(
         initiator_keypair.secret_key(),
         0,
         pattern,
@@ -141,7 +141,7 @@ async fn setup_encryptors_dual_server(testnet: &EphemeralTestnet, pattern: &str)
     .unwrap();
 
     let responder_keypair = Keypair::random();
-    let responder_config = PubkyDataConfig::new(
+    let responder_config = PubkyNoiseConfig::new(
         responder_keypair.secret_key(),
         0,
         pattern,
@@ -157,7 +157,7 @@ async fn setup_encryptors_dual_server(testnet: &EphemeralTestnet, pattern: &str)
     let initiator_public_key = initiator_session.info().public_key().clone();
     let responder_public_key = responder_session.info().public_key().clone();
 
-    let initiator = PubkyDataEncryptor::new(
+    let initiator = PubkyNoiseEncryptor::new(
         initiator_config.clone(),
         initiator_ephemeral_keypair.secret_key(),
         true,
@@ -165,7 +165,7 @@ async fn setup_encryptors_dual_server(testnet: &EphemeralTestnet, pattern: &str)
     )
     .unwrap();
 
-    let responder = PubkyDataEncryptor::new(
+    let responder = PubkyNoiseEncryptor::new(
         responder_config.clone(),
         responder_ephemeral_keypair.secret_key(),
         false,
@@ -223,8 +223,8 @@ async fn complete_xx_handshake(pair: &mut EncryptorPair) {
 
 /// Send a message from sender to receiver and verify it arrives correctly.
 async fn send_and_verify(
-    sender: &mut PubkyDataEncryptor,
-    receiver: &mut PubkyDataEncryptor,
+    sender: &mut PubkyNoiseEncryptor,
+    receiver: &mut PubkyNoiseEncryptor,
     message: &str,
 ) {
     sender.send_message(message.as_bytes()).await;
@@ -237,8 +237,8 @@ async fn send_and_verify(
 
 /// Send a message and verify the receiver gets tampered (non-UTF8) data.
 async fn send_and_verify_tampered(
-    sender: &mut PubkyDataEncryptor,
-    receiver: &mut PubkyDataEncryptor,
+    sender: &mut PubkyNoiseEncryptor,
+    receiver: &mut PubkyNoiseEncryptor,
     message: &str,
 ) {
     let raw_bytes = message.as_bytes();
@@ -261,22 +261,22 @@ async fn send_and_verify_tampered(
 
 #[tokio::test]
 #[should_panic]
-async fn pubky_data_cipher_check_utility_positive() {
-    let plaintext = [b'A'; PUBKY_DATA_MSG_LEN + 2];
+async fn cipher_check_utility_positive() {
+    let plaintext = [b'A'; PUBKY_NOISE_MSG_LEN + 2];
     let ciphertext = plaintext;
     cipher_check(&plaintext, &ciphertext);
 }
 
 #[tokio::test]
-async fn pubky_data_cipher_check_utility_negative() {
-    let plaintext = [b'A'; PUBKY_DATA_MSG_LEN + 2];
+async fn cipher_check_utility_negative() {
+    let plaintext = [b'A'; PUBKY_NOISE_MSG_LEN + 2];
     let mut ciphertext = plaintext;
     ciphertext[0] = b'B';
     cipher_check(&plaintext, &ciphertext);
 }
 
 #[tokio::test]
-async fn pubky_data_snow_test_initiator_first() {
+async fn snow_test_initiator_first() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -288,14 +288,19 @@ async fn pubky_data_snow_test_initiator_first() {
     send_and_verify(
         &mut pair.initiator,
         &mut pair.responder,
-        "Hello_World_Pubky_Data",
+        "Hello_World_Pubky_Noise",
     )
     .await;
-    send_and_verify(&mut pair.responder, &mut pair.initiator, "Pubky_Data_Rocks").await;
+    send_and_verify(
+        &mut pair.responder,
+        &mut pair.initiator,
+        "Pubky_Noise_Rocks",
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn pubky_data_snow_test_responder_first() {
+async fn snow_test_responder_first() {
     // Start a test homeserver with 1 MB user data limit
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
@@ -310,14 +315,14 @@ async fn pubky_data_snow_test_responder_first() {
     send_and_verify(
         &mut pair.responder,
         &mut pair.initiator,
-        "Hello World Pubky Data",
+        "Hello World Pubky Noise",
     )
     .await;
-    send_and_verify(&mut pair.initiator, &mut pair.responder, "Pubky Data Rocks").await;
+    send_and_verify(&mut pair.initiator, &mut pair.responder, "Pubky Noise Rocks").await;
 }
 
 #[tokio::test]
-async fn pubky_data_snow_test_responder_tampering() {
+async fn snow_test_responder_tampering() {
     // Start a test homeserver with 1 MB user data limit
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
@@ -331,13 +336,13 @@ async fn pubky_data_snow_test_responder_tampering() {
     send_and_verify_tampered(
         &mut pair.responder,
         &mut pair.initiator,
-        "Hello World Pubky Data",
+        "Hello World Pubky Noise",
     )
     .await;
 }
 
 #[tokio::test]
-async fn pubky_data_snow_test_initiator_tampering() {
+async fn snow_test_initiator_tampering() {
     // Start a test homeserver with 1 MB user data limit
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
@@ -351,13 +356,13 @@ async fn pubky_data_snow_test_initiator_tampering() {
     send_and_verify_tampered(
         &mut pair.initiator,
         &mut pair.responder,
-        "Hello World Pubky Data",
+        "Hello World Pubky Noise",
     )
     .await;
 }
 
 #[tokio::test]
-async fn pubky_data_snow_null_message() {
+async fn snow_null_message() {
     // Start a test homeserver with 1 MB user data limit
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
@@ -371,7 +376,7 @@ async fn pubky_data_snow_null_message() {
 }
 
 // //#[tokio::test]
-// async fn pubky_data_snow_test_min_max_size_message() {
+// async fn snow_test_min_max_size_message() {
 //     //TODO: fix accordingly dual outbox model
 //     let testnet = EphemeralTestnet::builder()
 //         .with_embedded_postgres()
@@ -397,7 +402,7 @@ async fn pubky_data_snow_null_message() {
 //     let server_path_string = format!("/pub/data");
 
 //     let initiator_keypair = Keypair::random();
-//     let mut initiator_encryptor = PubkyDataEncryptor::init_encryptor_stack(
+//     let mut initiator_encryptor = PubkyNoiseEncryptor::init_encryptor_stack(
 //         initiator_keypair.secret_key(),
 //         0,
 //         "NN".to_string(),
@@ -409,7 +414,7 @@ async fn pubky_data_snow_null_message() {
 //     .unwrap();
 
 //     let responder_keypair = Keypair::random();
-//     let mut responder_encryptor = PubkyDataEncryptor::init_encryptor_stack(
+//     let mut responder_encryptor = PubkyNoiseEncryptor::init_encryptor_stack(
 //         responder_keypair.secret_key(),
 //         0,
 //         "NN".to_string(),
@@ -458,7 +463,7 @@ async fn pubky_data_snow_null_message() {
 //         .handle_handshake(initiator_temporary_link_id, responder_public_key.clone())
 //         .await;
 
-//     // yield Err(PubkyDataError::IsTransport)
+//     // yield Err(PubkyNoiseError::IsTransport)
 //     assert!(!initiator_encryptor
 //         .is_handshake(&initiator_temporary_link_id)
 //         .is_ok());
@@ -490,7 +495,7 @@ async fn pubky_data_snow_null_message() {
 // }
 
 #[tokio::test]
-async fn pubky_data_snow_test_unknown_pattern() {
+async fn snow_test_unknown_pattern() {
     // Start a test homeserver with 1 MB user data limit
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
@@ -509,7 +514,7 @@ async fn pubky_data_snow_test_unknown_pattern() {
     let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
-    let init_config_ret = PubkyDataConfig::new(
+    let init_config_ret = PubkyNoiseConfig::new(
         initiator_keypair.secret_key(),
         0,
         "BA",
@@ -518,11 +523,11 @@ async fn pubky_data_snow_test_unknown_pattern() {
         initiator_pubky,
     );
     assert!(init_config_ret.is_err());
-    assert!(init_config_ret.unwrap_err() == PubkyDataError::UnknownNoisePattern);
+    assert!(init_config_ret.unwrap_err() == PubkyNoiseError::UnknownNoisePattern);
 }
 
 #[tokio::test]
-async fn pubky_data_snow_test_snow_noise_build_error() {
+async fn snow_test_snow_noise_build_error() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -548,7 +553,7 @@ async fn pubky_data_snow_test_snow_noise_build_error() {
 
     let initiator_keypair = Keypair::random();
     // Create config with NN pattern, then override to TestOnlyPatternAA
-    let mut config = PubkyDataConfig::new(
+    let mut config = PubkyNoiseConfig::new(
         initiator_keypair.secret_key(),
         0,
         "NN",
@@ -565,18 +570,18 @@ async fn pubky_data_snow_test_snow_noise_build_error() {
 
     let responder_public_key = responder_session.info().public_key();
 
-    let init_encryptor_ret = PubkyDataEncryptor::new(
+    let init_encryptor_ret = PubkyNoiseEncryptor::new(
         config,
         initiator_ephemeral_keypair.secret_key(),
         true,
         responder_public_key.clone(),
     );
     assert!(init_encryptor_ret.is_err());
-    assert!(init_encryptor_ret.unwrap_err() == PubkyDataError::SnowNoiseBuildError);
+    assert!(init_encryptor_ret.unwrap_err() == PubkyNoiseError::SnowNoiseBuildError);
 }
 
 #[tokio::test]
-async fn pubky_data_snow_test_cleaning_sequence() {
+async fn snow_test_cleaning_sequence() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -588,7 +593,7 @@ async fn pubky_data_snow_test_cleaning_sequence() {
     send_and_verify(
         &mut pair.initiator,
         &mut pair.responder,
-        "Hello_World_Pubky_Data",
+        "Hello_World_Noise_Data",
     )
     .await;
 
@@ -599,7 +604,7 @@ async fn pubky_data_snow_test_cleaning_sequence() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn pubky_data_snow_test_XX_pattern_simple() {
+async fn snow_test_XX_pattern_simple() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -613,7 +618,7 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
     send_and_verify(
         &mut pair.initiator,
         &mut pair.responder,
-        "Hello_World_Pubky_Data",
+        "Hello_World_Pubky_Noise",
     )
     .await;
 
@@ -630,12 +635,12 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
     let slot0_bytes = response.bytes().await.unwrap();
     assert_eq!(
         slot0_bytes.len(),
-        PUBKY_DATA_MSG_LEN + 2,
-        "Stored data should be PUBKY_DATA_MSG_LEN + 2 bytes"
+        PUBKY_NOISE_MSG_LEN + 2,
+        "Stored data should be PUBKY_NOISE_MSG_LEN + 2 bytes"
     );
     let len0 = u16::from_be_bytes([slot0_bytes[0], slot0_bytes[1]]) as usize;
     assert!(
-        len0 > 0 && len0 <= PUBKY_DATA_MSG_LEN,
+        len0 > 0 && len0 <= PUBKY_NOISE_MSG_LEN,
         "Length prefix should be valid, got {len0}"
     );
 
@@ -647,10 +652,10 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
         "Responder handshake msg 2 should exist at /pub/data/1"
     );
     let slot1_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot1_bytes.len(), PUBKY_DATA_MSG_LEN + 2);
+    assert_eq!(slot1_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
     let len1 = u16::from_be_bytes([slot1_bytes[0], slot1_bytes[1]]) as usize;
     assert!(
-        len1 > 0 && len1 <= PUBKY_DATA_MSG_LEN,
+        len1 > 0 && len1 <= PUBKY_NOISE_MSG_LEN,
         "Length prefix should be valid, got {len1}"
     );
 
@@ -662,10 +667,10 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
         "Initiator handshake msg 3 should exist at /pub/data/2"
     );
     let slot2_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot2_bytes.len(), PUBKY_DATA_MSG_LEN + 2);
+    assert_eq!(slot2_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
     let len2 = u16::from_be_bytes([slot2_bytes[0], slot2_bytes[1]]) as usize;
     assert!(
-        len2 > 0 && len2 <= PUBKY_DATA_MSG_LEN,
+        len2 > 0 && len2 <= PUBKY_NOISE_MSG_LEN,
         "Length prefix should be valid, got {len2}"
     );
 
@@ -677,15 +682,15 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
         "Transport message should exist at /pub/data/3"
     );
     let slot3_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot3_bytes.len(), PUBKY_DATA_MSG_LEN + 2);
+    assert_eq!(slot3_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
     let len3 = u16::from_be_bytes([slot3_bytes[0], slot3_bytes[1]]) as usize;
     assert!(
-        len3 > 0 && len3 <= PUBKY_DATA_MSG_LEN,
+        len3 > 0 && len3 <= PUBKY_NOISE_MSG_LEN,
         "Length prefix should be valid, got {len3}"
     );
     // Verify the stored data is actually encrypted (not plaintext)
     let transport_ciphertext = &slot3_bytes[2..len3 + 2];
-    let plaintext_bytes = "Hello_World_Pubky_Data".as_bytes();
+    let plaintext_bytes = "Hello_World_Pubky_Noise".as_bytes();
     assert_ne!(
         &transport_ciphertext[..plaintext_bytes.len()],
         plaintext_bytes,
@@ -774,7 +779,7 @@ async fn pubky_data_snow_test_XX_pattern_simple() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn pubky_data_snow_test_XX_pattern_tampering() {
+async fn snow_test_XX_pattern_tampering() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -786,13 +791,13 @@ async fn pubky_data_snow_test_XX_pattern_tampering() {
     send_and_verify_tampered(
         &mut pair.initiator,
         &mut pair.responder,
-        "Hello_World_Pubky_Data",
+        "Hello_World_Pubky_Noise",
     )
     .await;
 }
 
 #[tokio::test]
-async fn pubky_data_snow_test_simple_backup() {
+async fn snow_test_simple_backup() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -804,7 +809,7 @@ async fn pubky_data_snow_test_simple_backup() {
     send_and_verify(
         &mut pair.initiator,
         &mut pair.responder,
-        "Hello_World_Pubky_Data",
+        "Hello_World_Pubky_Noise",
     )
     .await;
 
@@ -812,7 +817,7 @@ async fn pubky_data_snow_test_simple_backup() {
 }
 
 #[tokio::test]
-async fn pubky_data_snow_test_dual_outbox() {
+async fn snow_test_dual_outbox() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -828,7 +833,7 @@ async fn pubky_data_snow_test_dual_outbox() {
 }
 
 #[tokio::test]
-async fn pubky_data_snow_test_identity_commitment() {
+async fn snow_test_identity_commitment() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -844,7 +849,7 @@ async fn pubky_data_snow_test_identity_commitment() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
+async fn snow_test_XX_pattern_simple_out_of_order_handshake() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -873,7 +878,7 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
     send_and_verify(
         &mut pair.initiator,
         &mut pair.responder,
-        "Hello_World_Pubky_Data",
+        "Hello_World_Pubky_Noise",
     )
     .await;
 
@@ -890,12 +895,12 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
     let slot0_bytes = response.bytes().await.unwrap();
     assert_eq!(
         slot0_bytes.len(),
-        PUBKY_DATA_MSG_LEN + 2,
-        "Stored data should be PUBKY_DATA_MSG_LEN + 2 bytes"
+        PUBKY_NOISE_MSG_LEN + 2,
+        "Stored data should be PUBKY_NOISE_MSG_LEN + 2 bytes"
     );
     let len0 = u16::from_be_bytes([slot0_bytes[0], slot0_bytes[1]]) as usize;
     assert!(
-        len0 > 0 && len0 <= PUBKY_DATA_MSG_LEN,
+        len0 > 0 && len0 <= PUBKY_NOISE_MSG_LEN,
         "Length prefix should be valid, got {len0}"
     );
 
@@ -907,10 +912,10 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
         "Responder handshake msg 2 should exist at /pub/data/1"
     );
     let slot1_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot1_bytes.len(), PUBKY_DATA_MSG_LEN + 2);
+    assert_eq!(slot1_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
     let len1 = u16::from_be_bytes([slot1_bytes[0], slot1_bytes[1]]) as usize;
     assert!(
-        len1 > 0 && len1 <= PUBKY_DATA_MSG_LEN,
+        len1 > 0 && len1 <= PUBKY_NOISE_MSG_LEN,
         "Length prefix should be valid, got {len1}"
     );
 
@@ -922,10 +927,10 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
         "Initiator handshake msg 3 should exist at /pub/data/2"
     );
     let slot2_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot2_bytes.len(), PUBKY_DATA_MSG_LEN + 2);
+    assert_eq!(slot2_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
     let len2 = u16::from_be_bytes([slot2_bytes[0], slot2_bytes[1]]) as usize;
     assert!(
-        len2 > 0 && len2 <= PUBKY_DATA_MSG_LEN,
+        len2 > 0 && len2 <= PUBKY_NOISE_MSG_LEN,
         "Length prefix should be valid, got {len2}"
     );
 
@@ -937,15 +942,15 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
         "Transport message should exist at /pub/data/3"
     );
     let slot3_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot3_bytes.len(), PUBKY_DATA_MSG_LEN + 2);
+    assert_eq!(slot3_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
     let len3 = u16::from_be_bytes([slot3_bytes[0], slot3_bytes[1]]) as usize;
     assert!(
-        len3 > 0 && len3 <= PUBKY_DATA_MSG_LEN,
+        len3 > 0 && len3 <= PUBKY_NOISE_MSG_LEN,
         "Length prefix should be valid, got {len3}"
     );
     // Verify the stored data is actually encrypted (not plaintext)
     let transport_ciphertext = &slot3_bytes[2..len3 + 2];
-    let plaintext_bytes = "Hello_World_Pubky_Data".as_bytes();
+    let plaintext_bytes = "Hello_World_Pubky_Noise".as_bytes();
     assert_ne!(
         &transport_ciphertext[..plaintext_bytes.len()],
         plaintext_bytes,
@@ -1034,7 +1039,7 @@ async fn pubky_data_snow_test_XX_pattern_simple_out_of_order_handshake() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn pubky_data_snow_test_XX_pattern_simple_incomplete_handshake() {
+async fn snow_test_XX_pattern_simple_incomplete_handshake() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1060,7 +1065,7 @@ async fn pubky_data_snow_test_XX_pattern_simple_incomplete_handshake() {
 /// Test restore from transport state: complete handshake, exchange messages,
 /// snapshot, serialize/deserialize, restore, then continue exchanging messages.
 #[tokio::test]
-async fn pubky_data_snow_test_restore() {
+async fn snow_test_restore() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1089,18 +1094,18 @@ async fn pubky_data_snow_test_restore() {
     assert_eq!(initiator_bytes.len(), 189);
     assert_eq!(responder_bytes.len(), 189);
 
-    let initiator_state = PubkyDataSessionState::deserialize(&initiator_bytes).unwrap();
-    let responder_state = PubkyDataSessionState::deserialize(&responder_bytes).unwrap();
+    let initiator_state = PubkyNoiseSessionState::deserialize(&initiator_bytes).unwrap();
+    let responder_state = PubkyNoiseSessionState::deserialize(&responder_bytes).unwrap();
 
     // Restore both sides from snapshots
-    let mut restored_initiator = PubkyDataEncryptor::restore(
+    let mut restored_initiator = PubkyNoiseEncryptor::restore(
         pair.initiator_config.clone(),
         initiator_state,
         responder_public_key.clone(),
     )
     .await
     .unwrap();
-    let mut restored_responder = PubkyDataEncryptor::restore(
+    let mut restored_responder = PubkyNoiseEncryptor::restore(
         pair.responder_config.clone(),
         responder_state,
         initiator_public_key.clone(),
@@ -1135,7 +1140,7 @@ async fn pubky_data_snow_test_restore() {
 
 /// Test that snapshot serialization round-trips correctly.
 #[tokio::test]
-async fn pubky_data_snow_test_restore_serialization_roundtrip() {
+async fn snow_test_restore_serialization_roundtrip() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1155,7 +1160,7 @@ async fn pubky_data_snow_test_restore_serialization_roundtrip() {
     // Take snapshot and verify round-trip
     let snapshot = pair.initiator.snapshot();
     let bytes = snapshot.serialize();
-    let restored = PubkyDataSessionState::deserialize(&bytes).unwrap();
+    let restored = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
 
     // Verify all fields match
     assert_eq!(restored.version, snapshot.version);
@@ -1172,7 +1177,7 @@ async fn pubky_data_snow_test_restore_serialization_roundtrip() {
 
 /// Test that restored encryptors produce the same link ID as the originals.
 #[tokio::test]
-async fn pubky_data_snow_test_restore_link_id_matches() {
+async fn snow_test_restore_link_id_matches() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1192,8 +1197,8 @@ async fn pubky_data_snow_test_restore_link_id_matches() {
     // Snapshot and restore initiator
     let init_snapshot = pair.initiator.snapshot();
     let init_bytes = init_snapshot.serialize();
-    let init_state = PubkyDataSessionState::deserialize(&init_bytes).unwrap();
-    let restored_initiator = PubkyDataEncryptor::restore(
+    let init_state = PubkyNoiseSessionState::deserialize(&init_bytes).unwrap();
+    let restored_initiator = PubkyNoiseEncryptor::restore(
         pair.initiator_config.clone(),
         init_state,
         responder_public_key.clone(),
@@ -1204,8 +1209,8 @@ async fn pubky_data_snow_test_restore_link_id_matches() {
     // Snapshot and restore responder
     let resp_snapshot = pair.responder.snapshot();
     let resp_bytes = resp_snapshot.serialize();
-    let resp_state = PubkyDataSessionState::deserialize(&resp_bytes).unwrap();
-    let restored_responder = PubkyDataEncryptor::restore(
+    let resp_state = PubkyNoiseSessionState::deserialize(&resp_bytes).unwrap();
+    let restored_responder = PubkyNoiseEncryptor::restore(
         pair.responder_config.clone(),
         resp_state,
         initiator_public_key.clone(),
@@ -1245,8 +1250,8 @@ async fn pubky_data_snow_test_restore_link_id_matches() {
 //        handle_handshake() now returns Err(HomeserverWriteError).
 //        Snow's HandshakeState has already advanced irreversibly, so the
 //        caller must recover via last_good_snapshot() + restore().
-//        See: pubky_data_snow_test_NN_initiator_put_failure_returns_error
-//             pubky_data_snow_test_XX_initiator_put_failure_returns_error
+//        See: snow_test_NN_initiator_put_failure_returns_error
+//             snow_test_XX_initiator_put_failure_returns_error
 //
 //   (a2) put() succeeds but data is subsequently lost (e.g. homeserver
 //        crash after acknowledgment, storage corruption):
@@ -1255,8 +1260,8 @@ async fn pubky_data_snow_test_restore_link_id_matches() {
 //        possible by restoring from a pre-failure snapshot (simulating
 //        "app restart" loading last persisted state), which replays the
 //        handshake from the correct position.
-//        See: pubky_data_snow_test_NN_initiator_write_failure_and_replay_recovery
-//             pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery
+//        See: snow_test_NN_initiator_write_failure_and_replay_recovery
+//             snow_test_XX_initiator_write_failure_and_replay_recovery
 // =============================================================================
 
 /// NN pattern: Responder fails to read from Initiator's outbox.
@@ -1268,7 +1273,7 @@ async fn pubky_data_snow_test_restore_link_id_matches() {
 /// - Transport works after recovery
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn pubky_data_snow_test_NN_responder_read_failure_no_state_advance() {
+async fn snow_test_NN_responder_read_failure_no_state_advance() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1348,7 +1353,7 @@ async fn pubky_data_snow_test_NN_responder_read_failure_no_state_advance() {
 /// across the longer XX action sequence.
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn pubky_data_snow_test_XX_responder_read_failure_no_state_advance() {
+async fn snow_test_XX_responder_read_failure_no_state_advance() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1432,7 +1437,7 @@ async fn pubky_data_snow_test_XX_responder_read_failure_no_state_advance() {
 /// 4. Restored Initiator re-does the write, handshake completes, transport works.
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn pubky_data_snow_test_NN_initiator_write_failure_and_replay_recovery() {
+async fn snow_test_NN_initiator_write_failure_and_replay_recovery() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1499,9 +1504,9 @@ async fn pubky_data_snow_test_NN_initiator_write_failure_and_replay_recovery() {
     // ── Phase 3: Recovery via "app restart" — restore from last_good_snapshot ──
 
     let pre_write_bytes = pre_write_snapshot.serialize();
-    let pre_write_state = PubkyDataSessionState::deserialize(&pre_write_bytes).unwrap();
+    let pre_write_state = PubkyNoiseSessionState::deserialize(&pre_write_bytes).unwrap();
 
-    let mut restored_initiator = PubkyDataEncryptor::restore(
+    let mut restored_initiator = PubkyNoiseEncryptor::restore(
         pair.initiator_config.clone(),
         pre_write_state,
         responder_public_key.clone(),
@@ -1567,7 +1572,7 @@ async fn pubky_data_snow_test_NN_initiator_write_failure_and_replay_recovery() {
 /// 4. Restored Initiator re-does the second write, handshake completes.
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery() {
+async fn snow_test_XX_initiator_write_failure_and_replay_recovery() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1634,9 +1639,9 @@ async fn pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery() {
     // ── Phase 4: Recovery via restore from last_good_snapshot ──
 
     let snapshot_bytes = pre_second_write_snapshot.serialize();
-    let snapshot_state = PubkyDataSessionState::deserialize(&snapshot_bytes).unwrap();
+    let snapshot_state = PubkyNoiseSessionState::deserialize(&snapshot_bytes).unwrap();
 
-    let mut restored_initiator = PubkyDataEncryptor::restore(
+    let mut restored_initiator = PubkyNoiseEncryptor::restore(
         pair.initiator_config.clone(),
         snapshot_state,
         responder_public_key.clone(),
@@ -1695,7 +1700,7 @@ async fn pubky_data_snow_test_XX_initiator_write_failure_and_replay_recovery() {
 /// - After each call, contains the state from *before* that call.
 /// - Updates on every subsequent call (tracks the latest pre-mutation state).
 #[tokio::test]
-async fn pubky_data_snow_test_last_good_snapshot_tracks_pre_mutation_state() {
+async fn snow_test_last_good_snapshot_tracks_pre_mutation_state() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1773,7 +1778,7 @@ async fn pubky_data_snow_test_last_good_snapshot_tracks_pre_mutation_state() {
 /// 5. Verify transport works after recovery.
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn pubky_data_snow_test_NN_initiator_put_failure_returns_error() {
+async fn snow_test_NN_initiator_put_failure_returns_error() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1788,7 +1793,7 @@ async fn pubky_data_snow_test_NN_initiator_put_failure_returns_error() {
 
     let result = pair.initiator.handle_handshake().await;
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), PubkyDataError::HomeserverWriteError);
+    assert_eq!(result.unwrap_err(), PubkyNoiseError::HomeserverWriteError);
 
     // ── Phase 2: Verify last_good_snapshot captured pre-mutation state ──
 
@@ -1801,9 +1806,9 @@ async fn pubky_data_snow_test_NN_initiator_put_failure_returns_error() {
     // ── Phase 3: Restore from snapshot (no write failure this time) ──
 
     let snapshot_bytes = pre_failure_snapshot.serialize();
-    let snapshot_state = PubkyDataSessionState::deserialize(&snapshot_bytes).unwrap();
+    let snapshot_state = PubkyNoiseSessionState::deserialize(&snapshot_bytes).unwrap();
 
-    let mut restored_initiator = PubkyDataEncryptor::restore(
+    let mut restored_initiator = PubkyNoiseEncryptor::restore(
         pair.initiator_config.clone(),
         snapshot_state,
         responder_public_key.clone(),
@@ -1864,7 +1869,7 @@ async fn pubky_data_snow_test_NN_initiator_put_failure_returns_error() {
 /// 4. Restore from last_good_snapshot, complete handshake, verify transport.
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn pubky_data_snow_test_XX_initiator_put_failure_returns_error() {
+async fn snow_test_XX_initiator_put_failure_returns_error() {
     let testnet = EphemeralTestnet::builder()
         .with_embedded_postgres()
         .build()
@@ -1890,7 +1895,7 @@ async fn pubky_data_snow_test_XX_initiator_put_failure_returns_error() {
     // Initiator StepTwo: [Read, Write] → reads slot 1 OK, but Write fails
     let result = pair.initiator.handle_handshake().await;
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), PubkyDataError::HomeserverWriteError);
+    assert_eq!(result.unwrap_err(), PubkyNoiseError::HomeserverWriteError);
 
     // ── Phase 3: Verify last_good_snapshot captured pre-StepTwo state ──
 
@@ -1902,9 +1907,9 @@ async fn pubky_data_snow_test_XX_initiator_put_failure_returns_error() {
     // ── Phase 4: Restore from snapshot ──
 
     let snapshot_bytes = pre_failure_snapshot.serialize();
-    let snapshot_state = PubkyDataSessionState::deserialize(&snapshot_bytes).unwrap();
+    let snapshot_state = PubkyNoiseSessionState::deserialize(&snapshot_bytes).unwrap();
 
-    let mut restored_initiator = PubkyDataEncryptor::restore(
+    let mut restored_initiator = PubkyNoiseEncryptor::restore(
         pair.initiator_config.clone(),
         snapshot_state,
         responder_public_key.clone(),
@@ -1915,7 +1920,10 @@ async fn pubky_data_snow_test_XX_initiator_put_failure_returns_error() {
     // Verify restored state
     let restored_snapshot = restored_initiator.snapshot();
     assert_eq!(restored_snapshot.counter, pre_failure_snapshot.counter);
-    assert_eq!(restored_snapshot.noise_step, pre_failure_snapshot.noise_step);
+    assert_eq!(
+        restored_snapshot.noise_step,
+        pre_failure_snapshot.noise_step
+    );
     assert_eq!(
         restored_snapshot.sub_step_index,
         pre_failure_snapshot.sub_step_index
