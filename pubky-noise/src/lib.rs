@@ -175,7 +175,7 @@ impl PubkyNoiseConfig {
             write_path,
             read_path,
             pubky_root_keypair,
-            pubky_noise_version: pubky_noise_version,
+            pubky_noise_version,
             default_pattern,
         }))
     }

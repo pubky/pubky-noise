@@ -318,7 +318,12 @@ async fn snow_test_responder_first() {
         "Hello World Pubky Noise",
     )
     .await;
-    send_and_verify(&mut pair.initiator, &mut pair.responder, "Pubky Noise Rocks").await;
+    send_and_verify(
+        &mut pair.initiator,
+        &mut pair.responder,
+        "Pubky Noise Rocks",
+    )
+    .await;
 }
 
 #[tokio::test]
