@@ -527,9 +527,14 @@ impl DataLinkContext {
     }
 
     pub fn delete(&mut self) {
-        //TODO: memorize the cryptographic state by forcing the flush of zeroized
-        // memory pages to disk.
+        //TODO: if possible, flush memory pages to disk
+        if self.local_static_seckey.is_some() {
+            self.local_static_seckey
+                .unwrap()
+                .copy_from_slice(&[0; 32][..]);
+        }
         self.local_static_seckey = None;
+        self.local_ephemeral_seckey.copy_from_slice(&[0; 32][..]);
     }
 
     pub fn is_handshake(&self) -> bool {
