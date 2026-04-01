@@ -1,12 +1,12 @@
 [package]
 name = "pubky-noise"
 description = "Fully-integrated Noise AE framework in pubky-sdk"
-version = "0.0.1"
+version = "0.1.0-rc1"
 edition = "2021"
 license = "MIT"
-repository = ""
+repository = "https://github.com/pubky/pubky-noise"
 keywords = ["pubky", "noise"]
-categories = ["authentication", "encryption"]
+categories = ["cryptography"]
 
 [features]
 test-utils = []
