@@ -411,10 +411,18 @@ impl PubkyNoiseEncryptor {
 
     /// Encrypt and send plaintext over the established transport.
     ///
+    /// The maximum payload size is [`PUBKY_NOISE_MSG_LEN`] bytes.
     /// Returns `true` on success, `false` on failure.
     pub async fn send_message(&mut self, plaintext: &[u8]) -> bool {
         // Phase guard: must be in transport mode
         if !self.context.is_transport() {
+            return false;
+        }
+
+        // Payload size guard: plaintext must fit within the message limit.
+        // The ciphertext buffer (PUBKY_NOISE_CIPHERTEXT_LEN) accounts for
+        // the AEAD tag, so plaintext up to PUBKY_NOISE_MSG_LEN is accepted.
+        if plaintext.len() > PUBKY_NOISE_MSG_LEN {
             return false;
         }
 
