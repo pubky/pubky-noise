@@ -65,6 +65,10 @@ pub enum PubkyNoiseError {
     RestoreHashMismatch,
     /// Restore failed: deserialization error.
     RestoreDeserializeError,
+    /// Transport-phase encryption (write_act) failed.
+    EncryptionError,
+    /// Transport-phase decryption (read_act) failed.
+    DecryptionError,
     OtherError,
 }
 
@@ -409,18 +413,22 @@ impl PubkyNoiseEncryptor {
 
     /// Encrypt and send plaintext over the established transport.
     ///
-    /// Returns `true` on success, `false` on failure.
-    pub async fn send_message(&mut self, plaintext: &[u8]) -> bool {
+    /// # Errors:
+    ///      - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
+    ///      - Returns [`PubkyNoiseError::EncryptionError`] if Noise encryption fails.
+    ///      - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
+    ///        write fails.
+    pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), PubkyNoiseError> {
         // Phase guard: must be in transport mode
         if !self.context.is_transport() {
-            return false;
+            return Err(PubkyNoiseError::IsHandshake);
         }
 
         let mut out = [0; PUBKY_NOISE_MSG_LEN];
-        let len = match self.context.write_act(plaintext, &mut out) {
-            Ok(len) => len,
-            Err(_) => return false,
-        };
+        let len = self
+            .context
+            .write_act(plaintext, &mut out)
+            .map_err(|_| PubkyNoiseError::EncryptionError)?;
 
         let packet = encode_packet(&out, len);
 
@@ -432,32 +440,37 @@ impl PubkyNoiseEncryptor {
         let path = self.config.write_path.as_str();
         let counter = self.context.get_counter();
         let formatted_path = format!("{path}/{counter}");
-        if self
-            .config
+        self.config
             .local_session
             .storage()
             .put(formatted_path, packet.to_vec())
             .await
-            .is_err()
-        {
-            return false;
-        }
+            .map_err(|_| PubkyNoiseError::HomeserverWriteError)?;
         // Advance the sending nonce only after the write is confirmed.
         // write_act() no longer increments the nonce internally, so that
         // a failed put() does not desynchronize the nonce with the receiver.
         self.context.increment_sending_nonce();
         self.context.increment_counter();
-        true
+        Ok(())
     }
 
     /// Receive and decrypt a message from the remote peer.
     ///
-    /// # Returns:
-    ///      - A vector of decrypted payloads (empty on failure).
-    pub async fn receive_message(&mut self) -> Vec<[u8; PUBKY_NOISE_MSG_LEN]> {
+    /// Returns `Ok` with an empty vector when no message is available yet
+    /// (normal polling behaviour).
+    ///
+    /// # Errors:
+    ///      - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
+    ///      - Returns [`PubkyNoiseError::HomeserverResponseError`] if the response body
+    ///        cannot be read.
+    ///      - Returns [`PubkyNoiseError::BadLengthCiphertext`] if the packet is malformed.
+    ///      - Returns [`PubkyNoiseError::DecryptionError`] if Noise decryption fails.
+    pub async fn receive_message(
+        &mut self,
+    ) -> Result<Vec<[u8; PUBKY_NOISE_MSG_LEN]>, PubkyNoiseError> {
         // Phase guard: must be in transport mode
         if !self.context.is_transport() {
-            return Vec::new();
+            return Err(PubkyNoiseError::IsHandshake);
         }
 
         let mut results = Vec::new();
@@ -473,23 +486,26 @@ impl PubkyNoiseEncryptor {
             .await
         {
             if response.status().is_success() {
-                if let Ok(ciphertext) = response.bytes().await {
-                    if let Ok((mut message, len)) = decode_packet(&ciphertext) {
-                        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+                let ciphertext = response
+                    .bytes()
+                    .await
+                    .map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
+                let (mut message, len) = decode_packet(&ciphertext)?;
+                let mut payload = [0; PUBKY_NOISE_MSG_LEN];
 
-                        #[cfg(feature = "test-utils")]
-                        if self.simulate_tampering {
-                            message[1] = 0xff;
-                        }
-
-                        let _ = self.context.read_act(&mut message, &mut payload, len);
-                        results.push(payload);
-                        self.context.increment_counter();
-                    }
+                #[cfg(feature = "test-utils")]
+                if self.simulate_tampering {
+                    message[1] = 0xff;
                 }
+
+                self.context
+                    .read_act(&mut message, &mut payload, len)
+                    .map_err(|_| PubkyNoiseError::DecryptionError)?;
+                results.push(payload);
+                self.context.increment_counter();
             }
         }
-        results
+        Ok(results)
     }
 
     /// Close and clean up this encryptor's Noise session.

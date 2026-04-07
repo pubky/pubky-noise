@@ -227,29 +227,27 @@ async fn send_and_verify(
     receiver: &mut PubkyNoiseEncryptor,
     message: &str,
 ) {
-    sender.send_message(message.as_bytes()).await;
-    let results = receiver.receive_message().await;
+    sender.send_message(message.as_bytes()).await.unwrap();
+    let results = receiver.receive_message().await.unwrap();
     assert!(!results.is_empty());
     let padded_msg = String::from_utf8(results[0].to_vec()).unwrap();
     let (msg, _) = padded_msg.split_at(message.len());
     assert_eq!(msg, message);
 }
 
-/// Send a message and verify the receiver gets tampered (non-UTF8) data.
+/// Send a message and verify the receiver gets a DecryptionError from tampering.
 async fn send_and_verify_tampered(
     sender: &mut PubkyNoiseEncryptor,
     receiver: &mut PubkyNoiseEncryptor,
     message: &str,
 ) {
     let raw_bytes = message.as_bytes();
-    sender.send_message(raw_bytes).await;
+    sender.send_message(raw_bytes).await.unwrap();
 
-    let results = receiver.receive_message().await;
-    assert!(!results.is_empty());
-    for ret in results {
-        let padded_msg = String::from_utf8(ret.to_vec());
-        assert!(padded_msg.is_err());
-    }
+    // Tampered ciphertext causes read_act to fail, surfaced as DecryptionError
+    let result = receiver.receive_message().await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), PubkyNoiseError::DecryptionError);
 
     let last_ciphertext = sender.test_last_ciphertext();
     if let Some(ct) = last_ciphertext {
@@ -1067,6 +1065,48 @@ async fn snow_test_XX_pattern_simple_incomplete_handshake() {
     assert!(pair.responder.transition_transport().is_err());
 }
 
+/// Calling send_message before transitioning to transport returns IsHandshake.
+#[tokio::test]
+async fn snow_test_send_message_before_transport_returns_error() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+
+    // Complete the handshake but do NOT call transition_transport.
+    let _ = pair.initiator.handle_handshake().await;
+    let _ = pair.responder.handle_handshake().await;
+    let _ = pair.initiator.handle_handshake().await;
+    assert!(pair.initiator.is_handshake_complete());
+
+    let result = pair.initiator.send_message(b"too early").await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), PubkyNoiseError::IsHandshake);
+}
+
+/// Calling receive_message before transitioning to transport returns IsHandshake.
+#[tokio::test]
+async fn snow_test_receive_message_before_transport_returns_error() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+
+    // Complete the handshake but do NOT call transition_transport.
+    let _ = pair.initiator.handle_handshake().await;
+    let _ = pair.responder.handle_handshake().await;
+    let _ = pair.initiator.handle_handshake().await;
+    assert!(pair.responder.is_handshake_complete());
+
+    let result = pair.responder.receive_message().await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), PubkyNoiseError::IsHandshake);
+}
+
 /// Test restore from transport state: complete handshake, exchange messages,
 /// snapshot, serialize/deserialize, restore, then continue exchanging messages.
 #[tokio::test]
@@ -1157,8 +1197,8 @@ async fn snow_test_restore_serialization_roundtrip() {
     // Exchange a few messages to advance nonces
     for i in 0..3 {
         let msg = format!("message_{i}");
-        assert!(pair.initiator.send_message(msg.as_bytes()).await);
-        let results = pair.responder.receive_message().await;
+        pair.initiator.send_message(msg.as_bytes()).await.unwrap();
+        let results = pair.responder.receive_message().await.unwrap();
         assert!(!results.is_empty());
     }
 
