@@ -1991,7 +1991,10 @@ async fn snow_test_message_payload_boundary_sizes() {
         "999-byte payload should succeed"
     );
     let results = pair.responder.receive_message().await;
-    assert!(!results.is_empty(), "Responder should receive the 999-byte message");
+    assert!(
+        !results.is_empty(),
+        "Responder should receive the 999-byte message"
+    );
     assert_eq!(
         &results[0][..PUBKY_NOISE_MSG_LEN - 1],
         &payload_under,
@@ -2005,7 +2008,10 @@ async fn snow_test_message_payload_boundary_sizes() {
         "1000-byte payload should succeed"
     );
     let results = pair.responder.receive_message().await;
-    assert!(!results.is_empty(), "Responder should receive the 1000-byte message");
+    assert!(
+        !results.is_empty(),
+        "Responder should receive the 1000-byte message"
+    );
     assert_eq!(
         &results[0][..],
         &payload_exact,
