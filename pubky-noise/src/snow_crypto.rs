@@ -531,11 +531,8 @@ impl DataLinkContext {
     }
 
     pub fn delete(&mut self) {
-        //TODO: if possible, flush memory pages to disk
-        if self.local_static_seckey.is_some() {
-            self.local_static_seckey
-                .unwrap()
-                .copy_from_slice(&[0; 32][..]);
+        if let Some(seckey) = &mut self.local_static_seckey {
+            seckey.as_mut_slice().copy_from_slice(&[0; 32][..]);
         }
         self.local_static_seckey = None;
         self.local_ephemeral_seckey.copy_from_slice(&[0; 32][..]);
