@@ -63,8 +63,8 @@ loop {
 let link_id = initiator.transition_transport().unwrap();
 
 // 5. Send and receive encrypted messages
-initiator.send_message(b"Hello, peer!").await;
-let messages = initiator.receive_message().await;
+initiator.send_message(b"Hello, peer!").await?;
+let messages = initiator.receive_message().await?;
 
 // 6. Clean up
 initiator.close();
@@ -376,7 +376,9 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 | `BadLengthCiphertext` | Received message exceeds max size | Discard message, check sender |
 | `HomeserverResponseError` | Failed to parse homeserver response | Retry |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
-| `IsHandshake` | Called `transition_transport()` too early | Wait for `is_handshake_complete()` |
+| `IsHandshake` | Called `transition_transport()`, `send_message()`, or `receive_message()` before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
+| `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
+| `DecryptionError` | Noise decryption failed during `receive_message()` | Message may be tampered or nonces desynchronized |
 | `RestoreReplayError` | Handshake replay failed during restore | Check that homeserver messages are intact |
 | `RestoreHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
 | `RestoreDeserializeError` | Snapshot deserialization failed | Check data integrity |
