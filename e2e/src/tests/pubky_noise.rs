@@ -6,10 +6,12 @@ use pubky_testnet::{
 };
 
 use pubky_noise::serializer::PubkyNoiseSessionState;
-use pubky_noise::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep, PUBKY_NOISE_MSG_LEN};
+use pubky_noise::snow_crypto::{
+    HandshakePattern, NoisePhase, NoiseStep, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
+};
 use pubky_noise::{HandshakeResult, PubkyNoiseConfig, PubkyNoiseEncryptor, PubkyNoiseError};
 
-fn cipher_check(plaintext: &[u8], ciphertext: &[u8; PUBKY_NOISE_MSG_LEN + 2]) {
+fn cipher_check(plaintext: &[u8], ciphertext: &[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]) {
     let plaintext_len = plaintext.len();
     let mut match_check = 0;
     for counter in 0..plaintext_len {
@@ -262,14 +264,14 @@ async fn send_and_verify_tampered(
 #[tokio::test]
 #[should_panic]
 async fn cipher_check_utility_positive() {
-    let plaintext = [b'A'; PUBKY_NOISE_MSG_LEN + 2];
+    let plaintext = [b'A'; PUBKY_NOISE_CIPHERTEXT_LEN + 2];
     let ciphertext = plaintext;
     cipher_check(&plaintext, &ciphertext);
 }
 
 #[tokio::test]
 async fn cipher_check_utility_negative() {
-    let plaintext = [b'A'; PUBKY_NOISE_MSG_LEN + 2];
+    let plaintext = [b'A'; PUBKY_NOISE_CIPHERTEXT_LEN + 2];
     let mut ciphertext = plaintext;
     ciphertext[0] = b'B';
     cipher_check(&plaintext, &ciphertext);
@@ -640,12 +642,12 @@ async fn snow_test_XX_pattern_simple() {
     let slot0_bytes = response.bytes().await.unwrap();
     assert_eq!(
         slot0_bytes.len(),
-        PUBKY_NOISE_MSG_LEN + 2,
-        "Stored data should be PUBKY_NOISE_MSG_LEN + 2 bytes"
+        PUBKY_NOISE_CIPHERTEXT_LEN + 2,
+        "Stored data should be PUBKY_NOISE_CIPHERTEXT_LEN + 2 bytes"
     );
     let len0 = u16::from_be_bytes([slot0_bytes[0], slot0_bytes[1]]) as usize;
     assert!(
-        len0 > 0 && len0 <= PUBKY_NOISE_MSG_LEN,
+        len0 > 0 && len0 <= PUBKY_NOISE_CIPHERTEXT_LEN,
         "Length prefix should be valid, got {len0}"
     );
 
@@ -657,10 +659,10 @@ async fn snow_test_XX_pattern_simple() {
         "Responder handshake msg 2 should exist at /pub/data/1"
     );
     let slot1_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot1_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
+    assert_eq!(slot1_bytes.len(), PUBKY_NOISE_CIPHERTEXT_LEN + 2);
     let len1 = u16::from_be_bytes([slot1_bytes[0], slot1_bytes[1]]) as usize;
     assert!(
-        len1 > 0 && len1 <= PUBKY_NOISE_MSG_LEN,
+        len1 > 0 && len1 <= PUBKY_NOISE_CIPHERTEXT_LEN,
         "Length prefix should be valid, got {len1}"
     );
 
@@ -672,10 +674,10 @@ async fn snow_test_XX_pattern_simple() {
         "Initiator handshake msg 3 should exist at /pub/data/2"
     );
     let slot2_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot2_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
+    assert_eq!(slot2_bytes.len(), PUBKY_NOISE_CIPHERTEXT_LEN + 2);
     let len2 = u16::from_be_bytes([slot2_bytes[0], slot2_bytes[1]]) as usize;
     assert!(
-        len2 > 0 && len2 <= PUBKY_NOISE_MSG_LEN,
+        len2 > 0 && len2 <= PUBKY_NOISE_CIPHERTEXT_LEN,
         "Length prefix should be valid, got {len2}"
     );
 
@@ -687,10 +689,10 @@ async fn snow_test_XX_pattern_simple() {
         "Transport message should exist at /pub/data/3"
     );
     let slot3_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot3_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
+    assert_eq!(slot3_bytes.len(), PUBKY_NOISE_CIPHERTEXT_LEN + 2);
     let len3 = u16::from_be_bytes([slot3_bytes[0], slot3_bytes[1]]) as usize;
     assert!(
-        len3 > 0 && len3 <= PUBKY_NOISE_MSG_LEN,
+        len3 > 0 && len3 <= PUBKY_NOISE_CIPHERTEXT_LEN,
         "Length prefix should be valid, got {len3}"
     );
     // Verify the stored data is actually encrypted (not plaintext)
@@ -900,12 +902,12 @@ async fn snow_test_XX_pattern_simple_out_of_order_handshake() {
     let slot0_bytes = response.bytes().await.unwrap();
     assert_eq!(
         slot0_bytes.len(),
-        PUBKY_NOISE_MSG_LEN + 2,
-        "Stored data should be PUBKY_NOISE_MSG_LEN + 2 bytes"
+        PUBKY_NOISE_CIPHERTEXT_LEN + 2,
+        "Stored data should be PUBKY_NOISE_CIPHERTEXT_LEN + 2 bytes"
     );
     let len0 = u16::from_be_bytes([slot0_bytes[0], slot0_bytes[1]]) as usize;
     assert!(
-        len0 > 0 && len0 <= PUBKY_NOISE_MSG_LEN,
+        len0 > 0 && len0 <= PUBKY_NOISE_CIPHERTEXT_LEN,
         "Length prefix should be valid, got {len0}"
     );
 
@@ -917,10 +919,10 @@ async fn snow_test_XX_pattern_simple_out_of_order_handshake() {
         "Responder handshake msg 2 should exist at /pub/data/1"
     );
     let slot1_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot1_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
+    assert_eq!(slot1_bytes.len(), PUBKY_NOISE_CIPHERTEXT_LEN + 2);
     let len1 = u16::from_be_bytes([slot1_bytes[0], slot1_bytes[1]]) as usize;
     assert!(
-        len1 > 0 && len1 <= PUBKY_NOISE_MSG_LEN,
+        len1 > 0 && len1 <= PUBKY_NOISE_CIPHERTEXT_LEN,
         "Length prefix should be valid, got {len1}"
     );
 
@@ -932,10 +934,10 @@ async fn snow_test_XX_pattern_simple_out_of_order_handshake() {
         "Initiator handshake msg 3 should exist at /pub/data/2"
     );
     let slot2_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot2_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
+    assert_eq!(slot2_bytes.len(), PUBKY_NOISE_CIPHERTEXT_LEN + 2);
     let len2 = u16::from_be_bytes([slot2_bytes[0], slot2_bytes[1]]) as usize;
     assert!(
-        len2 > 0 && len2 <= PUBKY_NOISE_MSG_LEN,
+        len2 > 0 && len2 <= PUBKY_NOISE_CIPHERTEXT_LEN,
         "Length prefix should be valid, got {len2}"
     );
 
@@ -947,10 +949,10 @@ async fn snow_test_XX_pattern_simple_out_of_order_handshake() {
         "Transport message should exist at /pub/data/3"
     );
     let slot3_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot3_bytes.len(), PUBKY_NOISE_MSG_LEN + 2);
+    assert_eq!(slot3_bytes.len(), PUBKY_NOISE_CIPHERTEXT_LEN + 2);
     let len3 = u16::from_be_bytes([slot3_bytes[0], slot3_bytes[1]]) as usize;
     assert!(
-        len3 > 0 && len3 <= PUBKY_NOISE_MSG_LEN,
+        len3 > 0 && len3 <= PUBKY_NOISE_CIPHERTEXT_LEN,
         "Length prefix should be valid, got {len3}"
     );
     // Verify the stored data is actually encrypted (not plaintext)
@@ -1961,4 +1963,65 @@ async fn snow_test_XX_initiator_put_failure_returns_error() {
         "XX_put_failure_reverse",
     )
     .await;
+}
+
+/// Test message payload sizes around the PUBKY_NOISE_MSG_LEN boundary.
+///
+/// The maximum plaintext payload is PUBKY_NOISE_MSG_LEN (1000) bytes.
+/// The ciphertext buffer is PUBKY_NOISE_CIPHERTEXT_LEN (1016) bytes,
+/// which accounts for the 16-byte ChaChaPoly AEAD tag.
+///
+/// - 999 bytes (MSG_LEN - 1): under the limit, should succeed
+/// - 1000 bytes (MSG_LEN):    exactly at the limit, should succeed
+/// - 1001 bytes (MSG_LEN + 1): over the limit, should fail
+#[tokio::test]
+async fn snow_test_message_payload_boundary_sizes() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+
+    // 999 bytes (PUBKY_NOISE_MSG_LEN - 1): under the limit — succeeds
+    let payload_under = [b'A'; PUBKY_NOISE_MSG_LEN - 1];
+    assert!(
+        pair.initiator.send_message(&payload_under).await,
+        "999-byte payload should succeed"
+    );
+    let results = pair.responder.receive_message().await;
+    assert!(
+        !results.is_empty(),
+        "Responder should receive the 999-byte message"
+    );
+    assert_eq!(
+        &results[0][..PUBKY_NOISE_MSG_LEN - 1],
+        &payload_under,
+        "Decrypted payload should match the original 999 bytes"
+    );
+
+    // 1000 bytes (PUBKY_NOISE_MSG_LEN): exactly at the limit — succeeds
+    let payload_exact = [b'B'; PUBKY_NOISE_MSG_LEN];
+    assert!(
+        pair.initiator.send_message(&payload_exact).await,
+        "1000-byte payload should succeed"
+    );
+    let results = pair.responder.receive_message().await;
+    assert!(
+        !results.is_empty(),
+        "Responder should receive the 1000-byte message"
+    );
+    assert_eq!(
+        &results[0][..],
+        &payload_exact,
+        "Decrypted payload should match the original 1000 bytes"
+    );
+
+    // 1001 bytes (PUBKY_NOISE_MSG_LEN + 1): over the limit — fails
+    let payload_over = [b'C'; PUBKY_NOISE_MSG_LEN + 1];
+    assert!(
+        !pair.initiator.send_message(&payload_over).await,
+        "1001-byte payload should fail (exceeds PUBKY_NOISE_MSG_LEN)"
+    );
 }
