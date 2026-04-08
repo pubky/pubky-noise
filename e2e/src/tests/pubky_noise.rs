@@ -2027,10 +2027,10 @@ async fn snow_test_message_payload_boundary_sizes() {
     // 999 bytes (PUBKY_NOISE_MSG_LEN - 1): under the limit — succeeds
     let payload_under = [b'A'; PUBKY_NOISE_MSG_LEN - 1];
     assert!(
-        pair.initiator.send_message(&payload_under).await,
+        pair.initiator.send_message(&payload_under).await.is_ok(),
         "999-byte payload should succeed"
     );
-    let results = pair.responder.receive_message().await;
+    let results = pair.responder.receive_message().await.unwrap();
     assert!(
         !results.is_empty(),
         "Responder should receive the 999-byte message"
@@ -2044,10 +2044,10 @@ async fn snow_test_message_payload_boundary_sizes() {
     // 1000 bytes (PUBKY_NOISE_MSG_LEN): exactly at the limit — succeeds
     let payload_exact = [b'B'; PUBKY_NOISE_MSG_LEN];
     assert!(
-        pair.initiator.send_message(&payload_exact).await,
+        pair.initiator.send_message(&payload_exact).await.is_ok(),
         "1000-byte payload should succeed"
     );
-    let results = pair.responder.receive_message().await;
+    let results = pair.responder.receive_message().await.unwrap();
     assert!(
         !results.is_empty(),
         "Responder should receive the 1000-byte message"
@@ -2060,8 +2060,11 @@ async fn snow_test_message_payload_boundary_sizes() {
 
     // 1001 bytes (PUBKY_NOISE_MSG_LEN + 1): over the limit — fails
     let payload_over = [b'C'; PUBKY_NOISE_MSG_LEN + 1];
-    assert!(
-        !pair.initiator.send_message(&payload_over).await,
-        "1001-byte payload should fail (exceeds PUBKY_NOISE_MSG_LEN)"
+    let result = pair.initiator.send_message(&payload_over).await;
+    assert!(result.is_err(), "1001-byte payload should fail");
+    assert_eq!(
+        result.unwrap_err(),
+        PubkyNoiseError::EncryptionError,
+        "1001-byte payload should fail with EncryptionError"
     );
 }
