@@ -13,7 +13,7 @@ use pubky::PubkySession;
 use serializer::PubkyNoiseSessionState;
 use snow_crypto::{
     full_handshake_actions, DataLinkContext, HandshakeAction, HandshakePattern, NoisePhase,
-    PUBKY_NOISE_MSG_LEN,
+    PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
 };
 
 /// A 32-byte identifier derived from the Noise handshake.
@@ -26,12 +26,14 @@ pub struct LinkId(pub [u8; 32]);
 /// Decode a length-prefixed packet into a message buffer and its length.
 ///
 /// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
-fn decode_packet(ciphertext: &[u8]) -> Result<([u8; PUBKY_NOISE_MSG_LEN], usize), PubkyNoiseError> {
-    if ciphertext.len() > PUBKY_NOISE_MSG_LEN + 2 {
+fn decode_packet(
+    ciphertext: &[u8],
+) -> Result<([u8; PUBKY_NOISE_CIPHERTEXT_LEN], usize), PubkyNoiseError> {
+    if ciphertext.len() > PUBKY_NOISE_CIPHERTEXT_LEN + 2 {
         return Err(PubkyNoiseError::BadLengthCiphertext);
     }
     let len = u16::from_be_bytes([ciphertext[0], ciphertext[1]]) as usize;
-    let mut message = [0u8; PUBKY_NOISE_MSG_LEN];
+    let mut message = [0u8; PUBKY_NOISE_CIPHERTEXT_LEN];
     message[..len].copy_from_slice(&ciphertext[2..len + 2]);
     Ok((message, len))
 }
@@ -39,8 +41,8 @@ fn decode_packet(ciphertext: &[u8]) -> Result<([u8; PUBKY_NOISE_MSG_LEN], usize)
 /// Encode a message into a length-prefixed packet.
 ///
 /// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
-fn encode_packet(data: &[u8], len: usize) -> [u8; PUBKY_NOISE_MSG_LEN + 2] {
-    let mut packet = [0u8; PUBKY_NOISE_MSG_LEN + 2];
+fn encode_packet(data: &[u8], len: usize) -> [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2] {
+    let mut packet = [0u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2];
     let be_bytes = (len as u16).to_be_bytes();
     packet[0..2].copy_from_slice(&be_bytes);
     packet[2..len + 2].copy_from_slice(&data[..len]);
@@ -208,7 +210,7 @@ pub struct PubkyNoiseEncryptor {
     #[cfg(feature = "test-utils")]
     simulate_write_failure: bool,
     #[cfg(feature = "test-utils")]
-    last_ciphertext: Option<[u8; PUBKY_NOISE_MSG_LEN + 2]>,
+    last_ciphertext: Option<[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]>,
 }
 
 impl PubkyNoiseEncryptor {
@@ -342,7 +344,7 @@ impl PubkyNoiseEncryptor {
                     }
                 }
                 HandshakeAction::Write => {
-                    let mut message = [0; PUBKY_NOISE_MSG_LEN];
+                    let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
                     if let Ok(len) = self.context.write_act(&[], &mut message) {
                         let path = self.config.write_path.as_str();
                         let counter = self.context.get_counter();
@@ -412,6 +414,7 @@ impl PubkyNoiseEncryptor {
     }
 
     /// Encrypt and send plaintext over the established transport.
+    /// The maximum payload size is [`PUBKY_NOISE_MSG_LEN`] bytes.
     ///
     /// # Errors:
     ///      - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
@@ -424,7 +427,7 @@ impl PubkyNoiseEncryptor {
             return Err(PubkyNoiseError::IsHandshake);
         }
 
-        let mut out = [0; PUBKY_NOISE_MSG_LEN];
+        let mut out = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
         let len = self
             .context
             .write_act(plaintext, &mut out)
@@ -648,7 +651,7 @@ impl PubkyNoiseEncryptor {
                     // we just call write_message with empty payload (same as original)
                     // and discard the output. The important thing is that Snow's
                     // internal state advances correctly.
-                    let mut message = [0; PUBKY_NOISE_MSG_LEN];
+                    let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
                     context
                         .write_act(&[], &mut message)
                         .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
@@ -782,7 +785,7 @@ impl PubkyNoiseEncryptor {
 
     /// Test-only: get the last ciphertext produced by send_message.
     #[cfg(feature = "test-utils")]
-    pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_NOISE_MSG_LEN + 2]> {
+    pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]> {
         self.last_ciphertext
     }
 }
