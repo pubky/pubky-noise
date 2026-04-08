@@ -3648,7 +3648,7 @@ dependencies = [
 
 [[package]]
 name = "pubky-noise"
-version = "0.1.0-rc1"
+version = "0.1.0-rc2"
 dependencies = [
  "curve25519-dalek 5.0.0-pre.5",
  "ed25519-dalek",
