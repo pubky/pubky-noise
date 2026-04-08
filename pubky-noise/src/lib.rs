@@ -501,6 +501,7 @@ impl PubkyNoiseEncryptor {
                     message[1] = 0xff;
                 }
 
+                // the read_act() is checking the authenticity of the 16-byte message tag
                 self.context
                     .read_act(&mut message, &mut payload, len)
                     .map_err(|_| PubkyNoiseError::DecryptionError)?;
