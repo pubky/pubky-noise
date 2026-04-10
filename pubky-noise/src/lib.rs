@@ -7,6 +7,7 @@ pub mod snow_crypto_resolver;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use pubky::errors::RequestError;
 use pubky::prelude::*;
 use pubky::PubkySession;
 
@@ -464,6 +465,8 @@ impl PubkyNoiseEncryptor {
     ///
     /// # Errors:
     ///      - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
+    ///      - Returns [`PubkyNoiseError::HomeserverReadError`] if the homeserver read
+    ///        fails with a non-404 error (network failure, 5xx, 403, etc.).
     ///      - Returns [`PubkyNoiseError::HomeserverResponseError`] if the response body
     ///        cannot be read.
     ///      - Returns [`PubkyNoiseError::BadLengthCiphertext`] if the packet is malformed.
@@ -481,14 +484,15 @@ impl PubkyNoiseEncryptor {
         let counter = self.context.get_counter();
         let public_key = self.context.get_endpoint();
         let formatted_path = format!("{public_key}/{path}/{counter}");
-        if let Ok(response) = self
+        match self
             .config
             .outbox_client
             .public_storage()
             .get(formatted_path)
             .await
         {
-            if response.status().is_success() {
+            Ok(response) => {
+                // pubky's get() only returns Ok for 2xx responses.
                 let ciphertext = response
                     .bytes()
                     .await
@@ -507,6 +511,13 @@ impl PubkyNoiseEncryptor {
                     .map_err(|_| PubkyNoiseError::DecryptionError)?;
                 results.push(payload);
                 self.context.increment_counter();
+            }
+            // 404 = no message available yet (normal polling behaviour)
+            Err(Error::Request(RequestError::Server { status, .. }))
+                if status == StatusCode::NOT_FOUND => {}
+            // Any other error (network, 5xx, 403, etc.) is surfaced.
+            Err(_) => {
+                return Err(PubkyNoiseError::HomeserverResponseError);
             }
         }
         Ok(results)
