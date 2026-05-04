@@ -88,3 +88,13 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: E2E tests
         run: cargo nextest run -p e2e
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - name: Check MSRV compatibility
+        run: cargo check --locked --workspace --all-features

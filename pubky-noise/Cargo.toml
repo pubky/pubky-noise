@@ -3,6 +3,7 @@ name = "pubky-noise"
 description = "Fully-integrated Noise AE framework in pubky-sdk"
 version = "0.1.0-rc3"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/pubky/pubky-noise"
 keywords = ["pubky", "noise"]
