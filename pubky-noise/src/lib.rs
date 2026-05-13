@@ -11,7 +11,7 @@ use pubky::errors::RequestError;
 use pubky::prelude::*;
 use pubky::PubkySession;
 
-use serializer::PubkyNoiseSessionState;
+use serializer::{PubkyNoiseSessionState, SESSION_STATE_VERSION};
 use snow_crypto::{
     full_handshake_actions, DataLinkContext, HandshakeAction, HandshakePattern, NoisePhase,
     PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
@@ -72,6 +72,8 @@ pub enum PubkyNoiseError {
     EncryptionError,
     /// Transport-phase decryption (read_act) failed.
     DecryptionError,
+    /// Message slot counter or transport nonce space is exhausted.
+    CounterOverflow,
     OtherError,
 }
 
@@ -117,16 +119,16 @@ impl PubkyNoiseConfig {
     /// [`PubkyNoiseConfig::new_with_paths`] instead.
     ///
     /// # Parameters:
-    ///      - `pubky_root_seckey`: A 32-byte root secret key.
-    ///      - `pubky_noise_version`: Protocol version identifier.
-    ///      - `pattern_string`: Default Noise pattern (e.g. "NN", "XX").
-    ///      - `homeserver_auth_session`: An authenticated PubkySession.
-    ///      - `destination_path`: Custom destination prefix for message sharing
-    ///        (used for both reads and writes).
-    ///      - `outbox_client`: HTTP Pubky client.
+    /// - `pubky_root_seckey`: A 32-byte root secret key.
+    /// - `pubky_noise_version`: Protocol version identifier.
+    /// - `pattern_string`: Default Noise pattern (e.g. "NN", "XX").
+    /// - `homeserver_auth_session`: An authenticated PubkySession.
+    /// - `destination_path`: Custom destination prefix for message sharing
+    ///   (used for both reads and writes).
+    /// - `outbox_client`: HTTP Pubky client.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyNoiseError::UnknownNoisePattern`] if the pattern string is invalid.
+    /// - Returns [`PubkyNoiseError::UnknownNoisePattern`] if the pattern string is invalid.
     pub fn new(
         pubky_root_seckey: [u8; 32],
         pubky_noise_version: u32,
@@ -153,16 +155,16 @@ impl PubkyNoiseConfig {
     /// [`path_derivation::derive_asymmetric_paths`] for per-peer-pair privacy).
     ///
     /// # Parameters:
-    ///      - `pubky_root_seckey`: A 32-byte root secret key.
-    ///      - `pubky_noise_version`: Protocol version identifier.
-    ///      - `pattern_string`: Default Noise pattern (e.g. "NN", "XX").
-    ///      - `homeserver_auth_session`: An authenticated PubkySession.
-    ///      - `write_path`: Folder prefix for writing messages to the local homeserver.
-    ///      - `read_path`: Folder prefix for reading messages from the remote homeserver.
-    ///      - `outbox_client`: HTTP Pubky client.
+    /// - `pubky_root_seckey`: A 32-byte root secret key.
+    /// - `pubky_noise_version`: Protocol version identifier.
+    /// - `pattern_string`: Default Noise pattern (e.g. "NN", "XX").
+    /// - `homeserver_auth_session`: An authenticated PubkySession.
+    /// - `write_path`: Folder prefix for writing messages to the local homeserver.
+    /// - `read_path`: Folder prefix for reading messages from the remote homeserver.
+    /// - `outbox_client`: HTTP Pubky client.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyNoiseError::UnknownNoisePattern`] if the pattern string is invalid.
+    /// - Returns [`PubkyNoiseError::UnknownNoisePattern`] if the pattern string is invalid.
     pub fn new_with_paths(
         pubky_root_seckey: [u8; 32],
         pubky_noise_version: u32,
@@ -218,13 +220,13 @@ impl PubkyNoiseEncryptor {
     /// Create a new single-session Noise encryptor.
     ///
     /// # Parameters:
-    ///      - `config`: Shared configuration (wrapped in Arc).
-    ///      - `holder_skey`: Local static secret key for this session.
-    ///      - `initiator`: Whether this side initiates the Noise handshake.
-    ///      - `endpoint_pubkey`: Remote peer's public key used as path suffix.
+    /// - `config`: Shared configuration (wrapped in Arc).
+    /// - `holder_skey`: Local static secret key for this session.
+    /// - `initiator`: Whether this side initiates the Noise handshake.
+    /// - `endpoint_pubkey`: Remote peer's public key used as path suffix.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
+    /// - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
     pub fn new(
         config: Arc<PubkyNoiseConfig>,
         mut holder_skey: [u8; 32],
@@ -302,11 +304,12 @@ impl PubkyNoiseEncryptor {
     ///   method.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyNoiseError::BadLengthCiphertext`] on malformed messages.
-    ///      - Returns [`PubkyNoiseError::HomeserverResponseError`] on response parse failure.
-    ///      - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
-    ///        write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
-    ///        and [`restore()`](Self::restore) is required.
+    /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] on malformed messages.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on response parse failure.
+    /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
+    ///   write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
+    ///   and [`restore()`](Self::restore) is required.
+    /// - Returns [`PubkyNoiseError::CounterOverflow`] if handshake slot space is exhausted.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyNoiseError> {
         // Capture pre-mutation snapshot so callers can recover from write failures.
         self.last_good_snapshot = Some(self.snapshot());
@@ -315,6 +318,9 @@ impl PubkyNoiseEncryptor {
         for action in remaining_actions {
             match action {
                 HandshakeAction::Read => {
+                    self.context
+                        .ensure_can_increment_counter()
+                        .map_err(|_| PubkyNoiseError::CounterOverflow)?;
                     let path = self.config.read_path.as_str();
                     let counter = self.context.get_counter();
                     let public_key = &self.endpoint_pubkey;
@@ -335,7 +341,9 @@ impl PubkyNoiseEncryptor {
                             } else {
                                 return Err(PubkyNoiseError::HomeserverResponseError);
                             }
-                            self.context.increment_counter();
+                            self.context
+                                .increment_counter()
+                                .map_err(|_| PubkyNoiseError::CounterOverflow)?;
                             self.context.advance_sub_step();
                         } else {
                             return Ok(HandshakeResult::Pending);
@@ -345,6 +353,9 @@ impl PubkyNoiseEncryptor {
                     }
                 }
                 HandshakeAction::Write => {
+                    self.context
+                        .ensure_can_increment_counter()
+                        .map_err(|_| PubkyNoiseError::CounterOverflow)?;
                     let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
                     if let Ok(len) = self.context.write_act(&[], &mut message) {
                         let path = self.config.write_path.as_str();
@@ -378,7 +389,9 @@ impl PubkyNoiseEncryptor {
                             // last_good_snapshot() + restore().
                             return Err(PubkyNoiseError::HomeserverWriteError);
                         }
-                        self.context.increment_counter();
+                        self.context
+                            .increment_counter()
+                            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
                         self.context.advance_sub_step();
                     }
                 }
@@ -403,7 +416,7 @@ impl PubkyNoiseEncryptor {
     /// Returns the `LinkId` derived from the handshake transcript hash.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyNoiseError::IsHandshake`] if still in handshake phase.
+    /// - Returns [`PubkyNoiseError::IsHandshake`] if still in handshake phase.
     pub fn transition_transport(&mut self) -> Result<LinkId, PubkyNoiseError> {
         if self.context.is_handshake() {
             return Err(PubkyNoiseError::IsHandshake);
@@ -418,15 +431,25 @@ impl PubkyNoiseEncryptor {
     /// The maximum payload size is [`PUBKY_NOISE_MSG_LEN`] bytes.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
-    ///      - Returns [`PubkyNoiseError::EncryptionError`] if Noise encryption fails.
-    ///      - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
-    ///        write fails.
+    /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
+    /// - Returns [`PubkyNoiseError::EncryptionError`] if Noise encryption fails.
+    /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
+    ///   write fails.
+    /// - Returns [`PubkyNoiseError::CounterOverflow`] if the outbound transport
+    ///   slot or sending nonce space is exhausted.
     pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), PubkyNoiseError> {
         // Phase guard: must be in transport mode
         if !self.context.is_transport() {
             return Err(PubkyNoiseError::IsHandshake);
         }
+
+        self.context
+            .ensure_can_advance_write_slot()
+            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+        let counter = self
+            .context
+            .get_write_slot()
+            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
 
         let mut out = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
         let len = self
@@ -442,7 +465,6 @@ impl PubkyNoiseEncryptor {
         }
 
         let path = self.config.write_path.as_str();
-        let counter = self.context.get_counter();
         let formatted_path = format!("{path}/{counter}");
         self.config
             .local_session
@@ -453,8 +475,9 @@ impl PubkyNoiseEncryptor {
         // Advance the sending nonce only after the write is confirmed.
         // write_act() no longer increments the nonce internally, so that
         // a failed put() does not desynchronize the nonce with the receiver.
-        self.context.increment_sending_nonce();
-        self.context.increment_counter();
+        self.context
+            .increment_sending_nonce()
+            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
         Ok(())
     }
 
@@ -464,13 +487,14 @@ impl PubkyNoiseEncryptor {
     /// (normal polling behaviour).
     ///
     /// # Errors:
-    ///      - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
-    ///      - Returns [`PubkyNoiseError::HomeserverReadError`] if the homeserver read
-    ///        fails with a non-404 error (network failure, 5xx, 403, etc.).
-    ///      - Returns [`PubkyNoiseError::HomeserverResponseError`] if the response body
-    ///        cannot be read.
-    ///      - Returns [`PubkyNoiseError::BadLengthCiphertext`] if the packet is malformed.
-    ///      - Returns [`PubkyNoiseError::DecryptionError`] if Noise decryption fails.
+    /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the homeserver read
+    ///   fails with a non-404 error (network failure, 5xx, 403, etc.) or if the
+    ///   response body cannot be read.
+    /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] if the packet is malformed.
+    /// - Returns [`PubkyNoiseError::DecryptionError`] if Noise decryption fails.
+    /// - Returns [`PubkyNoiseError::CounterOverflow`] if the inbound transport
+    ///   slot or receiving nonce space is exhausted.
     pub async fn receive_message(
         &mut self,
     ) -> Result<Vec<[u8; PUBKY_NOISE_MSG_LEN]>, PubkyNoiseError> {
@@ -479,9 +503,16 @@ impl PubkyNoiseEncryptor {
             return Err(PubkyNoiseError::IsHandshake);
         }
 
+        self.context
+            .ensure_can_advance_read_slot()
+            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+        let counter = self
+            .context
+            .get_read_slot()
+            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+
         let mut results = Vec::new();
         let path = self.config.read_path.as_str();
-        let counter = self.context.get_counter();
         let public_key = self.context.get_endpoint();
         let formatted_path = format!("{public_key}/{path}/{counter}");
         match self
@@ -510,7 +541,6 @@ impl PubkyNoiseEncryptor {
                     .read_act(&mut message, &mut payload, len)
                     .map_err(|_| PubkyNoiseError::DecryptionError)?;
                 results.push(payload);
-                self.context.increment_counter();
             }
             // 404 = no message available yet (normal polling behaviour)
             Err(Error::Request(RequestError::Server { status, .. }))
@@ -548,7 +578,7 @@ impl PubkyNoiseEncryptor {
         let handshake_hash = self.context.get_handshake_hash();
 
         PubkyNoiseSessionState {
-            version: 1,
+            version: SESSION_STATE_VERSION,
             phase,
             pattern: self.context.get_pattern(),
             initiator: self.context.is_initiator(),
@@ -591,14 +621,14 @@ impl PubkyNoiseEncryptor {
     /// 5. For handshake restore: stops at the saved step position
     ///
     /// # Parameters:
-    ///      - `config`: Shared configuration (must match the original session).
-    ///      - `state`: The saved session state snapshot.
+    /// - `config`: Shared configuration (must match the original session).
+    /// - `state`: The saved session state snapshot.
     ///
     /// # Errors:
-    ///      - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
-    ///      - Returns [`PubkyNoiseError::RestoreReplayError`] if handshake replay fails.
-    ///      - Returns [`PubkyNoiseError::RestoreHashMismatch`] if the replayed handshake
-    ///        produces a different hash than the saved one.
+    /// - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
+    /// - Returns [`PubkyNoiseError::RestoreReplayError`] if handshake replay fails.
+    /// - Returns [`PubkyNoiseError::RestoreHashMismatch`] if the replayed handshake
+    ///   produces a different hash than the saved one.
     pub async fn restore(
         config: Arc<PubkyNoiseConfig>,
         state: PubkyNoiseSessionState,
@@ -730,7 +760,8 @@ impl PubkyNoiseEncryptor {
             context.set_sending_nonce(state.sending_nonce);
             context.set_receiving_nonce(state.receiving_nonce);
 
-            // Set counter to saved value (includes handshake + transport messages)
+            // Set the transport base slot. Directional slots are derived from
+            // this base plus the saved send/receive nonces.
             context.set_counter(state.counter);
 
             Some(LinkId(state.link_id.unwrap_or(hash)))

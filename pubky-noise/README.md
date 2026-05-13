@@ -77,13 +77,17 @@ initiator.close();
 Each peer writes to their **own** homeserver and reads from the **remote** peer's homeserver:
 
 ```text
-Alice's Homeserver          Bob's Homeserver
-  /pub/data/0  <-- Alice writes    /pub/data/1  <-- Bob writes
-  /pub/data/2  <-- Alice writes    Bob reads from Alice's homeserver
-  Alice reads from Bob's homeserver
+Alice's Homeserver                 Bob's Homeserver
+  alice.write_path/{n}               bob.write_path/{m}
+    ^ Alice writes                     ^ Bob writes
+    | Bob reads via bob.read_path      | Alice reads via alice.read_path
 ```
 
-Messages are stored at incrementing slot indices (`/path/{counter}`). The counter advances after each successful read or write.
+Messages are stored at incrementing slot indices under each direction's path.
+During the handshake, reads and writes follow the Noise pattern's ordered action
+sequence and share one slot counter. After `transition_transport()`, that counter
+becomes the transport base slot, and each direction derives its effective slot as
+`base counter + sending_nonce` or `base counter + receiving_nonce`.
 
 ### Wire Format
 
@@ -217,7 +221,7 @@ Sessions can be snapshotted, serialized, and restored to recover from crashes or
 | 4-35 | 32 | ephemeral secret key |
 | 36 | 1 | has static secret flag |
 | 37-68 | 32 | static secret key |
-| 69-72 | 4 | counter (u32 big-endian) |
+| 69-72 | 4 | handshake/base counter (u32 big-endian) |
 | 73 | 1 | noise step |
 | 74 | 1 | sub-step index |
 | 75 | 1 | has handshake hash flag |
@@ -379,6 +383,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 | `IsHandshake` | Called `transition_transport()`, `send_message()`, or `receive_message()` before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
 | `DecryptionError` | Noise decryption failed during `receive_message()` | Message may be tampered or nonces desynchronized |
+| `CounterOverflow` | Message slot counter or transport nonce space is exhausted | Start a new Noise session |
 | `RestoreReplayError` | Handshake replay failed during restore | Check that homeserver messages are intact |
 | `RestoreHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
 | `RestoreDeserializeError` | Snapshot deserialization failed | Check data integrity |

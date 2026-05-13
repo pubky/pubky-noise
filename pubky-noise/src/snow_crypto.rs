@@ -321,8 +321,8 @@ fn resolve_pattern(
 /// given the pattern and role (initiator/respnder). Used by the replay logic
 /// to know which operations to perform when re-feeding persisted messages.
 /// # Parameters:
-///      - `pattern`: a handshake pattern
-///      - `initiator`: boolean parameter which indicates who is initiator and who is responder
+/// - `pattern`: a handshake pattern
+/// - `initiator`: boolean parameter which indicates who is initiator and who is responder
 pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec<HandshakeAction> {
     let mut actions = Vec::new();
     let steps = [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final];
@@ -347,6 +347,23 @@ pub enum ContextError {
     InternalSnowTransitionErr,
     InternalSnowWriteErr,
     InternalSnowReadErr,
+    CounterOverflow,
+}
+
+fn ensure_counter_can_increment(counter: u32) -> Result<(), ContextError> {
+    if counter == u32::MAX {
+        Err(ContextError::CounterOverflow)
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_nonce_can_increment(nonce: u64) -> Result<(), ContextError> {
+    if nonce == u64::MAX {
+        Err(ContextError::CounterOverflow)
+    } else {
+        Ok(())
+    }
 }
 
 /// A Noise state machine
@@ -525,9 +542,39 @@ impl DataLinkContext {
         self.counter
     }
 
-    //TODO: counter overflow
-    pub fn increment_counter(&mut self) {
-        self.counter += 1;
+    pub fn ensure_can_increment_counter(&self) -> Result<(), ContextError> {
+        ensure_counter_can_increment(self.counter)
+    }
+
+    pub fn increment_counter(&mut self) -> Result<(), ContextError> {
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .ok_or(ContextError::CounterOverflow)?;
+        Ok(())
+    }
+
+    fn transport_counter(&self, nonce: u64) -> Result<u32, ContextError> {
+        let nonce = u32::try_from(nonce).map_err(|_| ContextError::CounterOverflow)?;
+        self.counter
+            .checked_add(nonce)
+            .ok_or(ContextError::CounterOverflow)
+    }
+
+    pub fn get_write_slot(&self) -> Result<u32, ContextError> {
+        self.transport_counter(self.sending_nonce)
+    }
+
+    pub fn get_read_slot(&self) -> Result<u32, ContextError> {
+        self.transport_counter(self.receiving_nonce)
+    }
+
+    pub fn ensure_can_advance_write_slot(&self) -> Result<(), ContextError> {
+        ensure_counter_can_increment(self.get_write_slot()?)
+    }
+
+    pub fn ensure_can_advance_read_slot(&self) -> Result<(), ContextError> {
+        ensure_counter_can_increment(self.get_read_slot()?)
     }
 
     pub fn delete(&mut self) {
@@ -646,12 +693,16 @@ impl DataLinkContext {
                 Ok(())
             }
             NoisePhase::Transport => {
+                ensure_nonce_can_increment(self.receiving_nonce)?;
                 self.noise_transport
                     .as_ref()
                     .unwrap()
                     .read_message(self.receiving_nonce, &message[..index], payload)
                     .map_err(|_| ContextError::InternalSnowReadErr)?;
-                self.receiving_nonce += 1;
+                self.receiving_nonce = self
+                    .receiving_nonce
+                    .checked_add(1)
+                    .ok_or(ContextError::CounterOverflow)?;
                 Ok(())
             }
         }
@@ -724,8 +775,12 @@ impl DataLinkContext {
     /// Call this **after** confirming the encrypted message was successfully
     /// written to the homeserver. This ensures the nonce stays in sync with
     /// what the receiver expects, even if a write fails.
-    pub fn increment_sending_nonce(&mut self) {
-        self.sending_nonce += 1;
+    pub fn increment_sending_nonce(&mut self) -> Result<(), ContextError> {
+        self.sending_nonce = self
+            .sending_nonce
+            .checked_add(1)
+            .ok_or(ContextError::CounterOverflow)?;
+        Ok(())
     }
 
     /// Set the sending nonce (used during restore after transport transition).

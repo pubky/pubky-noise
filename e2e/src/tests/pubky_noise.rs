@@ -237,6 +237,12 @@ async fn send_and_verify(
     assert_eq!(msg, message);
 }
 
+/// Verify the first received payload starts with the expected message bytes.
+fn assert_received_message(results: &[[u8; PUBKY_NOISE_MSG_LEN]], expected: &[u8]) {
+    assert!(!results.is_empty());
+    assert_eq!(&results[0][..expected.len()], expected);
+}
+
 /// Send a message and verify the receiver gets a DecryptionError from tampering.
 async fn send_and_verify_tampered(
     sender: &mut PubkyNoiseEncryptor,
@@ -324,6 +330,81 @@ async fn snow_test_responder_first() {
         "Pubky Noise Rocks",
     )
     .await;
+}
+
+#[tokio::test]
+async fn snow_test_transport_allows_simultaneous_first_sends() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+
+    let alice_message = b"Alice first transport message";
+    let bob_message = b"Bob first transport message";
+
+    pair.initiator.send_message(alice_message).await.unwrap();
+    pair.responder.send_message(bob_message).await.unwrap();
+
+    let alice_results = pair.initiator.receive_message().await.unwrap();
+    let bob_results = pair.responder.receive_message().await.unwrap();
+
+    assert_received_message(&alice_results, bob_message);
+    assert_received_message(&bob_results, alice_message);
+}
+
+#[tokio::test]
+async fn snow_test_xx_transport_allows_simultaneous_first_sends() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+
+    let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
+    complete_xx_handshake(&mut pair).await;
+
+    let alice_message = b"Alice XX first transport message";
+    let bob_message = b"Bob XX first transport message";
+
+    pair.initiator.send_message(alice_message).await.unwrap();
+    pair.responder.send_message(bob_message).await.unwrap();
+
+    let alice_results = pair.initiator.receive_message().await.unwrap();
+    let bob_results = pair.responder.receive_message().await.unwrap();
+
+    assert_received_message(&alice_results, bob_message);
+    assert_received_message(&bob_results, alice_message);
+}
+
+#[tokio::test]
+async fn snow_test_xx_transport_allows_receive_before_simultaneous_first_sends() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+
+    let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
+    complete_xx_handshake(&mut pair).await;
+
+    assert!(pair.initiator.receive_message().await.unwrap().is_empty());
+    assert!(pair.responder.receive_message().await.unwrap().is_empty());
+
+    let alice_message = b"Alice XX after empty receive";
+    let bob_message = b"Bob XX after empty receive";
+
+    pair.initiator.send_message(alice_message).await.unwrap();
+    pair.responder.send_message(bob_message).await.unwrap();
+
+    let alice_results = pair.initiator.receive_message().await.unwrap();
+    let bob_results = pair.responder.receive_message().await.unwrap();
+
+    assert_received_message(&alice_results, bob_message);
+    assert_received_message(&bob_results, alice_message);
 }
 
 #[tokio::test]
