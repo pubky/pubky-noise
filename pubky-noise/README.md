@@ -86,8 +86,9 @@ Alice's Homeserver                 Bob's Homeserver
 Messages are stored at incrementing slot indices under each direction's path.
 During the handshake, reads and writes follow the Noise pattern's ordered action
 sequence and share one slot counter. After `transition_transport()`, that counter
-becomes the transport base slot, and each direction derives its effective slot as
-`base counter + sending_nonce` or `base counter + receiving_nonce`.
+becomes the transport base slot, and each direction advances its own homeserver
+slot counter independently. Snow's transport nonces are tracked separately from
+homeserver slot selection.
 
 ### Wire Format
 
@@ -126,7 +127,7 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 
 - **`LinkId`** -- A 32-byte identifier derived from the Noise handshake transcript hash. Changes after every handshake when ephemeral keys are used. Available after calling `transition_transport()`.
 
-- **`PubkyNoiseSessionState`** -- Serializable snapshot of a session (189 bytes). Contains everything needed to restore a session by replaying persisted handshake messages through a fresh Noise state.
+- **`PubkyNoiseSessionState`** -- Serializable snapshot of a session (197 bytes). Contains everything needed to restore a session by replaying persisted handshake messages through a fresh Noise state.
 
 - **`DataLinkContext`** -- Internal Noise state machine managing the handshake and transport phases. Not used directly by consumers.
 
@@ -210,7 +211,7 @@ Sessions can be snapshotted, serialized, and restored to recover from crashes or
 
 ### Snapshot Format
 
-`PubkyNoiseSessionState` serializes to a compact 189-byte binary format:
+`PubkyNoiseSessionState` serializes to a compact 197-byte binary format:
 
 | Offset | Size | Field |
 |---|---|---|
@@ -230,7 +231,9 @@ Sessions can be snapshotted, serialized, and restored to recover from crashes or
 | 109-140 | 32 | link ID |
 | 141-148 | 8 | sending nonce (u64 big-endian) |
 | 149-156 | 8 | receiving nonce (u64 big-endian) |
-| 157-188 | 32 | endpoint public key |
+| 157-160 | 4 | write counter (u32 big-endian) |
+| 161-164 | 4 | read counter (u32 big-endian) |
+| 165-196 | 32 | endpoint public key |
 
 ### Recovery Flow
 
@@ -383,7 +386,8 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 | `IsHandshake` | Called `transition_transport()`, `send_message()`, or `receive_message()` before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
 | `DecryptionError` | Noise decryption failed during `receive_message()` | Message may be tampered or nonces desynchronized |
-| `CounterOverflow` | Message slot counter or transport nonce space is exhausted | Start a new Noise session |
+| `CounterOverflow` | Message slot counter space is exhausted | Start a new Noise session |
+| `NonceOverflow` | Transport nonce space is exhausted | Start a new Noise session |
 | `RestoreReplayError` | Handshake replay failed during restore | Check that homeserver messages are intact |
 | `RestoreHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
 | `RestoreDeserializeError` | Snapshot deserialization failed | Check data integrity |

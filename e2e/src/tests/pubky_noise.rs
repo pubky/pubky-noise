@@ -1219,8 +1219,8 @@ async fn snow_test_restore() {
     // Serialize and deserialize (round-trip test)
     let initiator_bytes = initiator_snapshot.serialize();
     let responder_bytes = responder_snapshot.serialize();
-    assert_eq!(initiator_bytes.len(), 189);
-    assert_eq!(responder_bytes.len(), 189);
+    assert_eq!(initiator_bytes.len(), 197);
+    assert_eq!(responder_bytes.len(), 197);
 
     let initiator_state = PubkyNoiseSessionState::deserialize(&initiator_bytes).unwrap();
     let responder_state = PubkyNoiseSessionState::deserialize(&responder_bytes).unwrap();
@@ -1298,6 +1298,8 @@ async fn snow_test_restore_serialization_roundtrip() {
     assert_eq!(restored.counter, snapshot.counter);
     assert_eq!(restored.sending_nonce, snapshot.sending_nonce);
     assert_eq!(restored.receiving_nonce, snapshot.receiving_nonce);
+    assert_eq!(restored.write_counter, snapshot.write_counter);
+    assert_eq!(restored.read_counter, snapshot.read_counter);
     assert_eq!(restored.endpoint_pubkey, snapshot.endpoint_pubkey);
     assert_eq!(restored.handshake_hash, snapshot.handshake_hash);
     assert_eq!(restored.link_id, snapshot.link_id);

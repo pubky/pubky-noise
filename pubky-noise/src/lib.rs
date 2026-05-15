@@ -13,8 +13,8 @@ use pubky::PubkySession;
 
 use serializer::{PubkyNoiseSessionState, SESSION_STATE_VERSION};
 use snow_crypto::{
-    full_handshake_actions, DataLinkContext, HandshakeAction, HandshakePattern, NoisePhase,
-    PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
+    full_handshake_actions, ContextError, DataLinkContext, HandshakeAction, HandshakePattern,
+    NoisePhase, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
 };
 
 /// A 32-byte identifier derived from the Noise handshake.
@@ -50,6 +50,14 @@ fn encode_packet(data: &[u8], len: usize) -> [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2
     packet
 }
 
+fn map_context_overflow(err: ContextError) -> PubkyNoiseError {
+    match err {
+        ContextError::CounterOverflow => PubkyNoiseError::CounterOverflow,
+        ContextError::NonceOverflow => PubkyNoiseError::NonceOverflow,
+        _ => PubkyNoiseError::OtherError,
+    }
+}
+
 #[derive(Eq, Hash, PartialEq, Debug)]
 pub enum PubkyNoiseError {
     UnknownNoisePattern,
@@ -72,8 +80,10 @@ pub enum PubkyNoiseError {
     EncryptionError,
     /// Transport-phase decryption (read_act) failed.
     DecryptionError,
-    /// Message slot counter or transport nonce space is exhausted.
+    /// Message slot counter space is exhausted.
     CounterOverflow,
+    /// Transport nonce space is exhausted.
+    NonceOverflow,
     OtherError,
 }
 
@@ -436,7 +446,9 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
     ///   write fails.
     /// - Returns [`PubkyNoiseError::CounterOverflow`] if the outbound transport
-    ///   slot or sending nonce space is exhausted.
+    ///   slot space is exhausted.
+    /// - Returns [`PubkyNoiseError::NonceOverflow`] if the sending nonce space
+    ///   is exhausted.
     pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), PubkyNoiseError> {
         // Phase guard: must be in transport mode
         if !self.context.is_transport() {
@@ -445,11 +457,11 @@ impl PubkyNoiseEncryptor {
 
         self.context
             .ensure_can_advance_write_slot()
-            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
-        let counter = self
-            .context
-            .get_write_slot()
-            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+            .map_err(map_context_overflow)?;
+        self.context
+            .ensure_can_advance_sending_nonce()
+            .map_err(map_context_overflow)?;
+        let counter = self.context.get_write_slot();
 
         let mut out = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
         let len = self
@@ -477,7 +489,10 @@ impl PubkyNoiseEncryptor {
         // a failed put() does not desynchronize the nonce with the receiver.
         self.context
             .increment_sending_nonce()
-            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+            .map_err(map_context_overflow)?;
+        self.context
+            .increment_write_counter()
+            .map_err(map_context_overflow)?;
         Ok(())
     }
 
@@ -494,7 +509,9 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] if the packet is malformed.
     /// - Returns [`PubkyNoiseError::DecryptionError`] if Noise decryption fails.
     /// - Returns [`PubkyNoiseError::CounterOverflow`] if the inbound transport
-    ///   slot or receiving nonce space is exhausted.
+    ///   slot space is exhausted.
+    /// - Returns [`PubkyNoiseError::NonceOverflow`] if the receiving nonce space
+    ///   is exhausted.
     pub async fn receive_message(
         &mut self,
     ) -> Result<Vec<[u8; PUBKY_NOISE_MSG_LEN]>, PubkyNoiseError> {
@@ -505,11 +522,11 @@ impl PubkyNoiseEncryptor {
 
         self.context
             .ensure_can_advance_read_slot()
-            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
-        let counter = self
-            .context
-            .get_read_slot()
-            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+            .map_err(map_context_overflow)?;
+        self.context
+            .ensure_can_advance_receiving_nonce()
+            .map_err(map_context_overflow)?;
+        let counter = self.context.get_read_slot();
 
         let mut results = Vec::new();
         let path = self.config.read_path.as_str();
@@ -539,7 +556,13 @@ impl PubkyNoiseEncryptor {
                 // the read_act() is checking the authenticity of the 16-byte message tag
                 self.context
                     .read_act(&mut message, &mut payload, len)
-                    .map_err(|_| PubkyNoiseError::DecryptionError)?;
+                    .map_err(|err| match err {
+                        ContextError::NonceOverflow => PubkyNoiseError::NonceOverflow,
+                        _ => PubkyNoiseError::DecryptionError,
+                    })?;
+                self.context
+                    .increment_read_counter()
+                    .map_err(map_context_overflow)?;
                 results.push(payload);
             }
             // 404 = no message available yet (normal polling behaviour)
@@ -591,6 +614,8 @@ impl PubkyNoiseEncryptor {
             link_id: self.link_id.map(|id| id.0),
             sending_nonce: self.context.get_sending_nonce(),
             receiving_nonce: self.context.get_receiving_nonce(),
+            write_counter: self.context.get_write_counter(),
+            read_counter: self.context.get_read_counter(),
             endpoint_pubkey: self.endpoint_pubkey.to_bytes(),
         }
     }
@@ -617,7 +642,7 @@ impl PubkyNoiseEncryptor {
     /// 1. Builds a fresh `DataLinkContext` with the saved ephemeral key
     /// 2. Reads all handshake messages from the homeservers
     /// 3. Replays them through the fresh `HandshakeState` to re-derive state
-    /// 4. For transport restore: transitions to transport and sets nonces
+    /// 4. For transport restore: transitions to transport and sets nonces/counters
     /// 5. For handshake restore: stops at the saved step position
     ///
     /// # Parameters:
@@ -760,9 +785,10 @@ impl PubkyNoiseEncryptor {
             context.set_sending_nonce(state.sending_nonce);
             context.set_receiving_nonce(state.receiving_nonce);
 
-            // Set the transport base slot. Directional slots are derived from
-            // this base plus the saved send/receive nonces.
+            // Set the transport base slot and independent homeserver slots.
             context.set_counter(state.counter);
+            context.set_write_counter(state.write_counter);
+            context.set_read_counter(state.read_counter);
 
             Some(LinkId(state.link_id.unwrap_or(hash)))
         } else {

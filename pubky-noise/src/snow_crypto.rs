@@ -348,6 +348,7 @@ pub enum ContextError {
     InternalSnowWriteErr,
     InternalSnowReadErr,
     CounterOverflow,
+    NonceOverflow,
 }
 
 fn ensure_counter_can_increment(counter: u32) -> Result<(), ContextError> {
@@ -360,7 +361,7 @@ fn ensure_counter_can_increment(counter: u32) -> Result<(), ContextError> {
 
 fn ensure_nonce_can_increment(nonce: u64) -> Result<(), ContextError> {
     if nonce == u64::MAX {
-        Err(ContextError::CounterOverflow)
+        Err(ContextError::NonceOverflow)
     } else {
         Ok(())
     }
@@ -392,7 +393,12 @@ pub struct DataLinkContext {
 
     endpoint_pubkey: PublicKey,
 
+    /// Handshake slot counter, or transport base slot after handshake.
     counter: u32,
+    /// Homeserver slot for the next outbound transport message.
+    write_counter: u32,
+    /// Homeserver slot for the next inbound transport message.
+    read_counter: u32,
 
     // Tracks progress within the current step's action list for polling-safe handshake.
     // When a Read fails (peer hasn't written yet), we return Pending without advancing
@@ -529,6 +535,8 @@ impl DataLinkContext {
             endpoint_pubkey,
 
             counter: 0,
+            write_counter: 0,
+            read_counter: 0,
 
             sub_step_index: 0,
         })
@@ -554,27 +562,28 @@ impl DataLinkContext {
         Ok(())
     }
 
-    fn transport_counter(&self, nonce: u64) -> Result<u32, ContextError> {
-        let nonce = u32::try_from(nonce).map_err(|_| ContextError::CounterOverflow)?;
-        self.counter
-            .checked_add(nonce)
-            .ok_or(ContextError::CounterOverflow)
+    pub fn get_write_slot(&self) -> u32 {
+        self.write_counter
     }
 
-    pub fn get_write_slot(&self) -> Result<u32, ContextError> {
-        self.transport_counter(self.sending_nonce)
-    }
-
-    pub fn get_read_slot(&self) -> Result<u32, ContextError> {
-        self.transport_counter(self.receiving_nonce)
+    pub fn get_read_slot(&self) -> u32 {
+        self.read_counter
     }
 
     pub fn ensure_can_advance_write_slot(&self) -> Result<(), ContextError> {
-        ensure_counter_can_increment(self.get_write_slot()?)
+        ensure_counter_can_increment(self.write_counter)
     }
 
     pub fn ensure_can_advance_read_slot(&self) -> Result<(), ContextError> {
-        ensure_counter_can_increment(self.get_read_slot()?)
+        ensure_counter_can_increment(self.read_counter)
+    }
+
+    pub fn ensure_can_advance_sending_nonce(&self) -> Result<(), ContextError> {
+        ensure_nonce_can_increment(self.sending_nonce)
+    }
+
+    pub fn ensure_can_advance_receiving_nonce(&self) -> Result<(), ContextError> {
+        ensure_nonce_can_increment(self.receiving_nonce)
     }
 
     pub fn delete(&mut self) {
@@ -626,6 +635,8 @@ impl DataLinkContext {
         self.noise_phase = NoisePhase::Transport;
         self.sending_nonce = 0;
         self.receiving_nonce = 0;
+        self.write_counter = self.counter;
+        self.read_counter = self.counter;
         Ok(())
     }
 
@@ -693,7 +704,7 @@ impl DataLinkContext {
                 Ok(())
             }
             NoisePhase::Transport => {
-                ensure_nonce_can_increment(self.receiving_nonce)?;
+                self.ensure_can_advance_receiving_nonce()?;
                 self.noise_transport
                     .as_ref()
                     .unwrap()
@@ -702,7 +713,7 @@ impl DataLinkContext {
                 self.receiving_nonce = self
                     .receiving_nonce
                     .checked_add(1)
-                    .ok_or(ContextError::CounterOverflow)?;
+                    .ok_or(ContextError::NonceOverflow)?;
                 Ok(())
             }
         }
@@ -755,9 +766,29 @@ impl DataLinkContext {
         self.receiving_nonce
     }
 
+    /// Get the next outbound homeserver slot (transport phase).
+    pub fn get_write_counter(&self) -> u32 {
+        self.write_counter
+    }
+
+    /// Get the next inbound homeserver slot (transport phase).
+    pub fn get_read_counter(&self) -> u32 {
+        self.read_counter
+    }
+
     /// Set the counter (used during restore).
     pub fn set_counter(&mut self, counter: u32) {
         self.counter = counter;
+    }
+
+    /// Set the outbound homeserver slot counter (used during restore).
+    pub fn set_write_counter(&mut self, counter: u32) {
+        self.write_counter = counter;
+    }
+
+    /// Set the inbound homeserver slot counter (used during restore).
+    pub fn set_read_counter(&mut self, counter: u32) {
+        self.read_counter = counter;
     }
 
     /// Set the noise step (used during restore).
@@ -778,6 +809,24 @@ impl DataLinkContext {
     pub fn increment_sending_nonce(&mut self) -> Result<(), ContextError> {
         self.sending_nonce = self
             .sending_nonce
+            .checked_add(1)
+            .ok_or(ContextError::NonceOverflow)?;
+        Ok(())
+    }
+
+    /// Advance the outbound homeserver slot counter by 1.
+    pub fn increment_write_counter(&mut self) -> Result<(), ContextError> {
+        self.write_counter = self
+            .write_counter
+            .checked_add(1)
+            .ok_or(ContextError::CounterOverflow)?;
+        Ok(())
+    }
+
+    /// Advance the inbound homeserver slot counter by 1.
+    pub fn increment_read_counter(&mut self) -> Result<(), ContextError> {
+        self.read_counter = self
+            .read_counter
             .checked_add(1)
             .ok_or(ContextError::CounterOverflow)?;
         Ok(())
