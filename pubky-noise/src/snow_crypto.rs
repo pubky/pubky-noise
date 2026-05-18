@@ -11,6 +11,8 @@ pub const PUBKY_NOISE_MSG_LEN: usize = 1000;
 pub const PUBKY_NOISE_TAG_LEN: usize = 16;
 /// Ciphertext buffer size: plaintext + AEAD tag.
 pub const PUBKY_NOISE_CIPHERTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + PUBKY_NOISE_TAG_LEN;
+/// Noise reserves 2^64 - 1, so 2^64 - 2 is the last usable nonce.
+const MAX_USABLE_NOISE_NONCE: u64 = u64::MAX - 1;
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum NoisePhase {
@@ -360,7 +362,7 @@ fn ensure_counter_can_increment(counter: u32) -> Result<(), ContextError> {
 }
 
 fn ensure_nonce_can_increment(nonce: u64) -> Result<(), ContextError> {
-    if nonce == u64::MAX {
+    if nonce > MAX_USABLE_NOISE_NONCE {
         Err(ContextError::NonceOverflow)
     } else {
         Ok(())
