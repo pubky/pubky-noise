@@ -319,7 +319,7 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
     ///   write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
     ///   and [`restore()`](Self::restore) is required.
-    /// - Returns [`PubkyNoiseError::CounterOverflow`] if handshake slot space is exhausted.
+    /// - Returns [`PubkyNoiseError::CounterOverflow`] if outbound message slot space is exhausted.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyNoiseError> {
         // Capture pre-mutation snapshot so callers can recover from write failures.
         self.last_good_snapshot = Some(self.snapshot());
@@ -508,8 +508,8 @@ impl PubkyNoiseEncryptor {
     ///   response body cannot be read.
     /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] if the packet is malformed.
     /// - Returns [`PubkyNoiseError::DecryptionError`] if Noise decryption fails.
-    /// - Returns [`PubkyNoiseError::CounterOverflow`] if the inbound transport
-    ///   slot space is exhausted.
+    /// - Returns [`PubkyNoiseError::CounterOverflow`] if the remote outbound
+    ///   transport slot space is exhausted.
     /// - Returns [`PubkyNoiseError::NonceOverflow`] if the receiving nonce space
     ///   is exhausted.
     pub async fn receive_message(
@@ -785,7 +785,8 @@ impl PubkyNoiseEncryptor {
             context.set_sending_nonce(state.sending_nonce);
             context.set_receiving_nonce(state.receiving_nonce);
 
-            // Set the transport base slot and independent homeserver slots.
+            // Set the base slot and distinct counters used to track the local
+            // outbound slot and remote outbound slot.
             context.set_counter(state.counter);
             context.set_write_counter(state.write_counter);
             context.set_read_counter(state.read_counter);

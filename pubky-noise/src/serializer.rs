@@ -47,7 +47,7 @@ pub struct PubkyNoiseSessionState {
     pub receiving_nonce: u64,
     /// Next outbound homeserver slot in transport mode.
     pub write_counter: u32,
-    /// Next inbound homeserver slot in transport mode.
+    /// Next remote outbound homeserver slot to read in transport mode.
     pub read_counter: u32,
     /// The remote peer's public key (endpoint).
     pub endpoint_pubkey: [u8; 32],
