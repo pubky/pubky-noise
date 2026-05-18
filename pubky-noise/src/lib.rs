@@ -319,7 +319,7 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
     ///   write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
     ///   and [`restore()`](Self::restore) is required.
-    /// - Returns [`PubkyNoiseError::CounterOverflow`] if outbound message slot space is exhausted.
+    /// - Returns [`PubkyNoiseError::CounterOverflow`] if message slot space is exhausted.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyNoiseError> {
         // Capture pre-mutation snapshot so callers can recover from write failures.
         self.last_good_snapshot = Some(self.snapshot());
