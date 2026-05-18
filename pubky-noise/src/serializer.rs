@@ -7,7 +7,8 @@
 use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
 
 /// Current serialization format version.
-const SESSION_STATE_VERSION: u8 = 1;
+pub const SESSION_STATE_VERSION: u8 = 1;
+const SESSION_STATE_LEN: usize = 197;
 
 /// Serializable snapshot of a `PubkyNoiseEncryptor` session.
 ///
@@ -30,7 +31,7 @@ pub struct PubkyNoiseSessionState {
     pub ephemeral_secret: [u8; 32],
     /// The local static secret key (32 bytes), if the pattern requires one.
     pub static_secret: Option<[u8; 32]>,
-    /// Current message slot counter.
+    /// Handshake message slot counter, or transport base slot after handshake.
     pub counter: u32,
     /// Which handshake step we're at.
     pub noise_step: NoiseStep,
@@ -44,6 +45,10 @@ pub struct PubkyNoiseSessionState {
     pub sending_nonce: u64,
     /// Transport receiving nonce.
     pub receiving_nonce: u64,
+    /// Next outbound homeserver slot in transport mode.
+    pub write_counter: u32,
+    /// Next inbound homeserver slot in transport mode.
+    pub read_counter: u32,
     /// The remote peer's public key (endpoint).
     pub endpoint_pubkey: [u8; 32],
 }
@@ -69,14 +74,16 @@ impl PubkyNoiseSessionState {
     /// [109..141] link_id (32 bytes, zeros if absent)
     /// [141..149] sending_nonce (u64 big-endian)
     /// [149..157] receiving_nonce (u64 big-endian)
-    /// [157..189] endpoint_pubkey (32 bytes)
+    /// [157..161] write_counter (u32 big-endian)
+    /// [161..165] read_counter (u32 big-endian)
+    /// [165..197] endpoint_pubkey (32 bytes)
     /// ```
-    /// Total: 189 bytes
+    /// Total: 197 bytes
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(189);
+        let mut buf = Vec::with_capacity(SESSION_STATE_LEN);
 
         // [0] version
-        buf.push(self.version);
+        buf.push(SESSION_STATE_VERSION);
 
         // [1] phase
         buf.push(match self.phase {
@@ -135,16 +142,22 @@ impl PubkyNoiseSessionState {
         // [149..157] receiving_nonce
         buf.extend_from_slice(&self.receiving_nonce.to_be_bytes());
 
-        // [157..189] endpoint_pubkey
+        // [157..161] write_counter
+        buf.extend_from_slice(&self.write_counter.to_be_bytes());
+
+        // [161..165] read_counter
+        buf.extend_from_slice(&self.read_counter.to_be_bytes());
+
+        // [165..197] endpoint_pubkey
         buf.extend_from_slice(&self.endpoint_pubkey);
 
-        debug_assert_eq!(buf.len(), 189);
+        debug_assert_eq!(buf.len(), SESSION_STATE_LEN);
         buf
     }
 
     /// Deserialize from the compact binary format.
     pub fn deserialize(data: &[u8]) -> Result<Self, SerializerError> {
-        if data.len() < 189 {
+        if data.len() < SESSION_STATE_LEN {
             return Err(SerializerError::TooShort);
         }
 
@@ -213,8 +226,21 @@ impl PubkyNoiseSessionState {
             data[149], data[150], data[151], data[152], data[153], data[154], data[155], data[156],
         ]);
 
+        let write_counter = u32::from_be_bytes([data[157], data[158], data[159], data[160]]);
+
+        let read_counter = u32::from_be_bytes([data[161], data[162], data[163], data[164]]);
+
         let mut endpoint_pubkey = [0u8; 32];
-        endpoint_pubkey.copy_from_slice(&data[157..189]);
+        endpoint_pubkey.copy_from_slice(&data[165..197]);
+
+        validate_counters(
+            phase,
+            counter,
+            write_counter,
+            read_counter,
+            sending_nonce,
+            receiving_nonce,
+        )?;
 
         Ok(PubkyNoiseSessionState {
             version,
@@ -230,6 +256,8 @@ impl PubkyNoiseSessionState {
             link_id,
             sending_nonce,
             receiving_nonce,
+            write_counter,
+            read_counter,
             endpoint_pubkey,
         })
     }
@@ -244,4 +272,164 @@ pub enum SerializerError {
     UnsupportedVersion(u8),
     /// An invalid value was found for a field.
     InvalidField(&'static str, u8),
+    /// Serialized counter cannot advance in the slot space.
+    CounterOverflow,
+    /// Serialized nonce cannot be represented in the Noise nonce space.
+    NonceOverflow,
+    /// Serialized counters are internally inconsistent.
+    InvalidCounter,
+}
+
+fn validate_counters(
+    phase: NoisePhase,
+    counter: u32,
+    write_counter: u32,
+    read_counter: u32,
+    sending_nonce: u64,
+    receiving_nonce: u64,
+) -> Result<(), SerializerError> {
+    if counter == u32::MAX {
+        return Err(SerializerError::CounterOverflow);
+    }
+
+    if phase == NoisePhase::HandShake {
+        if sending_nonce == 0 && receiving_nonce == 0 && write_counter == 0 && read_counter == 0 {
+            return Ok(());
+        }
+        return Err(SerializerError::InvalidCounter);
+    }
+
+    if sending_nonce == u64::MAX || receiving_nonce == u64::MAX {
+        return Err(SerializerError::NonceOverflow);
+    }
+
+    if write_counter == u32::MAX || read_counter == u32::MAX {
+        return Err(SerializerError::CounterOverflow);
+    }
+
+    if write_counter < counter || read_counter < counter {
+        return Err(SerializerError::InvalidCounter);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transport_state() -> PubkyNoiseSessionState {
+        PubkyNoiseSessionState {
+            version: SESSION_STATE_VERSION,
+            phase: NoisePhase::Transport,
+            pattern: HandshakePattern::PatternNN,
+            initiator: true,
+            ephemeral_secret: [1; 32],
+            static_secret: None,
+            counter: 2,
+            noise_step: NoiseStep::Final,
+            sub_step_index: 0,
+            handshake_hash: Some([2; 32]),
+            link_id: Some([3; 32]),
+            sending_nonce: 2,
+            receiving_nonce: 1,
+            write_counter: 9,
+            read_counter: 7,
+            endpoint_pubkey: [4; 32],
+        }
+    }
+
+    #[test]
+    fn roundtrip_preserves_transport_counters_and_nonces() {
+        let state = transport_state();
+        let bytes = state.serialize();
+
+        assert_eq!(bytes.len(), SESSION_STATE_LEN);
+
+        let restored = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
+        assert_eq!(restored.version, SESSION_STATE_VERSION);
+        assert_eq!(restored.counter, state.counter);
+        assert_eq!(restored.sending_nonce, state.sending_nonce);
+        assert_eq!(restored.receiving_nonce, state.receiving_nonce);
+        assert_eq!(restored.write_counter, state.write_counter);
+        assert_eq!(restored.read_counter, state.read_counter);
+    }
+
+    #[test]
+    fn transport_snapshot_rejects_exhausted_sending_nonce() {
+        let mut bytes = transport_state().serialize();
+        bytes[141..149].copy_from_slice(&u64::MAX.to_be_bytes());
+
+        assert!(matches!(
+            PubkyNoiseSessionState::deserialize(&bytes),
+            Err(SerializerError::NonceOverflow)
+        ));
+    }
+
+    #[test]
+    fn transport_snapshot_rejects_exhausted_receiving_nonce() {
+        let mut bytes = transport_state().serialize();
+        bytes[149..157].copy_from_slice(&u64::MAX.to_be_bytes());
+
+        assert!(matches!(
+            PubkyNoiseSessionState::deserialize(&bytes),
+            Err(SerializerError::NonceOverflow)
+        ));
+    }
+
+    #[test]
+    fn transport_snapshot_rejects_write_counter_before_base() {
+        let mut bytes = transport_state().serialize();
+        bytes[157..161].copy_from_slice(&1u32.to_be_bytes());
+
+        assert!(matches!(
+            PubkyNoiseSessionState::deserialize(&bytes),
+            Err(SerializerError::InvalidCounter)
+        ));
+    }
+
+    #[test]
+    fn transport_snapshot_rejects_read_counter_before_base() {
+        let mut bytes = transport_state().serialize();
+        bytes[161..165].copy_from_slice(&1u32.to_be_bytes());
+
+        assert!(matches!(
+            PubkyNoiseSessionState::deserialize(&bytes),
+            Err(SerializerError::InvalidCounter)
+        ));
+    }
+
+    #[test]
+    fn transport_snapshot_rejects_exhausted_write_counter() {
+        let mut bytes = transport_state().serialize();
+        bytes[157..161].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        assert!(matches!(
+            PubkyNoiseSessionState::deserialize(&bytes),
+            Err(SerializerError::CounterOverflow)
+        ));
+    }
+
+    #[test]
+    fn transport_snapshot_rejects_exhausted_read_counter() {
+        let mut bytes = transport_state().serialize();
+        bytes[161..165].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        assert!(matches!(
+            PubkyNoiseSessionState::deserialize(&bytes),
+            Err(SerializerError::CounterOverflow)
+        ));
+    }
+
+    #[test]
+    fn handshake_snapshot_rejects_transport_nonces() {
+        let mut state = transport_state();
+        state.phase = NoisePhase::HandShake;
+        let bytes = state.serialize();
+
+        assert!(matches!(
+            PubkyNoiseSessionState::deserialize(&bytes),
+            Err(SerializerError::InvalidCounter)
+        ));
+    }
 }

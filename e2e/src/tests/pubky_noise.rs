@@ -237,6 +237,12 @@ async fn send_and_verify(
     assert_eq!(msg, message);
 }
 
+/// Verify the first received payload starts with the expected message bytes.
+fn assert_received_message(results: &[[u8; PUBKY_NOISE_MSG_LEN]], expected: &[u8]) {
+    assert!(!results.is_empty());
+    assert_eq!(&results[0][..expected.len()], expected);
+}
+
 /// Send a message and verify the receiver gets a DecryptionError from tampering.
 async fn send_and_verify_tampered(
     sender: &mut PubkyNoiseEncryptor,
@@ -324,6 +330,81 @@ async fn snow_test_responder_first() {
         "Pubky Noise Rocks",
     )
     .await;
+}
+
+#[tokio::test]
+async fn snow_test_transport_allows_simultaneous_first_sends() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+
+    let alice_message = b"Alice first transport message";
+    let bob_message = b"Bob first transport message";
+
+    pair.initiator.send_message(alice_message).await.unwrap();
+    pair.responder.send_message(bob_message).await.unwrap();
+
+    let alice_results = pair.initiator.receive_message().await.unwrap();
+    let bob_results = pair.responder.receive_message().await.unwrap();
+
+    assert_received_message(&alice_results, bob_message);
+    assert_received_message(&bob_results, alice_message);
+}
+
+#[tokio::test]
+async fn snow_test_xx_transport_allows_simultaneous_first_sends() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+
+    let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
+    complete_xx_handshake(&mut pair).await;
+
+    let alice_message = b"Alice XX first transport message";
+    let bob_message = b"Bob XX first transport message";
+
+    pair.initiator.send_message(alice_message).await.unwrap();
+    pair.responder.send_message(bob_message).await.unwrap();
+
+    let alice_results = pair.initiator.receive_message().await.unwrap();
+    let bob_results = pair.responder.receive_message().await.unwrap();
+
+    assert_received_message(&alice_results, bob_message);
+    assert_received_message(&bob_results, alice_message);
+}
+
+#[tokio::test]
+async fn snow_test_xx_transport_allows_receive_before_simultaneous_first_sends() {
+    let testnet = EphemeralTestnet::builder()
+        .with_embedded_postgres()
+        .build()
+        .await
+        .unwrap();
+
+    let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
+    complete_xx_handshake(&mut pair).await;
+
+    assert!(pair.initiator.receive_message().await.unwrap().is_empty());
+    assert!(pair.responder.receive_message().await.unwrap().is_empty());
+
+    let alice_message = b"Alice XX after empty receive";
+    let bob_message = b"Bob XX after empty receive";
+
+    pair.initiator.send_message(alice_message).await.unwrap();
+    pair.responder.send_message(bob_message).await.unwrap();
+
+    let alice_results = pair.initiator.receive_message().await.unwrap();
+    let bob_results = pair.responder.receive_message().await.unwrap();
+
+    assert_received_message(&alice_results, bob_message);
+    assert_received_message(&bob_results, alice_message);
 }
 
 #[tokio::test]
@@ -1138,8 +1219,8 @@ async fn snow_test_restore() {
     // Serialize and deserialize (round-trip test)
     let initiator_bytes = initiator_snapshot.serialize();
     let responder_bytes = responder_snapshot.serialize();
-    assert_eq!(initiator_bytes.len(), 189);
-    assert_eq!(responder_bytes.len(), 189);
+    assert_eq!(initiator_bytes.len(), 197);
+    assert_eq!(responder_bytes.len(), 197);
 
     let initiator_state = PubkyNoiseSessionState::deserialize(&initiator_bytes).unwrap();
     let responder_state = PubkyNoiseSessionState::deserialize(&responder_bytes).unwrap();
@@ -1217,6 +1298,8 @@ async fn snow_test_restore_serialization_roundtrip() {
     assert_eq!(restored.counter, snapshot.counter);
     assert_eq!(restored.sending_nonce, snapshot.sending_nonce);
     assert_eq!(restored.receiving_nonce, snapshot.receiving_nonce);
+    assert_eq!(restored.write_counter, snapshot.write_counter);
+    assert_eq!(restored.read_counter, snapshot.read_counter);
     assert_eq!(restored.endpoint_pubkey, snapshot.endpoint_pubkey);
     assert_eq!(restored.handshake_hash, snapshot.handshake_hash);
     assert_eq!(restored.link_id, snapshot.link_id);

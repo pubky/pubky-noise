@@ -10,7 +10,7 @@ Key capabilities:
 
 - **Noise protocol handshakes** -- NN (anonymous) and XX (mutually authenticated) patterns, with polling-safe async execution
 - **Encrypted transport** -- ChaCha20-Poly1305 authenticated encryption with explicit nonces via `Noise_*_25519_ChaChaPoly_SHA256`
-- **Session backup & restore** -- Compact 189-byte snapshots enable crash recovery by replaying handshake messages through a fresh Noise state
+- **Session backup & restore** -- Compact 197-byte snapshots enable crash recovery by replaying handshake messages through a fresh Noise state
 - **Asymmetric path derivation** -- Per-peer-pair private storage paths derived from DH shared secrets, preventing third-party enumeration of communication relationships
 - **Write failure recovery** -- Automatic pre-mutation snapshots during handshake allow recovery from homeserver write failures
 
