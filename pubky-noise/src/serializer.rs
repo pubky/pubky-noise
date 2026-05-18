@@ -9,6 +9,8 @@ use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
 /// Current serialization format version.
 pub const SESSION_STATE_VERSION: u8 = 1;
 const SESSION_STATE_LEN: usize = 197;
+/// Noise reserves 2^64 - 1, so 2^64 - 2 is the last usable nonce.
+const MAX_USABLE_NOISE_NONCE: u64 = u64::MAX - 1;
 
 /// Serializable snapshot of a `PubkyNoiseEncryptor` session.
 ///
@@ -47,7 +49,7 @@ pub struct PubkyNoiseSessionState {
     pub receiving_nonce: u64,
     /// Next outbound homeserver slot in transport mode.
     pub write_counter: u32,
-    /// Next inbound homeserver slot in transport mode.
+    /// Next remote outbound homeserver slot to read in transport mode.
     pub read_counter: u32,
     /// The remote peer's public key (endpoint).
     pub endpoint_pubkey: [u8; 32],
@@ -299,7 +301,7 @@ fn validate_counters(
         return Err(SerializerError::InvalidCounter);
     }
 
-    if sending_nonce == u64::MAX || receiving_nonce == u64::MAX {
+    if sending_nonce > MAX_USABLE_NOISE_NONCE || receiving_nonce > MAX_USABLE_NOISE_NONCE {
         return Err(SerializerError::NonceOverflow);
     }
 
@@ -364,6 +366,18 @@ mod tests {
             PubkyNoiseSessionState::deserialize(&bytes),
             Err(SerializerError::NonceOverflow)
         ));
+    }
+
+    #[test]
+    fn transport_snapshot_accepts_max_usable_noise_nonce() {
+        let mut state = transport_state();
+        state.sending_nonce = MAX_USABLE_NOISE_NONCE;
+        state.receiving_nonce = MAX_USABLE_NOISE_NONCE;
+        let bytes = state.serialize();
+
+        let restored = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
+        assert_eq!(restored.sending_nonce, MAX_USABLE_NOISE_NONCE);
+        assert_eq!(restored.receiving_nonce, MAX_USABLE_NOISE_NONCE);
     }
 
     #[test]

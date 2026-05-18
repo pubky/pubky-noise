@@ -11,6 +11,8 @@ pub const PUBKY_NOISE_MSG_LEN: usize = 1000;
 pub const PUBKY_NOISE_TAG_LEN: usize = 16;
 /// Ciphertext buffer size: plaintext + AEAD tag.
 pub const PUBKY_NOISE_CIPHERTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + PUBKY_NOISE_TAG_LEN;
+/// Noise reserves 2^64 - 1, so 2^64 - 2 is the last usable nonce.
+const MAX_USABLE_NOISE_NONCE: u64 = u64::MAX - 1;
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum NoisePhase {
@@ -360,7 +362,7 @@ fn ensure_counter_can_increment(counter: u32) -> Result<(), ContextError> {
 }
 
 fn ensure_nonce_can_increment(nonce: u64) -> Result<(), ContextError> {
-    if nonce == u64::MAX {
+    if nonce > MAX_USABLE_NOISE_NONCE {
         Err(ContextError::NonceOverflow)
     } else {
         Ok(())
@@ -388,7 +390,7 @@ pub struct DataLinkContext {
 
     /// Explicit nonce for outbound transport messages.
     sending_nonce: u64,
-    /// Explicit nonce for inbound transport messages.
+    /// Explicit nonce for decrypting remote outbound transport messages.
     receiving_nonce: u64,
 
     endpoint_pubkey: PublicKey,
@@ -397,7 +399,7 @@ pub struct DataLinkContext {
     counter: u32,
     /// Homeserver slot for the next outbound transport message.
     write_counter: u32,
-    /// Homeserver slot for the next inbound transport message.
+    /// Homeserver slot for the next remote outbound transport message.
     read_counter: u32,
 
     // Tracks progress within the current step's action list for polling-safe handshake.
@@ -771,7 +773,7 @@ impl DataLinkContext {
         self.write_counter
     }
 
-    /// Get the next inbound homeserver slot (transport phase).
+    /// Get the next remote outbound homeserver slot to read (transport phase).
     pub fn get_read_counter(&self) -> u32 {
         self.read_counter
     }
@@ -786,7 +788,7 @@ impl DataLinkContext {
         self.write_counter = counter;
     }
 
-    /// Set the inbound homeserver slot counter (used during restore).
+    /// Set the remote outbound homeserver slot counter (used during restore).
     pub fn set_read_counter(&mut self, counter: u32) {
         self.read_counter = counter;
     }
@@ -823,7 +825,7 @@ impl DataLinkContext {
         Ok(())
     }
 
-    /// Advance the inbound homeserver slot counter by 1.
+    /// Advance the remote outbound homeserver slot counter by 1.
     pub fn increment_read_counter(&mut self) -> Result<(), ContextError> {
         self.read_counter = self
             .read_counter
