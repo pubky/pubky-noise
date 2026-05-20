@@ -1,7 +1,7 @@
 [package]
 name = "pubky-noise"
 description = "Fully-integrated Noise AE framework in pubky-sdk"
-version = "0.1.0-rc4"
+version = "0.1.0-rc5"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -13,11 +13,11 @@ categories = ["cryptography"]
 test-utils = []
 
 [dependencies]
-pubky = "0.7.0"
-ed25519-dalek = { version = "=3.0.0-pre.5" }
-curve25519-dalek = { version = "=5.0.0-pre.5" }
+pubky = "0.8.0"
+ed25519-dalek = { version = "=3.0.0-pre.6" }
+curve25519-dalek = { version = "=5.0.0-pre.6" }
 snow = { version = "0.10.0", features = ["use-sha2"] }
 getrandom = "0.3"
-sha2 = "0.11.0-rc.4"
+sha2 = "0.11.0"
 hex = "0.4"
 rand = "0.9.0"

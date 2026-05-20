@@ -1,15 +1,72 @@
-use std::sync::Arc;
+use std::{
+    ops::Deref,
+    sync::{Arc, Weak},
+};
 
 use pubky_testnet::{
+    embedded_postgres::EmbeddedPostgres,
     pubky::{Keypair, PublicKey},
     EphemeralTestnet,
 };
+use tokio::sync::{Mutex, OnceCell};
 
 use pubky_noise::serializer::PubkyNoiseSessionState;
 use pubky_noise::snow_crypto::{
     HandshakePattern, NoisePhase, NoiseStep, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
 };
 use pubky_noise::{HandshakeResult, PubkyNoiseConfig, PubkyNoiseEncryptor, PubkyNoiseError};
+
+static SHARED_POSTGRES: OnceCell<Mutex<Weak<EmbeddedPostgres>>> = OnceCell::const_new();
+
+async fn shared_postgres() -> Arc<EmbeddedPostgres> {
+    let shared = SHARED_POSTGRES
+        .get_or_init(|| async { Mutex::new(Weak::new()) })
+        .await;
+    let mut postgres = shared.lock().await;
+    if let Some(postgres) = postgres.upgrade() {
+        return postgres;
+    }
+
+    let new_postgres = Arc::new(
+        EmbeddedPostgres::start()
+            .await
+            .expect("failed to start embedded postgres"),
+    );
+    let mut connection_string = new_postgres
+        .connection_string()
+        .expect("embedded postgres connection string")
+        .to_string();
+    if connection_string.contains('?') {
+        connection_string.push_str("&pubky-test=true");
+    } else {
+        connection_string.push_str("?pubky-test=true");
+    }
+    std::env::set_var("TEST_PUBKY_CONNECTION_STRING", connection_string);
+    *postgres = Arc::downgrade(&new_postgres);
+    new_postgres
+}
+
+struct SharedTestnet {
+    testnet: EphemeralTestnet,
+    _postgres: Arc<EmbeddedPostgres>,
+}
+
+impl Deref for SharedTestnet {
+    type Target = EphemeralTestnet;
+
+    fn deref(&self) -> &Self::Target {
+        &self.testnet
+    }
+}
+
+async fn build_testnet() -> SharedTestnet {
+    let postgres = shared_postgres().await;
+    let testnet = EphemeralTestnet::builder().build().await.unwrap();
+    SharedTestnet {
+        testnet,
+        _postgres: postgres,
+    }
+}
 
 fn cipher_check(plaintext: &[u8], ciphertext: &[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]) {
     let plaintext_len = plaintext.len();
@@ -283,11 +340,7 @@ async fn cipher_check_utility_negative() {
 
 #[tokio::test]
 async fn snow_test_initiator_first() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
 
@@ -308,11 +361,7 @@ async fn snow_test_initiator_first() {
 #[tokio::test]
 async fn snow_test_responder_first() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
 
     let mut pair = setup_encryptors(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
@@ -334,11 +383,7 @@ async fn snow_test_responder_first() {
 
 #[tokio::test]
 async fn snow_test_transport_allows_simultaneous_first_sends() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
 
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
@@ -358,11 +403,7 @@ async fn snow_test_transport_allows_simultaneous_first_sends() {
 
 #[tokio::test]
 async fn snow_test_xx_transport_allows_simultaneous_first_sends() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
 
     let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
     complete_xx_handshake(&mut pair).await;
@@ -382,11 +423,7 @@ async fn snow_test_xx_transport_allows_simultaneous_first_sends() {
 
 #[tokio::test]
 async fn snow_test_xx_transport_allows_receive_before_simultaneous_first_sends() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
 
     let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
     complete_xx_handshake(&mut pair).await;
@@ -410,11 +447,7 @@ async fn snow_test_xx_transport_allows_receive_before_simultaneous_first_sends()
 #[tokio::test]
 async fn snow_test_responder_tampering() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_with_tampering(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
 
@@ -430,11 +463,7 @@ async fn snow_test_responder_tampering() {
 #[tokio::test]
 async fn snow_test_initiator_tampering() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_with_tampering(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
 
@@ -450,11 +479,7 @@ async fn snow_test_initiator_tampering() {
 #[tokio::test]
 async fn snow_null_message() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
 
@@ -583,11 +608,7 @@ async fn snow_null_message() {
 #[tokio::test]
 async fn snow_test_unknown_pattern() {
     // Start a test homeserver with 1 MB user data limit
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
 
@@ -614,11 +635,7 @@ async fn snow_test_unknown_pattern() {
 
 #[tokio::test]
 async fn snow_test_snow_noise_build_error() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
@@ -668,11 +685,7 @@ async fn snow_test_snow_noise_build_error() {
 
 #[tokio::test]
 async fn snow_test_cleaning_sequence() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
 
@@ -691,11 +704,7 @@ async fn snow_test_cleaning_sequence() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn snow_test_XX_pattern_simple() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "XX").await;
     let initiator_public_key = pair.initiator_public_key.clone();
     let responder_public_key = pair.responder_public_key.clone();
@@ -866,11 +875,7 @@ async fn snow_test_XX_pattern_simple() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn snow_test_XX_pattern_tampering() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_with_tampering(&testnet, "XX").await;
     complete_xx_handshake(&mut pair).await;
 
@@ -884,11 +889,7 @@ async fn snow_test_XX_pattern_tampering() {
 
 #[tokio::test]
 async fn snow_test_simple_backup() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "XX").await;
     complete_xx_handshake(&mut pair).await;
 
@@ -904,11 +905,7 @@ async fn snow_test_simple_backup() {
 
 #[tokio::test]
 async fn snow_test_dual_outbox() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
 
@@ -920,11 +917,7 @@ async fn snow_test_dual_outbox() {
 
 #[tokio::test]
 async fn snow_test_identity_commitment() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
 
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
@@ -936,11 +929,7 @@ async fn snow_test_identity_commitment() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn snow_test_XX_pattern_simple_out_of_order_handshake() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "XX").await;
     let initiator_public_key = pair.initiator_public_key.clone();
     let responder_public_key = pair.responder_public_key.clone();
@@ -1126,11 +1115,7 @@ async fn snow_test_XX_pattern_simple_out_of_order_handshake() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn snow_test_XX_pattern_simple_incomplete_handshake() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "XX").await;
 
     // Incomplete handshake — third message never sent
@@ -1151,11 +1136,7 @@ async fn snow_test_XX_pattern_simple_incomplete_handshake() {
 /// Calling send_message before transitioning to transport returns IsHandshake.
 #[tokio::test]
 async fn snow_test_send_message_before_transport_returns_error() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "NN").await;
 
     // Complete the handshake but do NOT call transition_transport.
@@ -1172,11 +1153,7 @@ async fn snow_test_send_message_before_transport_returns_error() {
 /// Calling receive_message before transitioning to transport returns IsHandshake.
 #[tokio::test]
 async fn snow_test_receive_message_before_transport_returns_error() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "NN").await;
 
     // Complete the handshake but do NOT call transition_transport.
@@ -1194,11 +1171,7 @@ async fn snow_test_receive_message_before_transport_returns_error() {
 /// snapshot, serialize/deserialize, restore, then continue exchanging messages.
 #[tokio::test]
 async fn snow_test_restore() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
     let initiator_public_key = pair.initiator_public_key.clone();
     let responder_public_key = pair.responder_public_key.clone();
@@ -1269,11 +1242,7 @@ async fn snow_test_restore() {
 /// Test that snapshot serialization round-trips correctly.
 #[tokio::test]
 async fn snow_test_restore_serialization_roundtrip() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
 
@@ -1308,11 +1277,7 @@ async fn snow_test_restore_serialization_roundtrip() {
 /// Test that restored encryptors produce the same link ID as the originals.
 #[tokio::test]
 async fn snow_test_restore_link_id_matches() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
     let initiator_public_key = pair.initiator_public_key.clone();
     let responder_public_key = pair.responder_public_key.clone();
@@ -1404,11 +1369,7 @@ async fn snow_test_restore_link_id_matches() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn snow_test_NN_responder_read_failure_no_state_advance() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
 
     // Snapshot responder BEFORE any handshake activity
@@ -1484,11 +1445,7 @@ async fn snow_test_NN_responder_read_failure_no_state_advance() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn snow_test_XX_responder_read_failure_no_state_advance() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
 
     // Snapshot responder BEFORE any handshake activity
@@ -1568,11 +1525,7 @@ async fn snow_test_XX_responder_read_failure_no_state_advance() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn snow_test_NN_initiator_write_failure_and_replay_recovery() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
     let initiator_public_key = pair.initiator_public_key.clone();
     let responder_public_key = pair.responder_public_key.clone();
@@ -1703,11 +1656,7 @@ async fn snow_test_NN_initiator_write_failure_and_replay_recovery() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn snow_test_XX_initiator_write_failure_and_replay_recovery() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
     let initiator_public_key = pair.initiator_public_key.clone();
     let responder_public_key = pair.responder_public_key.clone();
@@ -1831,11 +1780,7 @@ async fn snow_test_XX_initiator_write_failure_and_replay_recovery() {
 /// - Updates on every subsequent call (tracks the latest pre-mutation state).
 #[tokio::test]
 async fn snow_test_last_good_snapshot_tracks_pre_mutation_state() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
 
     // ── Before any handshake call: last_good_snapshot is None ──
@@ -1909,11 +1854,7 @@ async fn snow_test_last_good_snapshot_tracks_pre_mutation_state() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn snow_test_NN_initiator_put_failure_returns_error() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
     let responder_public_key = pair.responder_public_key.clone();
 
@@ -2000,11 +1941,7 @@ async fn snow_test_NN_initiator_put_failure_returns_error() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn snow_test_XX_initiator_put_failure_returns_error() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
     let responder_public_key = pair.responder_public_key.clone();
 
@@ -2099,11 +2036,7 @@ async fn snow_test_XX_initiator_put_failure_returns_error() {
 /// - 1001 bytes (MSG_LEN + 1): over the limit, should fail
 #[tokio::test]
 async fn snow_test_message_payload_boundary_sizes() {
-    let testnet = EphemeralTestnet::builder()
-        .with_embedded_postgres()
-        .build()
-        .await
-        .unwrap();
+    let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
 

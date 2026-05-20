@@ -5,7 +5,7 @@ version = "0.1.0-rc1"
 publish = false
 
 [dependencies]
-pubky-testnet = { version = "0.7.0", features = ["embedded-postgres"] }
+pubky-testnet = { version = "0.8.0", features = ["embedded-postgres"] }
 pubky-noise = { path = "../pubky-noise", features = ["test-utils"] }
 tokio = { version = "1.47.1", features = ["full", "test-util"] }
 tracing-subscriber = "0.3.20"
