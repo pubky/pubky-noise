@@ -13,9 +13,9 @@ categories = ["cryptography"]
 test-utils = []
 
 [dependencies]
-pubky = "0.8.0"
-ed25519-dalek = { version = "=3.0.0-pre.6" }
-curve25519-dalek = { version = "=5.0.0-pre.6" }
+pubky = "0.10.0"
+ed25519-dalek = "3.0.0"
+curve25519-dalek = "5.0.0"
 snow = { version = "0.10.0", features = ["use-sha2"] }
 getrandom = "0.3"
 sha2 = "0.11.0"

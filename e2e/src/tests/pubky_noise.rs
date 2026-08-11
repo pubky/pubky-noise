@@ -4,8 +4,8 @@ use std::{
 };
 
 use pubky_testnet::{
-    embedded_postgres::EmbeddedPostgres,
-    pubky::{Keypair, PublicKey},
+    docker_postgres::DockerPostgres,
+    pubky::{ClientId, Keypair, Pubky, PubkySession, PublicKey},
     EphemeralTestnet,
 };
 use tokio::sync::{Mutex, OnceCell};
@@ -16,9 +16,11 @@ use pubky_noise::snow_crypto::{
 };
 use pubky_noise::{HandshakeResult, PubkyNoiseConfig, PubkyNoiseEncryptor, PubkyNoiseError};
 
-static SHARED_POSTGRES: OnceCell<Mutex<Weak<EmbeddedPostgres>>> = OnceCell::const_new();
+const E2E_CLIENT_ID: &str = "pubky-noise-e2e";
 
-async fn shared_postgres() -> Arc<EmbeddedPostgres> {
+static SHARED_POSTGRES: OnceCell<Mutex<Weak<DockerPostgres>>> = OnceCell::const_new();
+
+async fn shared_postgres() -> Arc<DockerPostgres> {
     let shared = SHARED_POSTGRES
         .get_or_init(|| async { Mutex::new(Weak::new()) })
         .await;
@@ -28,9 +30,9 @@ async fn shared_postgres() -> Arc<EmbeddedPostgres> {
     }
 
     let new_postgres = Arc::new(
-        EmbeddedPostgres::start()
+        DockerPostgres::start()
             .await
-            .expect("failed to start embedded postgres"),
+            .expect("failed to start Docker Postgres"),
     );
     let mut connection_string = new_postgres
         .connection_string()
@@ -48,7 +50,7 @@ async fn shared_postgres() -> Arc<EmbeddedPostgres> {
 
 struct SharedTestnet {
     testnet: EphemeralTestnet,
-    _postgres: Arc<EmbeddedPostgres>,
+    _postgres: Arc<DockerPostgres>,
 }
 
 impl Deref for SharedTestnet {
@@ -66,6 +68,15 @@ async fn build_testnet() -> SharedTestnet {
         testnet,
         _postgres: postgres,
     }
+}
+
+async fn create_grant_session(pubky: &Pubky, homeserver: &PublicKey) -> PubkySession {
+    let signer = pubky.signer(Keypair::random());
+    signer.signup(homeserver, None).await.unwrap();
+    signer
+        .signin(ClientId::new(E2E_CLIENT_ID).unwrap())
+        .await
+        .unwrap()
 }
 
 fn cipher_check(plaintext: &[u8], ciphertext: &[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]) {
@@ -98,17 +109,8 @@ async fn setup_encryptors(testnet: &EphemeralTestnet, pattern: &str) -> Encrypto
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
+    let initiator_session = create_grant_session(&initiator_pubky, &server.public_key()).await;
+    let responder_session = create_grant_session(&responder_pubky, &server.public_key()).await;
 
     let server_path_string = "/pub/data".to_string();
 
@@ -174,17 +176,10 @@ async fn setup_encryptors_dual_server(testnet: &EphemeralTestnet, pattern: &str)
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = testnet.sdk().unwrap();
 
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&first_server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&second_server.public_key(), None)
-        .await
-        .unwrap();
+    let initiator_session =
+        create_grant_session(&initiator_pubky, &first_server.public_key()).await;
+    let responder_session =
+        create_grant_session(&responder_pubky, &second_server.public_key()).await;
 
     let server_path_string = "/pub/data".to_string();
 
@@ -612,11 +607,7 @@ async fn snow_test_unknown_pattern() {
     let server = testnet.homeserver_app();
     let initiator_pubky = testnet.sdk().unwrap();
 
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
+    let initiator_session = create_grant_session(&initiator_pubky, &server.public_key()).await;
 
     let server_path_string = "/pub/data".to_string();
 
@@ -640,17 +631,8 @@ async fn snow_test_snow_noise_build_error() {
     let initiator_pubky = testnet.sdk().unwrap();
     let responder_pubky = initiator_pubky.clone();
 
-    let initiator_signer = initiator_pubky.signer(Keypair::random());
-    let initiator_session = initiator_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
-
-    let responder_signer = responder_pubky.signer(Keypair::random());
-    let responder_session = responder_signer
-        .signup(&server.public_key(), None)
-        .await
-        .unwrap();
+    let initiator_session = create_grant_session(&initiator_pubky, &server.public_key()).await;
+    let responder_session = create_grant_session(&responder_pubky, &server.public_key()).await;
 
     let server_path_string = "/pub/data".to_string();
 
@@ -671,7 +653,7 @@ async fn snow_test_snow_noise_build_error() {
 
     let initiator_ephemeral_keypair = Keypair::random();
 
-    let responder_public_key = responder_session.info().public_key();
+    let responder_public_key = responder_session.info().public_key().clone();
 
     let init_encryptor_ret = PubkyNoiseEncryptor::new(
         config,
