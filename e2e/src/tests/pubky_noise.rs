@@ -1221,6 +1221,177 @@ async fn snow_test_restore() {
     .await;
 }
 
+/// Prepared transport operations reserve the live nonce and slot while exposing
+/// the exact packet and post-operation state for durable handoff.
+#[tokio::test]
+async fn snow_test_prepared_transport_state_handoff() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+
+    let sender_before = pair.initiator.snapshot();
+    let message = b"prepared transport message";
+    let prepared_send = pair.initiator.prepare_send(message).unwrap();
+
+    let sender_after_prepare = pair.initiator.snapshot();
+    assert_eq!(
+        sender_after_prepare.sending_nonce,
+        sender_before.sending_nonce + 1
+    );
+    assert_eq!(
+        sender_after_prepare.write_counter,
+        sender_before.write_counter + 1
+    );
+    assert_eq!(
+        prepared_send.resulting_session_state.sending_nonce,
+        sender_before.sending_nonce + 1
+    );
+    assert_eq!(
+        prepared_send.resulting_session_state.write_counter,
+        sender_before.write_counter + 1
+    );
+
+    assert_eq!(
+        pair.initiator.prepare_send(b"next message").unwrap_err(),
+        PubkyNoiseError::PreparedTransportPending
+    );
+    assert_eq!(
+        pair.initiator.next_receive_path().unwrap_err(),
+        PubkyNoiseError::PreparedTransportPending
+    );
+    assert_eq!(
+        pair.initiator.persist_snapshot().await.unwrap_err(),
+        PubkyNoiseError::PreparedTransportPending
+    );
+
+    pair.initiator_config
+        .local_session
+        .storage()
+        .put(
+            prepared_send.destination_path.clone(),
+            prepared_send.ciphertext.to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let mut altered_prepared_send = prepared_send.clone();
+    altered_prepared_send.ciphertext[2] ^= 1;
+    assert!(!pair.initiator.confirm_prepared_send(&altered_prepared_send));
+    assert!(pair.initiator.confirm_prepared_send(&prepared_send));
+    assert!(!pair.initiator.confirm_prepared_send(&prepared_send));
+    let next_prepared_send = pair.initiator.prepare_send(b"next message").unwrap();
+    assert_ne!(
+        next_prepared_send.destination_path,
+        prepared_send.destination_path
+    );
+    assert_eq!(
+        next_prepared_send.resulting_session_state.sending_nonce,
+        sender_before.sending_nonce + 2
+    );
+    assert!(!pair.initiator.confirm_prepared_send(&prepared_send));
+    assert_eq!(
+        pair.initiator.next_receive_path().unwrap_err(),
+        PubkyNoiseError::PreparedTransportPending
+    );
+    pair.initiator_config
+        .local_session
+        .storage()
+        .put(
+            prepared_send.destination_path.clone(),
+            prepared_send.ciphertext.to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let receive_path = pair.responder.next_receive_path().unwrap();
+    let response = pair
+        .responder_config
+        .outbox_client
+        .public_storage()
+        .get(receive_path)
+        .await
+        .unwrap();
+    let ciphertext = response.bytes().await.unwrap();
+
+    let receiver_before = pair.responder.snapshot();
+    let prepared_receive = pair.responder.prepare_receive(&ciphertext).unwrap();
+    assert_eq!(&prepared_receive.plaintext[..message.len()], message);
+
+    let receiver_after_prepare = pair.responder.snapshot();
+    assert_eq!(
+        receiver_after_prepare.receiving_nonce,
+        receiver_before.receiving_nonce + 1
+    );
+    assert_eq!(
+        receiver_after_prepare.read_counter,
+        receiver_before.read_counter + 1
+    );
+    assert_eq!(
+        prepared_receive.resulting_session_state.receiving_nonce,
+        receiver_before.receiving_nonce + 1
+    );
+    assert_eq!(
+        prepared_receive.resulting_session_state.read_counter,
+        receiver_before.read_counter + 1
+    );
+
+    let sender_state =
+        PubkyNoiseSessionState::deserialize(&prepared_send.resulting_session_state.serialize())
+            .unwrap();
+    let receiver_state =
+        PubkyNoiseSessionState::deserialize(&prepared_receive.resulting_session_state.serialize())
+            .unwrap();
+    let mut altered_prepared_receive = prepared_receive.clone();
+    altered_prepared_receive.plaintext[0] ^= 1;
+    assert!(!pair
+        .responder
+        .confirm_prepared_receive(&altered_prepared_receive));
+    assert!(pair.responder.confirm_prepared_receive(&prepared_receive));
+
+    let mut restored_sender = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        sender_state,
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    let mut restored_receiver = PubkyNoiseEncryptor::restore(
+        pair.responder_config.clone(),
+        receiver_state,
+        pair.initiator_public_key.clone(),
+    )
+    .await
+    .unwrap();
+
+    send_and_verify(
+        &mut restored_sender,
+        &mut restored_receiver,
+        "message after prepared handoff",
+    )
+    .await;
+}
+
+/// Packets shorter than their declared length are rejected.
+#[tokio::test]
+async fn snow_test_prepare_receive_rejects_truncated_packets() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+
+    assert_eq!(
+        pair.responder.prepare_receive(&[]).unwrap_err(),
+        PubkyNoiseError::BadLengthCiphertext
+    );
+    assert_eq!(
+        pair.responder.prepare_receive(&[0]).unwrap_err(),
+        PubkyNoiseError::BadLengthCiphertext
+    );
+    assert_eq!(
+        pair.responder.prepare_receive(&[0, 16, 1]).unwrap_err(),
+        PubkyNoiseError::BadLengthCiphertext
+    );
+}
+
 /// Test that snapshot serialization round-trips correctly.
 #[tokio::test]
 async fn snow_test_restore_serialization_roundtrip() {

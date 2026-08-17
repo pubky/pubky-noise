@@ -9,7 +9,7 @@ Peers use their homeservers as outboxes: each party writes encrypted Noise messa
 ```toml
 # Cargo.toml
 [dependencies]
-pubky-noise = "0.1.0-rc6"
+pubky-noise = "0.1.0-rc7"
 ```
 
 ### Actual dependencies (for reference)
@@ -95,12 +95,12 @@ homeserver slot selection.
 Messages use a length-prefixed packet format:
 
 ```text
-[len_hi, len_lo, payload...]
+[len_hi, len_lo, ciphertext..., zero padding...]
 ```
 
-- `len`: big-endian u16 indicating payload length
-- `payload`: up to 1000 bytes (`PUBKY_NOISE_MSG_LEN`)
-- Total packet size: 1002 bytes
+- `len`: big-endian u16 indicating ciphertext length
+- `ciphertext`: up to 1016 bytes (1000-byte plaintext plus the 16-byte authentication tag)
+- Total stored packet size: 1018 bytes
 
 ### Crypto Primitives
 
@@ -129,6 +129,8 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 
 - **`PubkyNoiseSessionState`** -- Serializable snapshot of a session (197 bytes). Contains everything needed to restore a session by replaying persisted handshake messages through a fresh Noise state.
 
+- **`PreparedSend` / `PreparedReceive`** -- Staged transport results containing the exact message data and resulting session state. Use these when message publication or processing must be committed atomically with session state.
+
 - **`DataLinkContext`** -- Internal Noise state machine managing the handshake and transport phases. Not used directly by consumers.
 
 ### Lifecycle
@@ -140,6 +142,17 @@ new() --> handle_handshake() [loop] --> transition_transport() --> send/receive 
         |                                     |
     restore() [on crash recovery]     restore() [on crash recovery]
 ```
+
+### Staged Transport Operations
+
+`send_message()` and `receive_message()` remain the simplest transport APIs.
+Callers that need durable coordination can instead stage each state transition:
+
+1. Call `prepare_send()` to obtain the destination path, exact ciphertext, and resulting session state.
+2. Persist the prepared operation before publishing the ciphertext, then call `confirm_prepared_send()`. Preparation reserves the nonce and storage slot until confirmation.
+3. For inbound data, fetch `next_receive_path()`, call `prepare_receive()`, persist the plaintext event together with the resulting state, and call `confirm_prepared_receive()`.
+
+If a durable commit fails, discard the advanced encryptor and restore the previous state. If publication status is uncertain, retry the exact prepared ciphertext rather than encrypting the plaintext again. Callers sharing state across processes must serialize preparation and use conditional state updates.
 
 ## Noise Handshake Patterns
 

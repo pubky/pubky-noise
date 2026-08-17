@@ -342,7 +342,8 @@ pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec
     actions
 }
 
-//TODO: more granularity for errors
+/// Internal Noise state-machine errors.
+#[derive(Debug)]
 pub enum ContextError {
     Init,
     OngoingHandshake,
@@ -690,6 +691,42 @@ impl DataLinkContext {
         }
     }
 
+    /// Encrypt a transport message without advancing the sending nonce.
+    pub(crate) fn prepare_transport_write(
+        &self,
+        payload: &[u8],
+        message: &mut [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
+    ) -> Result<usize, ContextError> {
+        if !self.is_transport() {
+            return Err(ContextError::OngoingHandshake);
+        }
+
+        self.noise_transport
+            .as_ref()
+            .ok_or(ContextError::OngoingHandshake)?
+            .write_message(self.sending_nonce, payload, message.as_mut())
+            .map_err(|_| ContextError::InternalSnowWriteErr)
+    }
+
+    /// Decrypt a transport message without advancing the receiving nonce.
+    pub(crate) fn prepare_transport_read(
+        &self,
+        message: &[u8; PUBKY_NOISE_CIPHERTEXT_LEN],
+        payload: &mut [u8; PUBKY_NOISE_MSG_LEN],
+        len: usize,
+    ) -> Result<(), ContextError> {
+        if !self.is_transport() {
+            return Err(ContextError::OngoingHandshake);
+        }
+
+        self.noise_transport
+            .as_ref()
+            .ok_or(ContextError::OngoingHandshake)?
+            .read_message(self.receiving_nonce, &message[..len], payload)
+            .map(|_| ())
+            .map_err(|_| ContextError::InternalSnowReadErr)
+    }
+
     pub fn read_act(
         &mut self,
         message: &mut [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
@@ -842,5 +879,62 @@ impl DataLinkContext {
     /// Set the receiving nonce (used during restore after transport transition).
     pub fn set_receiving_nonce(&mut self, nonce: u64) {
         self.receiving_nonce = nonce;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pubky::Keypair;
+
+    use super::*;
+
+    fn transport_contexts() -> (DataLinkContext, DataLinkContext) {
+        let initiator_keypair = Keypair::random();
+        let responder_keypair = Keypair::random();
+        let mut initiator = DataLinkContext::new(
+            HandshakePattern::PatternNN,
+            true,
+            None,
+            responder_keypair.public_key(),
+        )
+        .unwrap();
+        let mut responder = DataLinkContext::new(
+            HandshakePattern::PatternNN,
+            false,
+            None,
+            initiator_keypair.public_key(),
+        )
+        .unwrap();
+
+        let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+        let len = initiator.write_act(&[], &mut message).unwrap();
+        responder.read_act(&mut message, &mut payload, len).unwrap();
+
+        let len = responder.write_act(&[], &mut message).unwrap();
+        initiator.read_act(&mut message, &mut payload, len).unwrap();
+
+        initiator.to_transport().unwrap();
+        responder.to_transport().unwrap();
+        (initiator, responder)
+    }
+
+    #[test]
+    fn test_prepared_transport_operations_do_not_advance_state() {
+        let (initiator, responder) = transport_contexts();
+        let mut ciphertext = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let mut plaintext = [0; PUBKY_NOISE_MSG_LEN];
+        let message = b"prepared transport message";
+
+        let ciphertext_len = initiator
+            .prepare_transport_write(message, &mut ciphertext)
+            .unwrap();
+        responder
+            .prepare_transport_read(&ciphertext, &mut plaintext, ciphertext_len)
+            .unwrap();
+
+        assert_eq!(&plaintext[..message.len()], message);
+        assert_eq!(initiator.get_sending_nonce(), 0);
+        assert_eq!(responder.get_receiving_nonce(), 0);
     }
 }
