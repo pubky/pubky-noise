@@ -882,7 +882,31 @@ async fn snow_test_simple_backup() {
     )
     .await;
 
-    let _ = pair.initiator.persist_snapshot().await;
+    pair.initiator.persist_snapshot().await.unwrap();
+
+    // The backup must be stored encrypted, not as the plaintext serialized state.
+    let stored = pair
+        .initiator_config
+        .local_session
+        .storage()
+        .get("/pub/data/backup")
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let plaintext = pair.initiator.snapshot().serialize();
+    assert_ne!(
+        stored.as_ref(),
+        plaintext.as_slice(),
+        "Stored backup should be encrypted, not plaintext"
+    );
+
+    // The encrypted backup decrypts back to the same session state.
+    let loaded = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config)
+        .await
+        .unwrap();
+    assert_eq!(loaded.serialize(), plaintext);
 }
 
 #[tokio::test]

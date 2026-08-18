@@ -1,3 +1,4 @@
+pub mod backup_crypto;
 pub mod identity_payload;
 pub mod path_derivation;
 pub mod serializer;
@@ -76,6 +77,8 @@ pub enum PubkyNoiseError {
     RestoreHashMismatch,
     /// Restore failed: deserialization error.
     RestoreDeserializeError,
+    /// Restore failed: persisted snapshot decryption failed.
+    RestoreBackupDecryptError,
     /// Transport-phase encryption (write_act) failed.
     EncryptionError,
     /// Transport-phase decryption (read_act) failed.
@@ -621,19 +624,58 @@ impl PubkyNoiseEncryptor {
     }
 
     /// Persist the current session snapshot to the homeserver (encrypted path).
+    ///
+    /// The serialized snapshot contains the session's ephemeral and static
+    /// secrets, so it is encrypted with a key derived from the Pubky root
+    /// secret (`XSalsa20Poly1305`, see [`backup_crypto`]) before uploading.
     pub async fn persist_snapshot(&self) -> Result<(), PubkyNoiseError> {
         let state = self.snapshot();
         let serialized = state.serialize();
-        // TODO: encrypt serialized bytes with a key derived from pubky_root_keypair
-        // before storing. For now, store as-is.
+        let encrypted =
+            backup_crypto::encrypt_backup(&self.config.pubky_root_keypair.secret(), &serialized);
         let path = format!("{}/backup", self.config.write_path);
         self.config
             .local_session
             .storage()
-            .put(path, serialized)
+            .put(path, encrypted)
             .await
             .map_err(|_| PubkyNoiseError::OtherError)?;
         Ok(())
+    }
+
+    /// Load and decrypt a session snapshot previously stored with
+    /// [`persist_snapshot()`](Self::persist_snapshot).
+    ///
+    /// The returned state can be passed to [`restore()`](Self::restore) to
+    /// reconstruct the encryptor.
+    ///
+    /// # Errors:
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the backup
+    ///   cannot be fetched (including when no backup exists yet).
+    /// - Returns [`PubkyNoiseError::RestoreBackupDecryptError`] if decryption
+    ///   fails (wrong root key or tampered/corrupted ciphertext).
+    /// - Returns [`PubkyNoiseError::RestoreDeserializeError`] if the decrypted
+    ///   bytes are not a valid session state.
+    pub async fn load_snapshot(
+        config: &PubkyNoiseConfig,
+    ) -> Result<PubkyNoiseSessionState, PubkyNoiseError> {
+        let path = format!("{}/backup", config.write_path);
+        let response = config
+            .local_session
+            .storage()
+            .get(path)
+            .await
+            .map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
+
+        let serialized = backup_crypto::decrypt_backup(&config.pubky_root_keypair.secret(), &bytes)
+            .map_err(|_| PubkyNoiseError::RestoreBackupDecryptError)?;
+
+        PubkyNoiseSessionState::deserialize(&serialized)
+            .map_err(|_| PubkyNoiseError::RestoreDeserializeError)
     }
 
     /// Restore a `PubkyNoiseEncryptor` from a previously saved session state.
