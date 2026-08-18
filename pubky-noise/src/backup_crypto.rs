@@ -122,7 +122,10 @@ mod tests {
     fn key_derivation_is_deterministic_and_domain_separated() {
         let root_secret = [42u8; 32];
 
-        assert_eq!(derive_backup_key(&root_secret), derive_backup_key(&root_secret));
+        assert_eq!(
+            derive_backup_key(&root_secret),
+            derive_backup_key(&root_secret)
+        );
         assert_ne!(
             derive_backup_key(&root_secret),
             Sha256::digest(root_secret).as_slice(),
