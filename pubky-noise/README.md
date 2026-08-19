@@ -127,7 +127,7 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 
 - **`LinkId`** -- A 32-byte identifier derived from the Noise handshake transcript hash. Changes after every handshake when ephemeral keys are used. Available after calling `transition_transport()`.
 
-- **`PubkyNoiseSessionState`** -- Serializable snapshot of a session (197 bytes). Contains everything needed to restore a session by replaying persisted handshake messages through a fresh Noise state.
+- **`PubkyNoiseSessionState`** -- Serializable snapshot of a session (197 bytes). Contains everything needed to restore a session by replaying persisted handshake messages through a fresh Noise state. Because it includes the session's secret keys, it is encrypted before homeserver storage (see [Session Backup & Restore](#session-backup--restore)).
 
 - **`DataLinkContext`** -- Internal Noise state machine managing the handshake and transport phases. Not used directly by consumers.
 
@@ -136,9 +136,9 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 ```text
 new() --> handle_handshake() [loop] --> transition_transport() --> send/receive --> close()
         |                                     |
-    last_good_snapshot                     snapshot() --> persist_snapshot()
+    last_good_snapshot                     snapshot() --> persist_snapshot() [encrypted]
         |                                     |
-    restore() [on crash recovery]     restore() [on crash recovery]
+    restore() [on crash recovery]     load_snapshot() --> restore() [on crash recovery]
 ```
 
 ## Noise Handshake Patterns
@@ -234,6 +234,32 @@ Sessions can be snapshotted, serialized, and restored to recover from crashes or
 | 157-160 | 4 | write counter (u32 big-endian) |
 | 161-164 | 4 | read counter (u32 big-endian) |
 | 165-196 | 32 | endpoint public key |
+
+### Encrypted Homeserver Backup
+
+The serialized snapshot contains the session's ephemeral and static secrets, so it must never
+be stored in plaintext. `persist_snapshot()` encrypts it before uploading to
+`{write_path}/backup` on the local homeserver, and `load_snapshot()` fetches and decrypts it:
+
+```rust,ignore
+// Encrypt and upload the snapshot to the homeserver
+encryptor.persist_snapshot().await?;
+
+// Later (e.g. after a crash or on another device): fetch, decrypt and restore
+let state = PubkyNoiseEncryptor::load_snapshot(&config).await?;
+let mut restored = PubkyNoiseEncryptor::restore(config, state, peer_pubkey).await?;
+// (`peer_pubkey` is the remote peer you were talking to; it is also stored
+//  in `state.endpoint_pubkey` and can be reconstructed from it via pkarr.)
+```
+
+Encryption follows the same convention as Pubky recovery files: XSalsa20Poly1305 with a random
+24-byte nonce per write (`pubky_common::crypto`). The encryption key is derived from the Pubky
+root secret with a domain-separated KDF -- `SHA-256("pubky-noise/session-backup/v0" || root_secret)` --
+so the raw root secret is never used directly. The snapshot is not compressed: it is a fixed
+197 bytes of mostly high-entropy key material, which does not compress.
+
+If you persist snapshots through your own storage instead of `persist_snapshot()`, you must
+encrypt the serialized bytes yourself.
 
 ### Recovery Flow
 
@@ -371,7 +397,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 
 - `last_good_snapshot()` returns `None` before the first `handle_handshake()` call.
 - Each `handle_handshake()` call overwrites the previous snapshot with the state from the start of *that* call.
-- The snapshot contains the ephemeral secret key, which is the critical piece that allows `restore()` to re-derive the same transport keys via replay.
+- The snapshot contains the ephemeral secret key, which is the critical piece that allows `restore()` to re-derive the same transport keys via replay. Any persisted snapshot must be encrypted (as `persist_snapshot()` does).
 - `restore()` verifies the handshake hash matches the saved one (for transport-phase restores), returning `RestoreHashMismatch` on mismatch.
 
 ## Error Handling
@@ -391,6 +417,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 | `RestoreReplayError` | Handshake replay failed during restore | Check that homeserver messages are intact |
 | `RestoreHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
 | `RestoreDeserializeError` | Snapshot deserialization failed | Check data integrity |
+| `RestoreBackupDecryptError` | Persisted snapshot decryption failed | Wrong root key, or tampered/corrupted backup |
 
 ## Features
 
