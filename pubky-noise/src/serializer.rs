@@ -8,7 +8,8 @@ use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
 
 /// Current serialization format version.
 pub const SESSION_STATE_VERSION: u8 = 1;
-const SESSION_STATE_LEN: usize = 197;
+/// Exact length in bytes of a serialized v1 session state.
+pub const SESSION_STATE_LEN: usize = 197;
 /// Noise reserves 2^64 - 1, so 2^64 - 2 is the last usable nonce.
 const MAX_USABLE_NOISE_NONCE: u64 = u64::MAX - 1;
 
@@ -158,6 +159,9 @@ impl PubkyNoiseSessionState {
     }
 
     /// Deserialize from the compact binary format.
+    ///
+    /// The input must be exactly [`SESSION_STATE_LEN`] bytes: shorter input is
+    /// rejected as truncated, longer input as containing trailing bytes.
     pub fn deserialize(data: &[u8]) -> Result<Self, SerializerError> {
         if data.len() < SESSION_STATE_LEN {
             return Err(SerializerError::TooShort);
@@ -166,6 +170,10 @@ impl PubkyNoiseSessionState {
         let version = data[0];
         if version != SESSION_STATE_VERSION {
             return Err(SerializerError::UnsupportedVersion(version));
+        }
+
+        if data.len() != SESSION_STATE_LEN {
+            return Err(SerializerError::TrailingBytes);
         }
 
         let phase = match data[1] {
@@ -270,6 +278,8 @@ impl PubkyNoiseSessionState {
 pub enum SerializerError {
     /// The input data is too short.
     TooShort,
+    /// The input data has trailing bytes after the session state.
+    TrailingBytes,
     /// Unsupported format version.
     UnsupportedVersion(u8),
     /// An invalid value was found for a field.
@@ -355,6 +365,17 @@ mod tests {
         assert_eq!(restored.receiving_nonce, state.receiving_nonce);
         assert_eq!(restored.write_counter, state.write_counter);
         assert_eq!(restored.read_counter, state.read_counter);
+    }
+
+    #[test]
+    fn rejects_trailing_bytes() {
+        let mut bytes = transport_state().serialize();
+        bytes.push(0);
+
+        assert!(matches!(
+            PubkyNoiseSessionState::deserialize(&bytes),
+            Err(SerializerError::TrailingBytes)
+        ));
     }
 
     #[test]

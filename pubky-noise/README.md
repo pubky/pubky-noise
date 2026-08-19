@@ -242,21 +242,44 @@ be stored in plaintext. `persist_snapshot()` encrypts it before uploading to
 `{write_path}/backup` on the local homeserver, and `load_snapshot()` fetches and decrypts it:
 
 ```rust,ignore
-// Encrypt and upload the snapshot to the homeserver
-encryptor.persist_snapshot().await?;
+// Encrypt and upload the snapshot to the homeserver.
+// `generation` is a caller-managed monotonically increasing counter.
+encryptor.persist_snapshot(generation).await?;
+// -> record the generation in trusted local storage as your rollback checkpoint
 
 // Later (e.g. after a crash or on another device): fetch, decrypt and restore
-let state = PubkyNoiseEncryptor::load_snapshot(&config).await?;
-let mut restored = PubkyNoiseEncryptor::restore(config, state, peer_pubkey).await?;
+let loaded = PubkyNoiseEncryptor::load_snapshot(&config, local_checkpoint).await?;
+let mut restored = PubkyNoiseEncryptor::restore(config, loaded.state, peer_pubkey).await?;
 // (`peer_pubkey` is the remote peer you were talking to; it is also stored
-//  in `state.endpoint_pubkey` and can be reconstructed from it via pkarr.)
+//  in `loaded.state.endpoint_pubkey` and can be reconstructed from it via pkarr.)
 ```
 
 Encryption follows the same convention as Pubky recovery files: XSalsa20Poly1305 with a random
-24-byte nonce per write (`pubky_common::crypto`). The encryption key is derived from the Pubky
-root secret with a domain-separated KDF -- `SHA-256("pubky-noise/session-backup/v0" || root_secret)` --
+24-byte nonce per write. The encryption key is derived from the Pubky root secret with a
+domain-separated KDF -- `SHA-256("pubky-noise/session-backup/v0" || root_secret)` --
 so the raw root secret is never used directly. The snapshot is not compressed: it is a fixed
 197 bytes of mostly high-entropy key material, which does not compress.
+
+The stored record is a closed, versioned envelope:
+
+```text
+magic ("PNBK") || envelope_version || algorithm_id || nonce || ciphertext
+```
+
+The header is duplicated inside the authenticated plaintext (the NaCl construction has no
+AAD) and validated on decryption. Only explicitly supported envelope versions are accepted,
+the record must match the exact length of its version, and the response body is read with a
+hard size cap -- malformed, truncated, trailing, and oversized records are all rejected.
+
+**Rollback protection.** AEAD authenticates the bytes but provides no freshness: a stale or
+malicious homeserver can return an older, still-valid backup after the session has advanced,
+which would reinstall old transport nonces and slot counters (nonce reuse, slot overwrites,
+peer desynchronization). To detect this, every backup carries a monotonic `generation` in its
+authenticated plaintext. Pass your trusted local checkpoint as `min_generation` to
+`load_snapshot()`; older backups are rejected with `RestoreBackupRollbackError`. Without a
+trusted checkpoint (`None`, e.g. a fresh device) rollback cannot be detected -- a signed or
+hash-chained sequence alone is not sufficient either, since the homeserver can simply withhold
+the newest element.
 
 If you persist snapshots through your own storage instead of `persist_snapshot()`, you must
 encrypt the serialized bytes yourself.
@@ -418,6 +441,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 | `RestoreHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
 | `RestoreDeserializeError` | Snapshot deserialization failed | Check data integrity |
 | `RestoreBackupDecryptError` | Persisted snapshot decryption failed | Wrong root key, or tampered/corrupted backup |
+| `RestoreBackupRollbackError` | Backup generation is older than the trusted local checkpoint | Restart from a fresh handshake; investigate homeserver |
 
 ## Features
 

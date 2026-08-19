@@ -3616,6 +3616,7 @@ dependencies = [
 name = "pubky-noise"
 version = "0.1.0-rc6"
 dependencies = [
+ "crypto_secretbox",
  "curve25519-dalek 5.0.0",
  "ed25519-dalek",
  "getrandom 0.3.4",

@@ -59,6 +59,32 @@ fn map_context_overflow(err: ContextError) -> PubkyNoiseError {
     }
 }
 
+fn map_backup_error(err: backup_crypto::BackupCryptoError) -> PubkyNoiseError {
+    match err {
+        backup_crypto::BackupCryptoError::Rollback { .. } => {
+            PubkyNoiseError::RestoreBackupRollbackError
+        }
+        backup_crypto::BackupCryptoError::DecryptError => {
+            PubkyNoiseError::RestoreBackupDecryptError
+        }
+        _ => PubkyNoiseError::RestoreDeserializeError,
+    }
+}
+
+/// A session snapshot loaded and decrypted from the homeserver.
+///
+/// Returned by [`PubkyNoiseEncryptor::load_snapshot`]. The `generation` is
+/// the caller-managed monotonic counter bound into the backup; callers should
+/// record it in trusted local storage as their new rollback checkpoint.
+#[derive(Debug, Clone)]
+pub struct LoadedSnapshot {
+    /// The generation the backup was persisted with.
+    pub generation: u64,
+    /// The decrypted session state, ready for
+    /// [`PubkyNoiseEncryptor::restore`].
+    pub state: PubkyNoiseSessionState,
+}
+
 #[derive(Eq, Hash, PartialEq, Debug)]
 pub enum PubkyNoiseError {
     UnknownNoisePattern,
@@ -79,6 +105,9 @@ pub enum PubkyNoiseError {
     RestoreDeserializeError,
     /// Restore failed: persisted snapshot decryption failed.
     RestoreBackupDecryptError,
+    /// Restore failed: persisted snapshot is older than the trusted local
+    /// checkpoint (rollback detected).
+    RestoreBackupRollbackError,
     /// Transport-phase encryption (write_act) failed.
     EncryptionError,
     /// Transport-phase decryption (read_act) failed.
@@ -628,11 +657,20 @@ impl PubkyNoiseEncryptor {
     /// The serialized snapshot contains the session's ephemeral and static
     /// secrets, so it is encrypted with a key derived from the Pubky root
     /// secret (`XSalsa20Poly1305`, see [`backup_crypto`]) before uploading.
-    pub async fn persist_snapshot(&self) -> Result<(), PubkyNoiseError> {
+    ///
+    /// # Parameters:
+    /// - `generation`: A caller-managed, monotonically increasing counter that
+    ///   is bound into the encrypted backup. Persist the latest value in
+    ///   trusted local storage and pass it as `min_generation` to
+    ///   [`load_snapshot()`](Self::load_snapshot) to detect a stale or
+    ///   malicious homeserver replaying an older backup.
+    pub async fn persist_snapshot(&self, generation: u64) -> Result<(), PubkyNoiseError> {
         let state = self.snapshot();
-        let serialized = state.serialize();
-        let encrypted =
-            backup_crypto::encrypt_backup(&self.config.pubky_root_keypair.secret(), &serialized);
+        let encrypted = backup_crypto::encrypt_backup(
+            &self.config.pubky_root_keypair.secret(),
+            generation,
+            &state,
+        );
         let path = format!("{}/backup", self.config.write_path);
         self.config
             .local_session
@@ -649,33 +687,71 @@ impl PubkyNoiseEncryptor {
     /// The returned state can be passed to [`restore()`](Self::restore) to
     /// reconstruct the encryptor.
     ///
+    /// The response body is read with a hard size cap
+    /// ([`backup_crypto::MAX_BACKUP_RESPONSE_BYTES`]) and the record must
+    /// match the exact length of its envelope version.
+    ///
+    /// # Parameters:
+    /// - `min_generation`: The highest backup generation observed so far, from
+    ///   the caller's trusted local checkpoint. Older backups are rejected
+    ///   with [`PubkyNoiseError::RestoreBackupRollbackError`]. Pass `None`
+    ///   only when no trusted checkpoint exists (e.g. restoring onto a fresh
+    ///   device) — in that case rollback to an older backup cannot be
+    ///   detected.
+    ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the backup
-    ///   cannot be fetched (including when no backup exists yet).
+    ///   cannot be fetched (including when no backup exists yet) or the
+    ///   response exceeds the size cap.
     /// - Returns [`PubkyNoiseError::RestoreBackupDecryptError`] if decryption
     ///   fails (wrong root key or tampered/corrupted ciphertext).
-    /// - Returns [`PubkyNoiseError::RestoreDeserializeError`] if the decrypted
-    ///   bytes are not a valid session state.
+    /// - Returns [`PubkyNoiseError::RestoreBackupRollbackError`] if the backup
+    ///   generation is older than `min_generation`.
+    /// - Returns [`PubkyNoiseError::RestoreDeserializeError`] if the record is
+    ///   not a valid backup envelope or the decrypted bytes are not a valid
+    ///   session state.
     pub async fn load_snapshot(
         config: &PubkyNoiseConfig,
-    ) -> Result<PubkyNoiseSessionState, PubkyNoiseError> {
+        min_generation: Option<u64>,
+    ) -> Result<LoadedSnapshot, PubkyNoiseError> {
         let path = format!("{}/backup", config.write_path);
-        let response = config
+        let mut response = config
             .local_session
             .storage()
             .get(path)
             .await
             .map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
-        let bytes = response
-            .bytes()
+
+        // Bounded body read: reject oversized responses before proportional
+        // allocation, regardless of what the Content-Length header claims.
+        if let Some(len) = response.content_length() {
+            if len > backup_crypto::MAX_BACKUP_RESPONSE_BYTES as u64 {
+                return Err(PubkyNoiseError::HomeserverResponseError);
+            }
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
+            .map_err(|_| PubkyNoiseError::HomeserverResponseError)?
+        {
+            if body.len() + chunk.len() > backup_crypto::MAX_BACKUP_RESPONSE_BYTES {
+                return Err(PubkyNoiseError::HomeserverResponseError);
+            }
+            body.extend_from_slice(&chunk);
+        }
 
-        let serialized = backup_crypto::decrypt_backup(&config.pubky_root_keypair.secret(), &bytes)
-            .map_err(|_| PubkyNoiseError::RestoreBackupDecryptError)?;
+        let (generation, serialized) = backup_crypto::decrypt_backup(
+            &config.pubky_root_keypair.secret(),
+            &body,
+            min_generation,
+        )
+        .map_err(map_backup_error)?;
 
-        PubkyNoiseSessionState::deserialize(&serialized)
-            .map_err(|_| PubkyNoiseError::RestoreDeserializeError)
+        let state = PubkyNoiseSessionState::deserialize(&serialized)
+            .map_err(|_| PubkyNoiseError::RestoreDeserializeError)?;
+
+        Ok(LoadedSnapshot { generation, state })
     }
 
     /// Restore a `PubkyNoiseEncryptor` from a previously saved session state.
