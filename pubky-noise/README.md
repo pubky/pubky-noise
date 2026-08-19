@@ -150,9 +150,11 @@ Callers that need durable coordination can instead stage each state transition:
 
 1. Call `prepare_send()` to obtain the destination path, exact ciphertext, and resulting session state.
 2. Persist the prepared operation before publishing the ciphertext, then call `confirm_prepared_send()`. Preparation reserves the nonce and storage slot until confirmation.
-3. For inbound data, fetch `next_receive_path()`, call `prepare_receive()`, persist the plaintext event together with the resulting state, and call `confirm_prepared_receive()`.
+3. For inbound data, fetch `next_receive_path()`, call `prepare_receive()`, atomically persist the resulting state with the application's durable processing result, and call `confirm_prepared_receive()`.
 
 If a durable commit fails, discard the advanced encryptor and restore the previous state. If publication status is uncertain, retry the exact prepared ciphertext rather than encrypting the plaintext again. Callers sharing state across processes must serialize preparation and use conditional state updates.
+
+Decrypted plaintext is sensitive application data. Avoid logging it, minimize copies, and protect it at rest whenever the application protocol requires persistence.
 
 ## Noise Handshake Patterns
 

@@ -1253,15 +1253,15 @@ async fn snow_test_prepared_transport_state_handoff() {
 
     assert_eq!(
         pair.initiator.prepare_send(b"next message").unwrap_err(),
-        PubkyNoiseError::PreparedTransportPending
+        PubkyNoiseError::UnconfirmedPreparedTransport
     );
     assert_eq!(
         pair.initiator.next_receive_path().unwrap_err(),
-        PubkyNoiseError::PreparedTransportPending
+        PubkyNoiseError::UnconfirmedPreparedTransport
     );
     assert_eq!(
         pair.initiator.persist_snapshot().await.unwrap_err(),
-        PubkyNoiseError::PreparedTransportPending
+        PubkyNoiseError::UnconfirmedPreparedTransport
     );
 
     pair.initiator_config
@@ -1291,7 +1291,7 @@ async fn snow_test_prepared_transport_state_handoff() {
     assert!(!pair.initiator.confirm_prepared_send(&prepared_send));
     assert_eq!(
         pair.initiator.next_receive_path().unwrap_err(),
-        PubkyNoiseError::PreparedTransportPending
+        PubkyNoiseError::UnconfirmedPreparedTransport
     );
     pair.initiator_config
         .local_session

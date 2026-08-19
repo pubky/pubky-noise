@@ -62,7 +62,8 @@ fn map_context_overflow(err: ContextError) -> PubkyNoiseError {
     }
 }
 
-fn prepared_transport_token(
+// Hash the exact prepared operation so stale or modified values cannot be confirmed.
+fn prepared_transport_digest(
     operation_kind: u8,
     resource: &[u8],
     message: &[u8],
@@ -104,8 +105,8 @@ pub enum PubkyNoiseError {
     CounterOverflow,
     /// Transport nonce space is exhausted.
     NonceOverflow,
-    /// A prepared transport operation must be durably persisted and confirmed.
-    PreparedTransportPending,
+    /// A prepared transport operation is awaiting durable confirmation.
+    UnconfirmedPreparedTransport,
     OtherError,
 }
 
@@ -127,7 +128,8 @@ pub struct PreparedSend {
     pub ciphertext: [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2],
     /// Session state to persist with this prepared ciphertext.
     pub resulting_session_state: PubkyNoiseSessionState,
-    confirmation_token: [u8; 32],
+    // Binds confirmation to this exact prepared operation; it is not a secret.
+    confirmation_digest: [u8; 32],
 }
 
 impl std::fmt::Debug for PreparedSend {
@@ -146,15 +148,21 @@ impl std::fmt::Debug for PreparedSend {
 /// A decrypted transport message and its resulting session state.
 ///
 /// Preparing a receive advances the encryptor past its ciphertext. Callers
-/// should persist the plaintext event and `resulting_session_state` together
-/// before exposing the event as processed.
+/// should atomically persist `resulting_session_state` with the durable
+/// application state produced from `plaintext` before exposing the event as
+/// processed.
+///
+/// The plaintext is sensitive application data. Avoid logging it, minimize
+/// copies, and protect it at rest if the application protocol requires its
+/// persistence.
 #[derive(Clone)]
 pub struct PreparedReceive {
     /// Decrypted, zero-padded private message payload.
     pub plaintext: [u8; PUBKY_NOISE_MSG_LEN],
-    /// Session state to persist with this plaintext event.
+    /// Session state to persist with the application's durable processing result.
     pub resulting_session_state: PubkyNoiseSessionState,
-    confirmation_token: [u8; 32],
+    // Binds confirmation to this exact prepared operation; it is not a secret.
+    confirmation_digest: [u8; 32],
 }
 
 impl std::fmt::Debug for PreparedReceive {
@@ -289,7 +297,7 @@ pub struct PubkyNoiseEncryptor {
     /// [`handle_handshake()`](Self::handle_handshake) call, before any
     /// state-mutating work. See [`last_good_snapshot()`](Self::last_good_snapshot).
     last_good_snapshot: Option<PubkyNoiseSessionState>,
-    prepared_transport_pending: Option<[u8; 32]>,
+    unconfirmed_transport_digest: Option<[u8; 32]>,
 
     // test-only fields — stripped from production builds
     #[cfg(feature = "test-utils")]
@@ -335,7 +343,7 @@ impl PubkyNoiseEncryptor {
             link_id: None,
             endpoint_pubkey,
             last_good_snapshot: None,
-            prepared_transport_pending: None,
+            unconfirmed_transport_digest: None,
             #[cfg(feature = "test-utils")]
             simulate_tampering: false,
             #[cfg(feature = "test-utils")]
@@ -513,8 +521,8 @@ impl PubkyNoiseEncryptor {
     }
 
     fn build_prepared_send(&self, plaintext: &[u8]) -> Result<PreparedSend, PubkyNoiseError> {
-        if self.prepared_transport_pending.is_some() {
-            return Err(PubkyNoiseError::PreparedTransportPending);
+        if self.unconfirmed_transport_digest.is_some() {
+            return Err(PubkyNoiseError::UnconfirmedPreparedTransport);
         }
         if !self.context.is_transport() {
             return Err(PubkyNoiseError::IsHandshake);
@@ -546,7 +554,7 @@ impl PubkyNoiseEncryptor {
             .checked_add(1)
             .ok_or(PubkyNoiseError::CounterOverflow)?;
 
-        let confirmation_token = prepared_transport_token(
+        let confirmation_digest = prepared_transport_digest(
             0,
             destination_path.as_bytes(),
             &ciphertext,
@@ -557,7 +565,7 @@ impl PubkyNoiseEncryptor {
             destination_path,
             ciphertext,
             resulting_session_state,
-            confirmation_token,
+            confirmation_digest,
         })
     }
 
@@ -588,7 +596,7 @@ impl PubkyNoiseEncryptor {
     /// this encryptor until then.
     ///
     /// # Errors
-    /// - Returns [`PubkyNoiseError::PreparedTransportPending`] if another staged
+    /// - Returns [`PubkyNoiseError::UnconfirmedPreparedTransport`] if another staged
     ///   transport operation has not been confirmed.
     /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
     /// - Returns [`PubkyNoiseError::EncryptionError`] if Noise encryption fails.
@@ -599,7 +607,7 @@ impl PubkyNoiseEncryptor {
     pub fn prepare_send(&mut self, plaintext: &[u8]) -> Result<PreparedSend, PubkyNoiseError> {
         let prepared = self.build_prepared_send(plaintext)?;
         self.apply_prepared_send(&prepared);
-        self.prepared_transport_pending = Some(prepared.confirmation_token);
+        self.unconfirmed_transport_digest = Some(prepared.confirmation_digest);
         Ok(prepared)
     }
 
@@ -607,7 +615,7 @@ impl PubkyNoiseEncryptor {
     /// The maximum payload size is [`PUBKY_NOISE_MSG_LEN`] bytes.
     ///
     /// # Errors:
-    /// - Returns [`PubkyNoiseError::PreparedTransportPending`] if a staged
+    /// - Returns [`PubkyNoiseError::UnconfirmedPreparedTransport`] if a staged
     ///   transport operation has not been confirmed.
     /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
     /// - Returns [`PubkyNoiseError::EncryptionError`] if Noise encryption fails.
@@ -643,15 +651,15 @@ impl PubkyNoiseEncryptor {
     /// This method does not perform network I/O or mutate the encryptor.
     ///
     /// # Errors
-    /// - Returns [`PubkyNoiseError::PreparedTransportPending`] if a staged
+    /// - Returns [`PubkyNoiseError::UnconfirmedPreparedTransport`] if a staged
     ///   transport operation has not been confirmed.
     /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
     /// - Returns [`PubkyNoiseError::CounterOverflow`] or
     ///   [`PubkyNoiseError::NonceOverflow`] if the inbound transport space is
     ///   exhausted.
     pub fn next_receive_path(&self) -> Result<String, PubkyNoiseError> {
-        if self.prepared_transport_pending.is_some() {
-            return Err(PubkyNoiseError::PreparedTransportPending);
+        if self.unconfirmed_transport_digest.is_some() {
+            return Err(PubkyNoiseError::UnconfirmedPreparedTransport);
         }
         if !self.context.is_transport() {
             return Err(PubkyNoiseError::IsHandshake);
@@ -675,8 +683,8 @@ impl PubkyNoiseEncryptor {
         &self,
         ciphertext: &[u8],
     ) -> Result<PreparedReceive, PubkyNoiseError> {
-        if self.prepared_transport_pending.is_some() {
-            return Err(PubkyNoiseError::PreparedTransportPending);
+        if self.unconfirmed_transport_digest.is_some() {
+            return Err(PubkyNoiseError::UnconfirmedPreparedTransport);
         }
         if !self.context.is_transport() {
             return Err(PubkyNoiseError::IsHandshake);
@@ -716,7 +724,7 @@ impl PubkyNoiseEncryptor {
             .checked_add(1)
             .ok_or(PubkyNoiseError::CounterOverflow)?;
 
-        let confirmation_token = prepared_transport_token(
+        let confirmation_digest = prepared_transport_digest(
             1,
             self.config.read_path.as_bytes(),
             &plaintext,
@@ -726,7 +734,7 @@ impl PubkyNoiseEncryptor {
         Ok(PreparedReceive {
             plaintext,
             resulting_session_state,
-            confirmation_token,
+            confirmation_digest,
         })
     }
 
@@ -740,10 +748,13 @@ impl PubkyNoiseEncryptor {
     /// Prepare an inbound ciphertext for durable processing.
     ///
     /// This method decrypts the packet and advances this encryptor past it
-    /// without performing network I/O. Persist the plaintext event and
-    /// `resulting_session_state` together before treating the event as processed.
-    /// If persistence fails, discard this encryptor and restore its previous
-    /// durable state.
+    /// without performing network I/O. Atomically persist
+    /// `resulting_session_state` with the durable application state produced
+    /// from the plaintext before treating the event as processed. If persistence
+    /// fails, discard this encryptor and restore its previous durable state.
+    ///
+    /// Treat the plaintext as sensitive application data. Do not log it, and
+    /// protect it at rest if the application protocol requires its persistence.
     ///
     /// Callers sharing session state across processes must serialize preparation
     /// and conditionally persist the resulting state against the state they
@@ -753,7 +764,7 @@ impl PubkyNoiseEncryptor {
     /// this encryptor until then.
     ///
     /// # Errors
-    /// - Returns [`PubkyNoiseError::PreparedTransportPending`] if another staged
+    /// - Returns [`PubkyNoiseError::UnconfirmedPreparedTransport`] if another staged
     ///   transport operation has not been confirmed.
     /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
     /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] if the packet is malformed.
@@ -768,15 +779,15 @@ impl PubkyNoiseEncryptor {
     ) -> Result<PreparedReceive, PubkyNoiseError> {
         let prepared = self.build_prepared_receive(ciphertext)?;
         self.apply_prepared_receive(&prepared);
-        self.prepared_transport_pending = Some(prepared.confirmation_token);
+        self.unconfirmed_transport_digest = Some(prepared.confirmation_digest);
         Ok(prepared)
     }
 
-    fn confirm_prepared_transport(&mut self, confirmation_token: &[u8; 32]) -> bool {
-        if self.prepared_transport_pending.as_ref() != Some(confirmation_token) {
+    fn confirm_prepared_transport(&mut self, confirmation_digest: &[u8; 32]) -> bool {
+        if self.unconfirmed_transport_digest.as_ref() != Some(confirmation_digest) {
             return false;
         }
-        self.prepared_transport_pending = None;
+        self.unconfirmed_transport_digest = None;
         true
     }
 
@@ -785,16 +796,16 @@ impl PubkyNoiseEncryptor {
     /// Call this only after atomically persisting both values from `prepared`.
     /// Returns `false` if `prepared` is not the current pending operation.
     pub fn confirm_prepared_send(&mut self, prepared: &PreparedSend) -> bool {
-        let confirmation_token = prepared_transport_token(
+        let confirmation_digest = prepared_transport_digest(
             0,
             prepared.destination_path.as_bytes(),
             &prepared.ciphertext,
             &prepared.resulting_session_state,
         );
-        if confirmation_token != prepared.confirmation_token {
+        if confirmation_digest != prepared.confirmation_digest {
             return false;
         }
-        self.confirm_prepared_transport(&confirmation_token)
+        self.confirm_prepared_transport(&confirmation_digest)
     }
 
     /// Confirm that a prepared receive and its resulting state were durably persisted.
@@ -802,16 +813,16 @@ impl PubkyNoiseEncryptor {
     /// Call this only after atomically persisting both values from `prepared`.
     /// Returns `false` if `prepared` is not the current pending operation.
     pub fn confirm_prepared_receive(&mut self, prepared: &PreparedReceive) -> bool {
-        let confirmation_token = prepared_transport_token(
+        let confirmation_digest = prepared_transport_digest(
             1,
             self.config.read_path.as_bytes(),
             &prepared.plaintext,
             &prepared.resulting_session_state,
         );
-        if confirmation_token != prepared.confirmation_token {
+        if confirmation_digest != prepared.confirmation_digest {
             return false;
         }
-        self.confirm_prepared_transport(&confirmation_token)
+        self.confirm_prepared_transport(&confirmation_digest)
     }
 
     /// Receive and decrypt a message from the remote peer.
@@ -820,7 +831,7 @@ impl PubkyNoiseEncryptor {
     /// (normal polling behaviour).
     ///
     /// # Errors:
-    /// - Returns [`PubkyNoiseError::PreparedTransportPending`] if a staged
+    /// - Returns [`PubkyNoiseError::UnconfirmedPreparedTransport`] if a staged
     ///   transport operation has not been confirmed.
     /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
     /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the homeserver read
@@ -912,12 +923,12 @@ impl PubkyNoiseEncryptor {
     /// Persist the current session snapshot to the homeserver (encrypted path).
     ///
     /// # Errors
-    /// - Returns [`PubkyNoiseError::PreparedTransportPending`] if a prepared
+    /// - Returns [`PubkyNoiseError::UnconfirmedPreparedTransport`] if a prepared
     ///   message and its resulting state must first be persisted together.
     /// - Returns [`PubkyNoiseError::OtherError`] if the homeserver write fails.
     pub async fn persist_snapshot(&self) -> Result<(), PubkyNoiseError> {
-        if self.prepared_transport_pending.is_some() {
-            return Err(PubkyNoiseError::PreparedTransportPending);
+        if self.unconfirmed_transport_digest.is_some() {
+            return Err(PubkyNoiseError::UnconfirmedPreparedTransport);
         }
         let state = self.snapshot();
         let serialized = state.serialize();
@@ -1103,7 +1114,7 @@ impl PubkyNoiseEncryptor {
             link_id,
             endpoint_pubkey,
             last_good_snapshot: None,
-            prepared_transport_pending: None,
+            unconfirmed_transport_digest: None,
             #[cfg(feature = "test-utils")]
             simulate_tampering: false,
             #[cfg(feature = "test-utils")]
