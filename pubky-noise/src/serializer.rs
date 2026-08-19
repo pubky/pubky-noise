@@ -9,8 +9,8 @@ use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
 /// Current serialization format version.
 pub const SESSION_STATE_VERSION: u8 = 1;
 const SESSION_STATE_LEN: usize = 197;
-/// Noise reserves 2^64 - 1, so 2^64 - 2 is the last usable nonce.
-const MAX_USABLE_NOISE_NONCE: u64 = u64::MAX - 1;
+/// Restorable exhausted nonce sentinel; Noise reserves `u64::MAX`.
+const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
 
 /// Serializable snapshot of a `PubkyNoiseEncryptor` session.
 ///
@@ -301,7 +301,7 @@ fn validate_counters(
         return Err(SerializerError::InvalidCounter);
     }
 
-    if sending_nonce > MAX_USABLE_NOISE_NONCE || receiving_nonce > MAX_USABLE_NOISE_NONCE {
+    if sending_nonce > EXHAUSTED_NOISE_NONCE || receiving_nonce > EXHAUSTED_NOISE_NONCE {
         return Err(SerializerError::NonceOverflow);
     }
 
@@ -369,15 +369,15 @@ mod tests {
     }
 
     #[test]
-    fn transport_snapshot_accepts_max_usable_noise_nonce() {
+    fn transport_snapshot_accepts_exhausted_noise_nonce_sentinel() {
         let mut state = transport_state();
-        state.sending_nonce = MAX_USABLE_NOISE_NONCE;
-        state.receiving_nonce = MAX_USABLE_NOISE_NONCE;
+        state.sending_nonce = EXHAUSTED_NOISE_NONCE;
+        state.receiving_nonce = EXHAUSTED_NOISE_NONCE;
         let bytes = state.serialize();
 
         let restored = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
-        assert_eq!(restored.sending_nonce, MAX_USABLE_NOISE_NONCE);
-        assert_eq!(restored.receiving_nonce, MAX_USABLE_NOISE_NONCE);
+        assert_eq!(restored.sending_nonce, EXHAUSTED_NOISE_NONCE);
+        assert_eq!(restored.receiving_nonce, EXHAUSTED_NOISE_NONCE);
     }
 
     #[test]

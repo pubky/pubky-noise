@@ -11,8 +11,9 @@ pub const PUBKY_NOISE_MSG_LEN: usize = 1000;
 pub const PUBKY_NOISE_TAG_LEN: usize = 16;
 /// Ciphertext buffer size: plaintext + AEAD tag.
 pub const PUBKY_NOISE_CIPHERTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + PUBKY_NOISE_TAG_LEN;
-/// Noise reserves 2^64 - 1, so 2^64 - 2 is the last usable nonce.
-const MAX_USABLE_NOISE_NONCE: u64 = u64::MAX - 1;
+/// Noise reserves `u64::MAX`; the preceding value is the exhausted cursor
+/// sentinel so every accepted operation produces a restorable state.
+const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum NoisePhase {
@@ -355,7 +356,8 @@ pub enum ContextError {
 }
 
 fn ensure_counter_can_increment(counter: u32) -> Result<(), ContextError> {
-    if counter == u32::MAX {
+    // Keep u32::MAX - 1 as the exhausted serialized cursor.
+    if counter >= u32::MAX - 1 {
         Err(ContextError::CounterOverflow)
     } else {
         Ok(())
@@ -363,7 +365,7 @@ fn ensure_counter_can_increment(counter: u32) -> Result<(), ContextError> {
 }
 
 fn ensure_nonce_can_increment(nonce: u64) -> Result<(), ContextError> {
-    if nonce > MAX_USABLE_NOISE_NONCE {
+    if nonce >= EXHAUSTED_NOISE_NONCE {
         Err(ContextError::NonceOverflow)
     } else {
         Ok(())
@@ -714,7 +716,7 @@ impl DataLinkContext {
         message: &[u8; PUBKY_NOISE_CIPHERTEXT_LEN],
         payload: &mut [u8; PUBKY_NOISE_MSG_LEN],
         len: usize,
-    ) -> Result<(), ContextError> {
+    ) -> Result<usize, ContextError> {
         if !self.is_transport() {
             return Err(ContextError::OngoingHandshake);
         }
@@ -723,7 +725,6 @@ impl DataLinkContext {
             .as_ref()
             .ok_or(ContextError::OngoingHandshake)?
             .read_message(self.receiving_nonce, &message[..len], payload)
-            .map(|_| ())
             .map_err(|_| ContextError::InternalSnowReadErr)
     }
 
@@ -924,17 +925,32 @@ mod tests {
         let (initiator, responder) = transport_contexts();
         let mut ciphertext = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
         let mut plaintext = [0; PUBKY_NOISE_MSG_LEN];
-        let message = b"prepared transport message";
+        let message = b"prepared transport message\0\0";
 
         let ciphertext_len = initiator
             .prepare_transport_write(message, &mut ciphertext)
             .unwrap();
-        responder
+        let plaintext_len = responder
             .prepare_transport_read(&ciphertext, &mut plaintext, ciphertext_len)
             .unwrap();
 
-        assert_eq!(&plaintext[..message.len()], message);
+        assert_eq!(plaintext_len, message.len());
+        assert_eq!(&plaintext[..plaintext_len], message);
         assert_eq!(initiator.get_sending_nonce(), 0);
         assert_eq!(responder.get_receiving_nonce(), 0);
+    }
+
+    #[test]
+    fn test_transport_cursor_boundaries_reserve_restorable_sentinel() {
+        assert!(ensure_counter_can_increment(u32::MAX - 2).is_ok());
+        assert!(matches!(
+            ensure_counter_can_increment(u32::MAX - 1),
+            Err(ContextError::CounterOverflow)
+        ));
+        assert!(ensure_nonce_can_increment(u64::MAX - 2).is_ok());
+        assert!(matches!(
+            ensure_nonce_can_increment(u64::MAX - 1),
+            Err(ContextError::NonceOverflow)
+        ));
     }
 }

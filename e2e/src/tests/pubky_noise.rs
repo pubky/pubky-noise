@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::{
     ops::Deref,
     sync::{Arc, Weak},
@@ -290,9 +292,9 @@ async fn send_and_verify(
 }
 
 /// Verify the first received payload starts with the expected message bytes.
-fn assert_received_message(results: &[[u8; PUBKY_NOISE_MSG_LEN]], expected: &[u8]) {
+fn assert_received_message(results: &[Vec<u8>], expected: &[u8]) {
     assert!(!results.is_empty());
-    assert_eq!(&results[0][..expected.len()], expected);
+    assert_eq!(results[0], expected);
 }
 
 /// Send a message and verify the receiver gets a DecryptionError from tampering.
@@ -1168,8 +1170,8 @@ async fn snow_test_restore() {
     .await;
 
     // Snapshot both sides
-    let initiator_snapshot = pair.initiator.snapshot();
-    let responder_snapshot = pair.responder.snapshot();
+    let initiator_snapshot = pair.initiator.snapshot().unwrap();
+    let responder_snapshot = pair.responder.snapshot().unwrap();
 
     // Serialize and deserialize (round-trip test)
     let initiator_bytes = initiator_snapshot.serialize();
@@ -1229,79 +1231,55 @@ async fn snow_test_prepared_transport_state_handoff() {
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
 
-    let sender_before = pair.initiator.snapshot();
-    let message = b"prepared transport message";
+    let sender_before = pair.initiator.snapshot().unwrap();
+    let message = b"prepared transport message\0\0";
     let prepared_send = pair.initiator.prepare_send(message).unwrap();
 
-    let sender_after_prepare = pair.initiator.snapshot();
     assert_eq!(
-        sender_after_prepare.sending_nonce,
+        pair.initiator.snapshot().unwrap_err(),
+        PubkyNoiseError::UnacknowledgedPreparedTransport
+    );
+    assert_eq!(
+        prepared_send.resulting_session_state().sending_nonce,
         sender_before.sending_nonce + 1
     );
     assert_eq!(
-        sender_after_prepare.write_counter,
-        sender_before.write_counter + 1
-    );
-    assert_eq!(
-        prepared_send.resulting_session_state.sending_nonce,
-        sender_before.sending_nonce + 1
-    );
-    assert_eq!(
-        prepared_send.resulting_session_state.write_counter,
+        prepared_send.resulting_session_state().write_counter,
         sender_before.write_counter + 1
     );
 
     assert_eq!(
         pair.initiator.prepare_send(b"next message").unwrap_err(),
-        PubkyNoiseError::UnconfirmedPreparedTransport
+        PubkyNoiseError::UnacknowledgedPreparedTransport
     );
     assert_eq!(
         pair.initiator.next_receive_path().unwrap_err(),
-        PubkyNoiseError::UnconfirmedPreparedTransport
+        PubkyNoiseError::UnacknowledgedPreparedTransport
     );
     assert_eq!(
         pair.initiator.persist_snapshot().await.unwrap_err(),
-        PubkyNoiseError::UnconfirmedPreparedTransport
+        PubkyNoiseError::UnacknowledgedPreparedTransport
     );
 
+    let sender_state =
+        PubkyNoiseSessionState::deserialize(&prepared_send.resulting_session_state().serialize())
+            .unwrap();
     pair.initiator_config
         .local_session
         .storage()
         .put(
-            prepared_send.destination_path.clone(),
-            prepared_send.ciphertext.to_vec(),
+            prepared_send.destination_path(),
+            prepared_send.ciphertext().to_vec(),
         )
         .await
         .unwrap();
-
-    let mut altered_prepared_send = prepared_send.clone();
-    altered_prepared_send.ciphertext[2] ^= 1;
-    assert!(!pair.initiator.confirm_prepared_send(&altered_prepared_send));
-    assert!(pair.initiator.confirm_prepared_send(&prepared_send));
-    assert!(!pair.initiator.confirm_prepared_send(&prepared_send));
-    let next_prepared_send = pair.initiator.prepare_send(b"next message").unwrap();
-    assert_ne!(
-        next_prepared_send.destination_path,
-        prepared_send.destination_path
-    );
-    assert_eq!(
-        next_prepared_send.resulting_session_state.sending_nonce,
-        sender_before.sending_nonce + 2
-    );
-    assert!(!pair.initiator.confirm_prepared_send(&prepared_send));
-    assert_eq!(
-        pair.initiator.next_receive_path().unwrap_err(),
-        PubkyNoiseError::UnconfirmedPreparedTransport
-    );
-    pair.initiator_config
-        .local_session
-        .storage()
-        .put(
-            prepared_send.destination_path.clone(),
-            prepared_send.ciphertext.to_vec(),
-        )
-        .await
+    pair.initiator
+        .acknowledge_persisted_send(prepared_send)
         .unwrap();
+    assert_eq!(
+        pair.initiator.snapshot().unwrap().serialize(),
+        sender_state.serialize()
+    );
 
     let receive_path = pair.responder.next_receive_path().unwrap();
     let response = pair
@@ -1313,40 +1291,34 @@ async fn snow_test_prepared_transport_state_handoff() {
         .unwrap();
     let ciphertext = response.bytes().await.unwrap();
 
-    let receiver_before = pair.responder.snapshot();
+    let receiver_before = pair.responder.snapshot().unwrap();
     let prepared_receive = pair.responder.prepare_receive(&ciphertext).unwrap();
-    assert_eq!(&prepared_receive.plaintext[..message.len()], message);
+    assert_eq!(prepared_receive.plaintext(), message);
 
-    let receiver_after_prepare = pair.responder.snapshot();
     assert_eq!(
-        receiver_after_prepare.receiving_nonce,
+        pair.responder.snapshot().unwrap_err(),
+        PubkyNoiseError::UnacknowledgedPreparedTransport
+    );
+    assert_eq!(
+        prepared_receive.resulting_session_state().receiving_nonce,
         receiver_before.receiving_nonce + 1
     );
     assert_eq!(
-        receiver_after_prepare.read_counter,
-        receiver_before.read_counter + 1
-    );
-    assert_eq!(
-        prepared_receive.resulting_session_state.receiving_nonce,
-        receiver_before.receiving_nonce + 1
-    );
-    assert_eq!(
-        prepared_receive.resulting_session_state.read_counter,
+        prepared_receive.resulting_session_state().read_counter,
         receiver_before.read_counter + 1
     );
 
-    let sender_state =
-        PubkyNoiseSessionState::deserialize(&prepared_send.resulting_session_state.serialize())
-            .unwrap();
-    let receiver_state =
-        PubkyNoiseSessionState::deserialize(&prepared_receive.resulting_session_state.serialize())
-            .unwrap();
-    let mut altered_prepared_receive = prepared_receive.clone();
-    altered_prepared_receive.plaintext[0] ^= 1;
-    assert!(!pair
-        .responder
-        .confirm_prepared_receive(&altered_prepared_receive));
-    assert!(pair.responder.confirm_prepared_receive(&prepared_receive));
+    let receiver_state = PubkyNoiseSessionState::deserialize(
+        &prepared_receive.resulting_session_state().serialize(),
+    )
+    .unwrap();
+    pair.responder
+        .acknowledge_persisted_receive(prepared_receive)
+        .unwrap();
+    assert_eq!(
+        pair.responder.snapshot().unwrap().serialize(),
+        receiver_state.serialize()
+    );
 
     let mut restored_sender = PubkyNoiseEncryptor::restore(
         pair.initiator_config.clone(),
@@ -1369,6 +1341,243 @@ async fn snow_test_prepared_transport_state_handoff() {
         "message after prepared handoff",
     )
     .await;
+}
+
+/// The final accepted send and receive state remains serializable and
+/// restorable; the next operation fails before using an unrestorable cursor.
+#[tokio::test]
+async fn snow_test_prepared_transport_cursor_boundaries_restore() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+
+    let sender_base = pair.initiator.snapshot().unwrap();
+    let receiver_base = pair.responder.snapshot().unwrap();
+
+    let mut sender_nonce_state = sender_base.clone();
+    sender_nonce_state.sending_nonce = u64::MAX - 2;
+    let mut sender_nonce = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        sender_nonce_state,
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    let final_nonce_send = sender_nonce.prepare_send(b"final nonce send").unwrap();
+    assert_eq!(
+        final_nonce_send.resulting_session_state().sending_nonce,
+        u64::MAX - 1
+    );
+    let final_nonce_state = PubkyNoiseSessionState::deserialize(
+        &final_nonce_send.resulting_session_state().serialize(),
+    )
+    .unwrap();
+    let mut exhausted_nonce_sender = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        final_nonce_state,
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        exhausted_nonce_sender
+            .prepare_send(b"too late")
+            .unwrap_err(),
+        PubkyNoiseError::NonceOverflow
+    );
+
+    let mut sender_slot_state = sender_base.clone();
+    sender_slot_state.write_counter = u32::MAX - 2;
+    let mut sender_slot = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        sender_slot_state,
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    let final_slot_send = sender_slot.prepare_send(b"final slot send").unwrap();
+    assert_eq!(
+        final_slot_send.resulting_session_state().write_counter,
+        u32::MAX - 1
+    );
+    let final_slot_state =
+        PubkyNoiseSessionState::deserialize(&final_slot_send.resulting_session_state().serialize())
+            .unwrap();
+    let mut exhausted_slot_sender = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        final_slot_state,
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        exhausted_slot_sender.prepare_send(b"too late").unwrap_err(),
+        PubkyNoiseError::CounterOverflow
+    );
+
+    let mut matching_sender_state = sender_base.clone();
+    matching_sender_state.sending_nonce = u64::MAX - 2;
+    let mut matching_sender = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        matching_sender_state,
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    let ciphertext = matching_sender
+        .prepare_send(b"final nonce receive")
+        .unwrap()
+        .ciphertext()
+        .to_vec();
+
+    let mut receiver_nonce_state = receiver_base.clone();
+    receiver_nonce_state.receiving_nonce = u64::MAX - 2;
+    let mut receiver_nonce = PubkyNoiseEncryptor::restore(
+        pair.responder_config.clone(),
+        receiver_nonce_state,
+        pair.initiator_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    let final_nonce_receive = receiver_nonce.prepare_receive(&ciphertext).unwrap();
+    assert_eq!(
+        final_nonce_receive
+            .resulting_session_state()
+            .receiving_nonce,
+        u64::MAX - 1
+    );
+    let final_receive_nonce_state = PubkyNoiseSessionState::deserialize(
+        &final_nonce_receive.resulting_session_state().serialize(),
+    )
+    .unwrap();
+    let mut exhausted_nonce_receiver = PubkyNoiseEncryptor::restore(
+        pair.responder_config.clone(),
+        final_receive_nonce_state,
+        pair.initiator_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        exhausted_nonce_receiver
+            .prepare_receive(&ciphertext)
+            .unwrap_err(),
+        PubkyNoiseError::NonceOverflow
+    );
+
+    let mut matching_sender = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        sender_base,
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    let ciphertext = matching_sender
+        .prepare_send(b"final slot receive")
+        .unwrap()
+        .ciphertext()
+        .to_vec();
+
+    let mut receiver_slot_state = receiver_base;
+    receiver_slot_state.read_counter = u32::MAX - 2;
+    let mut receiver_slot = PubkyNoiseEncryptor::restore(
+        pair.responder_config.clone(),
+        receiver_slot_state,
+        pair.initiator_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    let final_slot_receive = receiver_slot.prepare_receive(&ciphertext).unwrap();
+    assert_eq!(
+        final_slot_receive.resulting_session_state().read_counter,
+        u32::MAX - 1
+    );
+    let final_receive_slot_state = PubkyNoiseSessionState::deserialize(
+        &final_slot_receive.resulting_session_state().serialize(),
+    )
+    .unwrap();
+    let mut exhausted_slot_receiver = PubkyNoiseEncryptor::restore(
+        pair.responder_config.clone(),
+        final_receive_slot_state,
+        pair.initiator_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        exhausted_slot_receiver
+            .prepare_receive(&ciphertext)
+            .unwrap_err(),
+        PubkyNoiseError::CounterOverflow
+    );
+}
+
+/// Prepared handles cannot acknowledge another encryptor's pending operation.
+#[tokio::test]
+async fn snow_test_prepared_transport_acknowledgement_rejects_mismatch() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+
+    let initiator_state = pair.initiator.snapshot().unwrap();
+    let initiator_send = pair.initiator.prepare_send(b"initiator").unwrap();
+    let responder_send = pair.responder.prepare_send(b"responder").unwrap();
+
+    assert_eq!(
+        pair.responder
+            .acknowledge_persisted_send(initiator_send)
+            .unwrap_err(),
+        PubkyNoiseError::PreparedTransportMismatch
+    );
+    pair.responder
+        .acknowledge_persisted_send(responder_send)
+        .unwrap();
+
+    let mut fresh_initiator = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        initiator_state,
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    let no_pending_send = fresh_initiator
+        .prepare_send(b"no pending on initiator")
+        .unwrap();
+    assert_eq!(
+        pair.responder
+            .acknowledge_persisted_send(no_pending_send)
+            .unwrap_err(),
+        PubkyNoiseError::NoPreparedTransport
+    );
+}
+
+/// The deprecated convenience sender retains and retries the exact packet
+/// after an ambiguous publication failure instead of reusing its nonce.
+#[tokio::test]
+async fn snow_test_send_message_failure_retries_exact_ciphertext() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+
+    pair.initiator.test_enable_write_failure();
+    assert_eq!(
+        pair.initiator
+            .send_message(b"retry exactly")
+            .await
+            .unwrap_err(),
+        PubkyNoiseError::HomeserverWriteError
+    );
+    assert_eq!(
+        pair.initiator.prepare_send(b"different").unwrap_err(),
+        PubkyNoiseError::UnacknowledgedPreparedTransport
+    );
+    assert_eq!(
+        pair.initiator.snapshot().unwrap_err(),
+        PubkyNoiseError::UnacknowledgedPreparedTransport
+    );
+
+    pair.initiator.test_disable_write_failure();
+    pair.initiator.retry_pending_send().await.unwrap();
+    let received = pair.responder.receive_message().await.unwrap();
+    assert_eq!(received, vec![b"retry exactly".to_vec()]);
 }
 
 /// Packets shorter than their declared length are rejected.
@@ -1408,7 +1617,7 @@ async fn snow_test_restore_serialization_roundtrip() {
     }
 
     // Take snapshot and verify round-trip
-    let snapshot = pair.initiator.snapshot();
+    let snapshot = pair.initiator.snapshot().unwrap();
     let bytes = snapshot.serialize();
     let restored = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
 
@@ -1443,7 +1652,7 @@ async fn snow_test_restore_link_id_matches() {
     assert_eq!(original_init_link, original_resp_link);
 
     // Snapshot and restore initiator
-    let init_snapshot = pair.initiator.snapshot();
+    let init_snapshot = pair.initiator.snapshot().unwrap();
     let init_bytes = init_snapshot.serialize();
     let init_state = PubkyNoiseSessionState::deserialize(&init_bytes).unwrap();
     let restored_initiator = PubkyNoiseEncryptor::restore(
@@ -1455,7 +1664,7 @@ async fn snow_test_restore_link_id_matches() {
     .unwrap();
 
     // Snapshot and restore responder
-    let resp_snapshot = pair.responder.snapshot();
+    let resp_snapshot = pair.responder.snapshot().unwrap();
     let resp_bytes = resp_snapshot.serialize();
     let resp_state = PubkyNoiseSessionState::deserialize(&resp_bytes).unwrap();
     let restored_responder = PubkyNoiseEncryptor::restore(
@@ -1526,7 +1735,7 @@ async fn snow_test_NN_responder_read_failure_no_state_advance() {
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
 
     // Snapshot responder BEFORE any handshake activity
-    let snap_before = pair.responder.snapshot();
+    let snap_before = pair.responder.snapshot().unwrap();
     assert_eq!(snap_before.noise_step, NoiseStep::StepOne);
     assert_eq!(snap_before.sub_step_index, 0);
     assert_eq!(snap_before.counter, 0);
@@ -1537,7 +1746,7 @@ async fn snow_test_NN_responder_read_failure_no_state_advance() {
     assert_eq!(result, HandshakeResult::Pending);
 
     // Snapshot responder AFTER the failed read
-    let snap_after = pair.responder.snapshot();
+    let snap_after = pair.responder.snapshot().unwrap();
 
     // State must NOT have advanced
     assert_eq!(snap_after.noise_step, snap_before.noise_step);
@@ -1550,7 +1759,7 @@ async fn snow_test_NN_responder_read_failure_no_state_advance() {
         let result = pair.responder.handle_handshake().await.unwrap();
         assert_eq!(result, HandshakeResult::Pending);
     }
-    let snap_after_retries = pair.responder.snapshot();
+    let snap_after_retries = pair.responder.snapshot().unwrap();
     assert_eq!(snap_after_retries.counter, 0);
     assert_eq!(snap_after_retries.noise_step, NoiseStep::StepOne);
     assert_eq!(snap_after_retries.sub_step_index, 0);
@@ -1602,7 +1811,7 @@ async fn snow_test_XX_responder_read_failure_no_state_advance() {
     let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
 
     // Snapshot responder BEFORE any handshake activity
-    let snap_before = pair.responder.snapshot();
+    let snap_before = pair.responder.snapshot().unwrap();
     assert_eq!(snap_before.noise_step, NoiseStep::StepOne);
     assert_eq!(snap_before.sub_step_index, 0);
     assert_eq!(snap_before.counter, 0);
@@ -1613,7 +1822,7 @@ async fn snow_test_XX_responder_read_failure_no_state_advance() {
     assert_eq!(result, HandshakeResult::Pending);
 
     // State must NOT have advanced
-    let snap_after = pair.responder.snapshot();
+    let snap_after = pair.responder.snapshot().unwrap();
     assert_eq!(snap_after.noise_step, snap_before.noise_step);
     assert_eq!(snap_after.sub_step_index, snap_before.sub_step_index);
     assert_eq!(snap_after.counter, snap_before.counter);
@@ -1623,7 +1832,7 @@ async fn snow_test_XX_responder_read_failure_no_state_advance() {
         let result = pair.responder.handle_handshake().await.unwrap();
         assert_eq!(result, HandshakeResult::Pending);
     }
-    let snap_after_retries = pair.responder.snapshot();
+    let snap_after_retries = pair.responder.snapshot().unwrap();
     assert_eq!(snap_after_retries.counter, 0);
     assert_eq!(snap_after_retries.noise_step, NoiseStep::StepOne);
     assert_eq!(snap_after_retries.sub_step_index, 0);
@@ -1699,7 +1908,7 @@ async fn snow_test_NN_initiator_write_failure_and_replay_recovery() {
     assert_eq!(pre_write_snapshot.sub_step_index, 0);
 
     // Verify Initiator's current state IS advanced (this is the erroneous advance)
-    let post_write_snapshot = pair.initiator.snapshot();
+    let post_write_snapshot = pair.initiator.snapshot().unwrap();
     assert_eq!(post_write_snapshot.counter, 1);
     assert_eq!(post_write_snapshot.noise_step, NoiseStep::StepTwo);
     assert_eq!(post_write_snapshot.sub_step_index, 0);
@@ -1751,7 +1960,7 @@ async fn snow_test_NN_initiator_write_failure_and_replay_recovery() {
     .unwrap();
 
     // Verify restored state is back to the correct initial position
-    let restored_snapshot = restored_initiator.snapshot();
+    let restored_snapshot = restored_initiator.snapshot().unwrap();
     assert_eq!(restored_snapshot.counter, 0);
     assert_eq!(restored_snapshot.noise_step, NoiseStep::StepOne);
     assert_eq!(restored_snapshot.sub_step_index, 0);
@@ -1839,7 +2048,7 @@ async fn snow_test_XX_initiator_write_failure_and_replay_recovery() {
     assert_eq!(pre_second_write_snapshot.sub_step_index, 0);
 
     // Verify state advanced: counter=3 (read slot 1 + write slot 2), step=Final
-    let post_write_snapshot = pair.initiator.snapshot();
+    let post_write_snapshot = pair.initiator.snapshot().unwrap();
     assert_eq!(post_write_snapshot.counter, 3);
     assert_eq!(post_write_snapshot.noise_step, NoiseStep::Final);
 
@@ -1883,7 +2092,7 @@ async fn snow_test_XX_initiator_write_failure_and_replay_recovery() {
 
     // Verify restored state: counter=1, step=StepTwo, sub_step=0
     // (back to before the Read+Write that was lost)
-    let restored_snapshot = restored_initiator.snapshot();
+    let restored_snapshot = restored_initiator.snapshot().unwrap();
     assert_eq!(restored_snapshot.counter, pre_second_write_snapshot.counter);
     assert_eq!(
         restored_snapshot.noise_step,
@@ -1953,7 +2162,7 @@ async fn snow_test_last_good_snapshot_tracks_pre_mutation_state() {
     assert_eq!(snap.phase, NoisePhase::HandShake);
 
     // Current state should be AFTER the call (advanced)
-    let current = pair.initiator.snapshot();
+    let current = pair.initiator.snapshot().unwrap();
     assert_eq!(current.counter, 1);
     assert_eq!(current.noise_step, NoiseStep::StepTwo);
     assert_eq!(current.sub_step_index, 0);
@@ -1968,7 +2177,7 @@ async fn snow_test_last_good_snapshot_tracks_pre_mutation_state() {
     assert_eq!(snap.sub_step_index, 0);
 
     // Responder advanced: read slot 0 + write slot 1 = counter 2, step StepTwo
-    let current = pair.responder.snapshot();
+    let current = pair.responder.snapshot().unwrap();
     assert_eq!(current.counter, 2);
     assert_eq!(current.noise_step, NoiseStep::StepTwo);
 
@@ -1983,7 +2192,7 @@ async fn snow_test_last_good_snapshot_tracks_pre_mutation_state() {
     assert_eq!(snap.sub_step_index, 0);
 
     // Current state: read slot 1, step advanced to Final
-    let current = pair.initiator.snapshot();
+    let current = pair.initiator.snapshot().unwrap();
     assert_eq!(current.counter, 2);
     assert_eq!(current.noise_step, NoiseStep::Final);
 
@@ -2041,7 +2250,7 @@ async fn snow_test_NN_initiator_put_failure_returns_error() {
     .unwrap();
 
     // Verify restored state matches the pre-failure snapshot
-    let restored_snapshot = restored_initiator.snapshot();
+    let restored_snapshot = restored_initiator.snapshot().unwrap();
     assert_eq!(restored_snapshot.counter, 0);
     assert_eq!(restored_snapshot.noise_step, NoiseStep::StepOne);
     assert_eq!(restored_snapshot.sub_step_index, 0);
@@ -2138,7 +2347,7 @@ async fn snow_test_XX_initiator_put_failure_returns_error() {
     .unwrap();
 
     // Verify restored state
-    let restored_snapshot = restored_initiator.snapshot();
+    let restored_snapshot = restored_initiator.snapshot().unwrap();
     assert_eq!(restored_snapshot.counter, pre_failure_snapshot.counter);
     assert_eq!(
         restored_snapshot.noise_step,

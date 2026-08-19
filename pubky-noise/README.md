@@ -62,8 +62,17 @@ loop {
 // 4. Transition to transport phase
 let link_id = initiator.transition_transport().unwrap();
 
-// 5. Send and receive encrypted messages
-initiator.send_message(b"Hello, peer!").await?;
+// 5. Prepare, durably queue, and publish an encrypted message
+let prepared = initiator.prepare_send(b"Hello, peer!")?;
+durable_store.commit_send(
+    prepared.destination_path(),
+    prepared.ciphertext(),
+    prepared.resulting_session_state(),
+)?;
+initiator.acknowledge_persisted_send(prepared)?;
+durable_publisher.flush_in_order().await?;
+
+// Receive convenience API; use prepare_receive for durable processing.
 let messages = initiator.receive_message().await?;
 
 // 6. Clean up
@@ -145,14 +154,24 @@ new() --> handle_handshake() [loop] --> transition_transport() --> send/receive 
 
 ### Staged Transport Operations
 
-`send_message()` and `receive_message()` remain the simplest transport APIs.
-Callers that need durable coordination can instead stage each state transition:
+Transport sends use staged state transitions so ambiguous homeserver responses
+cannot cause a fresh plaintext to reuse a nonce:
 
 1. Call `prepare_send()` to obtain the destination path, exact ciphertext, and resulting session state.
-2. Persist the prepared operation before publishing the ciphertext, then call `confirm_prepared_send()`. Preparation reserves the nonce and storage slot until confirmation.
-3. For inbound data, fetch `next_receive_path()`, call `prepare_receive()`, atomically persist the resulting state with the application's durable processing result, and call `confirm_prepared_receive()`.
+2. Atomically persist the exact ciphertext and resulting session state in a durable outbound queue.
+3. Call `acknowledge_persisted_send()`. The handle is consumed and the encryptor may prepare the next message.
+4. Publish queued ciphertexts in order. If publication is uncertain, retry the exact stored ciphertext.
+5. For inbound data, fetch `next_receive_path()`, call `prepare_receive()`, atomically persist the resulting state with the application's durable processing result, and call `acknowledge_persisted_receive()`.
 
-If a durable commit fails, discard the advanced encryptor and restore the previous state. If publication status is uncertain, retry the exact prepared ciphertext rather than encrypting the plaintext again. Callers sharing state across processes must serialize preparation and use conditional state updates.
+If the durable commit fails, drop the advanced encryptor and restore the previous
+durable state. There is no in-place discard operation. Callers sharing state
+across processes must serialize preparation and use conditional state updates.
+
+`send_message()` is deprecated because it cannot make the exact ciphertext and
+resulting state durable atomically. After an ambiguous in-process write failure,
+`retry_pending_send()` republishes the exact retained ciphertext. This recovery
+does not survive a process crash. `receive_message()` remains available for
+callers that do not need atomic application-state processing.
 
 Decrypted plaintext is sensitive application data. Avoid logging it, minimize copies, and protect it at rest whenever the application protocol requires persistence.
 
@@ -254,7 +273,7 @@ Sessions can be snapshotted, serialized, and restored to recover from crashes or
 
 ```rust,ignore
 // Take a snapshot (automatic during handle_handshake, or manual)
-let snapshot = encryptor.snapshot();
+let snapshot = encryptor.snapshot()?;
 let bytes = snapshot.serialize();
 // ... persist bytes to storage ...
 
@@ -398,11 +417,14 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 | `BadLengthCiphertext` | Received message exceeds max size | Discard message, check sender |
 | `HomeserverResponseError` | Failed to parse homeserver response | Retry |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
-| `IsHandshake` | Called `transition_transport()`, `send_message()`, or `receive_message()` before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
+| `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
 | `DecryptionError` | Noise decryption failed during `receive_message()` | Message may be tampered or nonces desynchronized |
 | `CounterOverflow` | Message slot counter space is exhausted | Start a new Noise session |
 | `NonceOverflow` | Transport nonce space is exhausted | Start a new Noise session |
+| `UnacknowledgedPreparedTransport` | A prepared operation has not been durably acknowledged | Persist and acknowledge its handle, or restore the previous durable state if persistence failed |
+| `NoPreparedTransport` | An acknowledgement was attempted with no pending operation | Check the caller's operation lifecycle |
+| `PreparedTransportMismatch` | A prepared handle belongs to another encryptor or operation | Use the handle returned by the current encryptor |
 | `RestoreReplayError` | Handshake replay failed during restore | Check that homeserver messages are intact |
 | `RestoreHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
 | `RestoreDeserializeError` | Snapshot deserialization failed | Check data integrity |
