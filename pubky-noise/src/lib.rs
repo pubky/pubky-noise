@@ -120,7 +120,7 @@ pub enum HandshakeResult {
     Terminal,
 }
 
-/// A transport message prepared for durable publication.
+/// A transport message staged for durable queuing and later publication.
 ///
 /// Preparing a send reserves its nonce and storage slot on the encryptor.
 /// Callers must persist this value before publishing its ciphertext.
@@ -208,9 +208,13 @@ impl std::fmt::Debug for PreparedReceive {
     }
 }
 
+/// Exact in-memory retry state retained by the deprecated convenience send API.
 struct PendingConvenienceSend {
+    /// Pubky path targeted by the original send attempt.
     destination_path: String,
+    /// Ciphertext that must be retried without re-encryption.
     ciphertext: [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2],
+    /// Digest used to acknowledge the matching prepared state transition.
     acknowledgement_digest: [u8; 32],
 }
 
@@ -349,7 +353,9 @@ pub struct PubkyNoiseEncryptor {
     /// [`handle_handshake()`](Self::handle_handshake) call, before any
     /// state-mutating work. See [`last_good_snapshot()`](Self::last_good_snapshot).
     last_good_snapshot: Option<PubkyNoiseSessionState>,
+    /// Fences transport operations until the prepared transition is persisted.
     unacknowledged_transport_digest: Option<[u8; 32]>,
+    /// Exact retry data retained after an ambiguous convenience-send failure.
     pending_convenience_send: Option<PendingConvenienceSend>,
 
     // test-only fields — stripped from production builds
@@ -630,7 +636,7 @@ impl PubkyNoiseEncryptor {
             .set_write_counter(prepared.resulting_session_state.write_counter);
     }
 
-    /// Prepare plaintext for durable publication over the established transport.
+    /// Encrypt and stage a transport message for durable queuing.
     ///
     /// This method performs the Noise encryption without writing to Pubky. It
     /// reserves the nonce and storage slot on this encryptor so another call
@@ -639,7 +645,7 @@ impl PubkyNoiseEncryptor {
     ///
     /// Persist the returned operation before publishing its ciphertext. If
     /// persistence fails, discard this encryptor and restore its previous
-    /// durable state. If publication status is uncertain, retry the exact
+    /// persisted state. If publication status is uncertain, retry the exact
     /// prepared ciphertext instead of preparing the plaintext again.
     ///
     /// Callers sharing session state across processes must serialize preparation
@@ -845,13 +851,13 @@ impl PubkyNoiseEncryptor {
             .set_read_counter(prepared.resulting_session_state.read_counter);
     }
 
-    /// Prepare an inbound ciphertext for durable processing.
+    /// Prepare an inbound ciphertext for durable application processing.
     ///
     /// This method decrypts the packet and advances this encryptor past it
     /// without performing network I/O. Atomically persist
     /// `resulting_session_state` with the durable application state produced
     /// from the plaintext before treating the event as processed. If persistence
-    /// fails, discard this encryptor and restore its previous durable state.
+    /// fails, discard this encryptor and restore its previous persisted state.
     ///
     /// Treat the plaintext as sensitive application data. Do not log it, and
     /// protect it at rest if the application protocol requires its persistence.
@@ -1012,6 +1018,15 @@ impl PubkyNoiseEncryptor {
     /// This snapshot contains everything needed to restore the session later
     /// by replaying persisted handshake messages.
     ///
+    /// # Security
+    ///
+    /// The snapshot contains static and ephemeral secret key material. Encrypt
+    /// and authenticate it at rest, restrict access to authorized callers, and
+    /// delete superseded snapshots. Retaining restorable ephemeral material
+    /// extends its lifetime and can expose messages from this Noise session if
+    /// the snapshot is compromised. Establish fresh sessions periodically to
+    /// bound that exposure.
+    ///
     /// During the handshake phase, a pre-mutation snapshot is captured
     /// automatically by [`handle_handshake()`](Self::handle_handshake) and
     /// is accessible via [`last_good_snapshot()`](Self::last_good_snapshot).
@@ -1052,7 +1067,12 @@ impl PubkyNoiseEncryptor {
         }
     }
 
-    /// Persist the current session snapshot to the homeserver (encrypted path).
+    /// Persist the current session snapshot to the configured Pubky path.
+    ///
+    /// This method writes the serialized secret-bearing snapshot without
+    /// application-layer encryption. Use [`snapshot()`](Self::snapshot) and
+    /// caller-managed authenticated encryption when the configured storage is
+    /// not confidential.
     ///
     /// # Errors
     /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] if a prepared

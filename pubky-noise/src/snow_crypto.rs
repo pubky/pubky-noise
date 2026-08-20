@@ -11,8 +11,8 @@ pub const PUBKY_NOISE_MSG_LEN: usize = 1000;
 pub const PUBKY_NOISE_TAG_LEN: usize = 16;
 /// Ciphertext buffer size: plaintext + AEAD tag.
 pub const PUBKY_NOISE_CIPHERTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + PUBKY_NOISE_TAG_LEN;
-/// Noise reserves `u64::MAX`; the preceding value is the exhausted cursor
-/// sentinel so every accepted operation produces a restorable state.
+/// Noise reserves `u64::MAX`. The preceding value is the exhausted cursor,
+/// making `u64::MAX - 2` the final usable nonce.
 const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]

@@ -269,6 +269,24 @@ Sessions can be snapshotted, serialized, and restored to recover from crashes or
 | 161-164 | 4 | read counter (u32 big-endian) |
 | 165-196 | 32 | endpoint public key |
 
+### Snapshot Security
+
+Session snapshots contain static and ephemeral secret key material. Encrypt and
+authenticate them at rest, restrict access to apps or processes authorized for
+the same identity, and delete superseded snapshots. Retaining restorable
+ephemeral material extends its lifetime and can expose messages from that Noise
+session if a snapshot is compromised. Establish fresh sessions periodically to
+bound that exposure.
+
+At-rest encryption protects the stored bytes but does not remove this tradeoff
+while a snapshot remains recoverable. The staged transport APIs also do not
+provide cross-process authorization or locking; callers must enforce both.
+
+`persist_snapshot()` writes the serialized snapshot directly to the configured
+Pubky path without application-layer encryption. When that storage is not
+confidential, use `snapshot()` and persist it with caller-managed authenticated
+encryption instead.
+
 ### Recovery Flow
 
 ```rust,ignore
