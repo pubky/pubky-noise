@@ -76,13 +76,24 @@ fn map_backup_error(err: backup_crypto::BackupCryptoError) -> PubkyNoiseError {
 /// Returned by [`PubkyNoiseEncryptor::load_snapshot`]. The `generation` is
 /// the caller-managed monotonic counter bound into the backup; callers should
 /// record it in trusted local storage as their new rollback checkpoint.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LoadedSnapshot {
     /// The generation the backup was persisted with.
     pub generation: u64,
     /// The decrypted session state, ready for
     /// [`PubkyNoiseEncryptor::restore`].
     pub state: PubkyNoiseSessionState,
+}
+
+/// Redacted `Debug`: delegates to the redacted `Debug` of
+/// [`PubkyNoiseSessionState`], which never renders secret key material.
+impl std::fmt::Debug for LoadedSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedSnapshot")
+            .field("generation", &self.generation)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 #[derive(Eq, Hash, PartialEq, Debug)]
@@ -986,5 +997,52 @@ impl std::fmt::Debug for PubkyNoiseConfig {
             .field("pubky_noise_version", &self.pubky_noise_version)
             .field("default_pattern", &self.default_pattern)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
+
+    fn state_with_secrets() -> PubkyNoiseSessionState {
+        PubkyNoiseSessionState {
+            version: SESSION_STATE_VERSION,
+            phase: NoisePhase::Transport,
+            pattern: HandshakePattern::PatternNN,
+            initiator: true,
+            ephemeral_secret: [0xAA; 32],
+            static_secret: Some([0xBB; 32]),
+            counter: 2,
+            noise_step: NoiseStep::Final,
+            sub_step_index: 0,
+            handshake_hash: Some([2; 32]),
+            link_id: Some([3; 32]),
+            sending_nonce: 2,
+            receiving_nonce: 1,
+            write_counter: 9,
+            read_counter: 7,
+            endpoint_pubkey: [4; 32],
+        }
+    }
+
+    #[test]
+    fn loaded_snapshot_debug_redacts_secrets() {
+        let loaded = LoadedSnapshot {
+            generation: 7,
+            state: state_with_secrets(),
+        };
+
+        let rendered = format!("{loaded:?}");
+
+        assert!(
+            !rendered.contains(format!("{:?}", [0xAA; 32]).as_str()),
+            "ephemeral secret leaked in Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains(format!("{:?}", [0xBB; 32]).as_str()),
+            "static secret leaked in Debug: {rendered}"
+        );
+        assert!(rendered.contains("generation"));
     }
 }

@@ -18,7 +18,7 @@ const MAX_USABLE_NOISE_NONCE: u64 = u64::MAX - 1;
 /// This struct contains everything needed to reconstruct the Noise session
 /// by replaying persisted handshake messages through a fresh `HandshakeState`
 /// built with the same ephemeral key material.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PubkyNoiseSessionState {
     /// Format version for forward compatibility.
     pub version: u8,
@@ -54,6 +54,33 @@ pub struct PubkyNoiseSessionState {
     pub read_counter: u32,
     /// The remote peer's public key (endpoint).
     pub endpoint_pubkey: [u8; 32],
+}
+
+/// Redacted `Debug`: the ephemeral and static secrets are never rendered.
+impl std::fmt::Debug for PubkyNoiseSessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PubkyNoiseSessionState")
+            .field("version", &self.version)
+            .field("phase", &self.phase)
+            .field("pattern", &self.pattern)
+            .field("initiator", &self.initiator)
+            .field("ephemeral_secret", &"[redacted]")
+            .field(
+                "static_secret",
+                &self.static_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("counter", &self.counter)
+            .field("noise_step", &self.noise_step)
+            .field("sub_step_index", &self.sub_step_index)
+            .field("handshake_hash", &self.handshake_hash)
+            .field("link_id", &self.link_id)
+            .field("sending_nonce", &self.sending_nonce)
+            .field("receiving_nonce", &self.receiving_nonce)
+            .field("write_counter", &self.write_counter)
+            .field("read_counter", &self.read_counter)
+            .field("endpoint_pubkey", &self.endpoint_pubkey)
+            .finish()
+    }
 }
 
 impl PubkyNoiseSessionState {
@@ -376,6 +403,27 @@ mod tests {
             PubkyNoiseSessionState::deserialize(&bytes),
             Err(SerializerError::TrailingBytes)
         ));
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let mut state = transport_state();
+        state.ephemeral_secret = [0xAA; 32];
+        state.static_secret = Some([0xBB; 32]);
+
+        let rendered = format!("{state:?}");
+
+        assert!(
+            !rendered.contains(format!("{:?}", [0xAA; 32]).as_str()),
+            "ephemeral secret leaked in Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains(format!("{:?}", [0xBB; 32]).as_str()),
+            "static secret leaked in Debug: {rendered}"
+        );
+        assert!(rendered.contains("redacted"));
+        // Non-secret fields remain visible for debugging.
+        assert!(rendered.contains("sending_nonce"));
     }
 
     #[test]
