@@ -15,9 +15,9 @@
 //! [30..]    ciphertext || Poly1305 tag
 //! ```
 //!
-//! The NaCl `XSalsa20Poly1305` construction (`crypto_secretbox`) does not
-//! support AAD, so the 6-byte header is duplicated at the start of the
-//! authenticated plaintext and validated against the outer header on
+//! The NaCl `XSalsa20Poly1305` construction used by [`pubky_common::crypto`]
+//! does not support AAD, so the 6-byte header is duplicated at the start of
+//! the authenticated plaintext and validated against the outer header on
 //! decryption. The authenticated plaintext is therefore
 //! `header (6) || generation (8, big-endian) || session state (197 bytes)`.
 //! Envelope versioning is intentionally separate from the session-state
@@ -54,10 +54,7 @@
 //! hash-chained sequence alone is not sufficient either, since the homeserver
 //! can simply withhold the newest element.
 
-use crypto_secretbox::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-    XSalsa20Poly1305,
-};
+use pubky_common::crypto;
 use sha2::{Digest, Sha256};
 
 use crate::serializer::{PubkyNoiseSessionState, SESSION_STATE_LEN};
@@ -159,15 +156,11 @@ pub fn encrypt_backup(
     debug_assert_eq!(plaintext.len(), PLAINTEXT_LEN_V1);
 
     let key = derive_backup_key(root_secret);
-    let cipher = XSalsa20Poly1305::new((&key).into());
-    let nonce = XSalsa20Poly1305::generate_nonce(&mut OsRng);
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_slice())
-        .expect("XSalsa20Poly1305 encrypt should be infallible");
+    // `pubky_common::crypto::encrypt` prepends a fresh random 24-byte nonce.
+    let ciphertext = crypto::encrypt(&plaintext, &key);
 
     let mut out = Vec::with_capacity(BACKUP_RECORD_LEN_V1);
     out.extend_from_slice(&header);
-    out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
     debug_assert_eq!(out.len(), BACKUP_RECORD_LEN_V1);
     out
@@ -213,13 +206,10 @@ pub fn decrypt_backup(
     }
 
     let header = &record[..HEADER_LEN];
-    let nonce = &record[HEADER_LEN..HEADER_LEN + NONCE_LEN];
-    let ciphertext = &record[HEADER_LEN + NONCE_LEN..];
 
     let key = derive_backup_key(root_secret);
-    let cipher = XSalsa20Poly1305::new((&key).into());
-    let plaintext = cipher
-        .decrypt(nonce.into(), ciphertext)
+    // `pubky_common::crypto::decrypt` splits off the leading 24-byte nonce.
+    let plaintext = crypto::decrypt(&record[HEADER_LEN..], &key)
         .map_err(|_| BackupCryptoError::DecryptError)?;
     if plaintext.len() != PLAINTEXT_LEN_V1 {
         return Err(BackupCryptoError::InvalidLength {
@@ -294,12 +284,9 @@ mod tests {
     /// header, non-standard plaintext lengths).
     fn craft_record(root_secret: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
         let key = derive_backup_key(root_secret);
-        let cipher = XSalsa20Poly1305::new((&key).into());
-        let nonce = XSalsa20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = cipher.encrypt(&nonce, plaintext).unwrap();
+        let ciphertext = crypto::encrypt(plaintext, &key);
 
         let mut record = envelope_header().to_vec();
-        record.extend_from_slice(&nonce);
         record.extend_from_slice(&ciphertext);
         record
     }

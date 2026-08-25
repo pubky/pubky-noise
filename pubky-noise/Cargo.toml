@@ -15,7 +15,6 @@ test-utils = []
 [dependencies]
 pubky = "0.10.0"
 pubky-common = "0.10"
-crypto_secretbox = { version = "0.1", features = ["std"] }
 ed25519-dalek = "3.0.0"
 curve25519-dalek = "5.0.0"
 snow = { version = "0.10.0", features = ["use-sha2"] }
