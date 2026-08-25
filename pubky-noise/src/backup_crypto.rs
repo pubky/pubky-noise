@@ -88,7 +88,7 @@ pub const BACKUP_RECORD_LEN_V1: usize = HEADER_LEN + NONCE_LEN + PLAINTEXT_LEN_V
 /// Hard cap on the homeserver response body when fetching a backup.
 ///
 /// Bounds memory allocation against a malicious homeserver returning a huge
-/// body. The v1 record is 251 bytes; this leaves ample room for future
+/// body. The v1 record is 257 bytes; this leaves ample room for future
 /// envelope versions while keeping allocation strictly bounded.
 pub const MAX_BACKUP_RESPONSE_BYTES: usize = 4096;
 
