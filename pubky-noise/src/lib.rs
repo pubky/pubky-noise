@@ -643,7 +643,10 @@ impl PubkyNoiseEncryptor {
     /// cannot prepare different plaintext with the same nonce. The maximum
     /// payload size is [`PUBKY_NOISE_MSG_LEN`] bytes.
     ///
-    /// Persist the returned operation before publishing its ciphertext. If
+    /// Persist the returned destination path, exact ciphertext, and
+    /// `resulting_session_state` together before publishing the ciphertext. Use
+    /// caller-managed durable storage for this transaction; [`persist_snapshot()`](Self::persist_snapshot)
+    /// is rejected while a prepared operation awaits acknowledgement. If
     /// persistence fails, discard this encryptor and restore its previous
     /// persisted state. If publication status is uncertain, retry the exact
     /// prepared ciphertext instead of preparing the plaintext again.
@@ -856,8 +859,11 @@ impl PubkyNoiseEncryptor {
     /// This method decrypts the packet and advances this encryptor past it
     /// without performing network I/O. Atomically persist
     /// `resulting_session_state` with the durable application state produced
-    /// from the plaintext before treating the event as processed. If persistence
-    /// fails, discard this encryptor and restore its previous persisted state.
+    /// from the plaintext before treating the event as processed. Use
+    /// caller-managed durable storage for this transaction;
+    /// [`persist_snapshot()`](Self::persist_snapshot) is rejected while a
+    /// prepared operation awaits acknowledgement. If persistence fails, discard
+    /// this encryptor and restore its previous persisted state.
     ///
     /// Treat the plaintext as sensitive application data. Do not log it, and
     /// protect it at rest if the application protocol requires its persistence.
@@ -1022,10 +1028,12 @@ impl PubkyNoiseEncryptor {
     ///
     /// The snapshot contains static and ephemeral secret key material. Encrypt
     /// and authenticate it at rest, restrict access to authorized callers, and
-    /// delete superseded snapshots. Retaining restorable ephemeral material
-    /// extends its lifetime and can expose messages from this Noise session if
-    /// the snapshot is compromised. Establish fresh sessions periodically to
-    /// bound that exposure.
+    /// ensure superseded snapshots are no longer recoverable. Retaining
+    /// restorable ephemeral material extends its lifetime and can expose messages
+    /// from this Noise session if the snapshot is compromised. A fresh session
+    /// bounds this exposure only when older snapshots are no longer recoverable.
+    /// This crate does not authenticate or authorize processes that access
+    /// caller-managed snapshots.
     ///
     /// During the handshake phase, a pre-mutation snapshot is captured
     /// automatically by [`handle_handshake()`](Self::handle_handshake) and

@@ -157,6 +157,9 @@ new() --> handle_handshake() [loop] --> transition_transport() --> send/receive 
 Transport sends use staged state transitions so ambiguous homeserver responses
 cannot cause a fresh plaintext to reuse a nonce:
 
+These APIs coordinate an application's durable state with transport processing.
+They do not acknowledge that the remote peer received a message.
+
 1. Call `prepare_send()` to obtain the destination path, exact ciphertext, and resulting session state.
 2. Atomically persist the exact ciphertext and resulting session state in a durable outbound queue.
 3. Call `acknowledge_persisted_send()`. The handle is consumed and the encryptor may prepare the next message.
@@ -166,6 +169,9 @@ cannot cause a fresh plaintext to reuse a nonce:
 If the durable commit fails, drop the advanced encryptor and restore the previous
 durable state. There is no in-place discard operation. Callers sharing state
 across processes must serialize preparation and use conditional state updates.
+Do not call `persist_snapshot()` to commit a staged operation: it is rejected
+while an operation is awaiting acknowledgement. Persist the state returned by
+the prepared operation through the caller-managed durable transaction instead.
 
 `send_message()` is deprecated because it cannot make the exact ciphertext and
 resulting state durable atomically. After an ambiguous in-process write failure,
@@ -273,14 +279,15 @@ Sessions can be snapshotted, serialized, and restored to recover from crashes or
 
 Session snapshots contain static and ephemeral secret key material. Encrypt and
 authenticate them at rest, restrict access to apps or processes authorized for
-the same identity, and delete superseded snapshots. Retaining restorable
-ephemeral material extends its lifetime and can expose messages from that Noise
-session if a snapshot is compromised. Establish fresh sessions periodically to
-bound that exposure.
+the same identity, and ensure superseded snapshots are no longer recoverable.
+Retaining restorable ephemeral material extends its lifetime and can expose
+messages from that Noise session if the snapshot is compromised. A fresh session
+bounds this exposure only when older snapshots are no longer recoverable.
 
 At-rest encryption protects the stored bytes but does not remove this tradeoff
 while a snapshot remains recoverable. The staged transport APIs also do not
-provide cross-process authorization or locking; callers must enforce both.
+provide cross-process authentication, authorization, credential management, or
+locking; callers must enforce those requirements.
 
 `persist_snapshot()` writes the serialized snapshot directly to the configured
 Pubky path without application-layer encryption. When that storage is not
