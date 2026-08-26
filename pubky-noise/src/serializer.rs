@@ -9,7 +9,7 @@ use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
 /// Current serialization format version.
 pub const SESSION_STATE_VERSION: u8 = 1;
 /// Exact length in bytes of a serialized v1 session state.
-pub const SESSION_STATE_LEN: usize = 197;
+pub const SESSION_STATE_V1_LEN: usize = 197;
 /// Noise reserves 2^64 - 1, so 2^64 - 2 is the last usable nonce.
 const MAX_USABLE_NOISE_NONCE: u64 = u64::MAX - 1;
 
@@ -110,7 +110,7 @@ impl PubkyNoiseSessionState {
     /// ```
     /// Total: 197 bytes
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(SESSION_STATE_LEN);
+        let mut buf = Vec::with_capacity(SESSION_STATE_V1_LEN);
 
         // [0] version
         buf.push(SESSION_STATE_VERSION);
@@ -181,16 +181,16 @@ impl PubkyNoiseSessionState {
         // [165..197] endpoint_pubkey
         buf.extend_from_slice(&self.endpoint_pubkey);
 
-        debug_assert_eq!(buf.len(), SESSION_STATE_LEN);
+        debug_assert_eq!(buf.len(), SESSION_STATE_V1_LEN);
         buf
     }
 
     /// Deserialize from the compact binary format.
     ///
-    /// The input must be exactly [`SESSION_STATE_LEN`] bytes: shorter input is
+    /// The input must be exactly [`SESSION_STATE_V1_LEN`] bytes: shorter input is
     /// rejected as truncated, longer input as containing trailing bytes.
     pub fn deserialize(data: &[u8]) -> Result<Self, SerializerError> {
-        if data.len() < SESSION_STATE_LEN {
+        if data.len() < SESSION_STATE_V1_LEN {
             return Err(SerializerError::TooShort);
         }
 
@@ -199,7 +199,7 @@ impl PubkyNoiseSessionState {
             return Err(SerializerError::UnsupportedVersion(version));
         }
 
-        if data.len() != SESSION_STATE_LEN {
+        if data.len() != SESSION_STATE_V1_LEN {
             return Err(SerializerError::TrailingBytes);
         }
 
@@ -383,7 +383,7 @@ mod tests {
         let state = transport_state();
         let bytes = state.serialize();
 
-        assert_eq!(bytes.len(), SESSION_STATE_LEN);
+        assert_eq!(bytes.len(), SESSION_STATE_V1_LEN);
 
         let restored = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
         assert_eq!(restored.version, SESSION_STATE_VERSION);

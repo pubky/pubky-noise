@@ -38,6 +38,17 @@
 //! this key can never be confused with keys derived for other purposes from
 //! the same root secret.
 //!
+//! The domain tag's `v0` versions the *key-derivation context* only. It is
+//! deliberately independent of the session-state serialization version
+//! ([`crate::serializer::SESSION_STATE_VERSION`]), the envelope format
+//! version, and the algorithm ID, which evolve separately: the derived key
+//! just encrypts bytes and does not care about their layout. The tag is
+//! bumped only when the KDF itself changes, or when a fresh key space is
+//! wanted — e.g. alongside a new encryption algorithm, so keys are separated
+//! across algorithms. Note that a tag bump changes the derived key, so
+//! backups written under the old tag become undecryptable; that is usually
+//! desirable when the bump accompanies an algorithm change.
+//!
 //! No compression is applied: the serialized snapshot is a fixed 197 bytes of
 //! mostly high-entropy key material, which does not compress.
 //!
@@ -58,7 +69,7 @@
 use pubky_common::crypto;
 use sha2::{Digest, Sha256};
 
-use crate::serializer::{PubkyNoiseSessionState, SESSION_STATE_LEN};
+use crate::serializer::{PubkyNoiseSessionState, SESSION_STATE_V1_LEN};
 
 /// Domain separation tag for backup key derivation.
 const BACKUP_KEY_DOMAIN: &[u8] = b"pubky-noise/session-backup/v0";
@@ -82,7 +93,7 @@ const GENERATION_LEN: usize = 8;
 /// v1 authenticated plaintext length: header (6) || generation (8) ||
 /// session state (197). The header is duplicated inside the plaintext because
 /// `crypto_secretbox` does not support AAD.
-const PLAINTEXT_LEN_V1: usize = HEADER_LEN + GENERATION_LEN + SESSION_STATE_LEN;
+const PLAINTEXT_LEN_V1: usize = HEADER_LEN + GENERATION_LEN + SESSION_STATE_V1_LEN;
 /// v1 record length: header (6) || nonce (24) || ciphertext (211 + tag 16).
 pub const BACKUP_RECORD_LEN_V1: usize = HEADER_LEN + NONCE_LEN + PLAINTEXT_LEN_V1 + TAG_LEN;
 
@@ -352,7 +363,7 @@ mod tests {
         let record = encrypt_backup(&root_secret, 1, &state);
 
         assert!(!record
-            .windows(SESSION_STATE_LEN)
+            .windows(SESSION_STATE_V1_LEN)
             .any(|w| w == state.serialize().as_slice()));
     }
 
