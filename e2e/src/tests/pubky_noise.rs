@@ -887,7 +887,10 @@ async fn snow_test_simple_backup() {
         backup_crypto::derive_backup_key(&pair.initiator_config.pubky_root_keypair.secret());
 
     // Persist generation 1 and keep a copy of the stored record.
-    pair.initiator.persist_snapshot(&backup_key, 1).await.unwrap();
+    pair.initiator
+        .persist_snapshot(&backup_key, 1)
+        .await
+        .unwrap();
     let stored_a = pair
         .initiator_config
         .local_session
@@ -916,7 +919,10 @@ async fn snow_test_simple_backup() {
 
     // Advance the session and persist generation 2.
     send_and_verify(&mut pair.initiator, &mut pair.responder, "Hello_Again").await;
-    pair.initiator.persist_snapshot(&backup_key, 2).await.unwrap();
+    pair.initiator
+        .persist_snapshot(&backup_key, 2)
+        .await
+        .unwrap();
 
     // Simulate a stale/malicious homeserver replaying the generation-1 record.
     pair.initiator_config

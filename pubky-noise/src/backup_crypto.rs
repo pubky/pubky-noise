@@ -225,8 +225,8 @@ pub fn decrypt_backup_with_key(
     let header = &record[..HEADER_LEN];
 
     // `pubky_common::crypto::decrypt` splits off the leading 24-byte nonce.
-    let plaintext = crypto::decrypt(&record[HEADER_LEN..], key)
-        .map_err(|_| BackupCryptoError::DecryptError)?;
+    let plaintext =
+        crypto::decrypt(&record[HEADER_LEN..], key).map_err(|_| BackupCryptoError::DecryptError)?;
     if plaintext.len() != PLAINTEXT_LEN_V1 {
         return Err(BackupCryptoError::InvalidLength {
             expected: PLAINTEXT_LEN_V1,

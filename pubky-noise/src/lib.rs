@@ -762,12 +762,9 @@ impl PubkyNoiseEncryptor {
             body.extend_from_slice(&chunk);
         }
 
-        let (generation, serialized) = backup_crypto::decrypt_backup_with_key(
-            backup_key,
-            &body,
-            min_generation,
-        )
-        .map_err(map_backup_error)?;
+        let (generation, serialized) =
+            backup_crypto::decrypt_backup_with_key(backup_key, &body, min_generation)
+                .map_err(map_backup_error)?;
 
         let state = PubkyNoiseSessionState::deserialize(&serialized)
             .map_err(|_| PubkyNoiseError::RestoreDeserializeError)?;
