@@ -1582,10 +1582,12 @@ async fn snow_test_send_message_failure_retries_exact_ciphertext() {
 
 /// Packets shorter than their declared length are rejected.
 #[tokio::test]
-async fn snow_test_prepare_receive_rejects_truncated_packets() {
+async fn snow_test_prepare_receive_rejects_malformed_lengths() {
     let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
+
+    let receiver_before = pair.responder.snapshot().unwrap().serialize();
 
     assert_eq!(
         pair.responder.prepare_receive(&[]).unwrap_err(),
@@ -1598,6 +1600,45 @@ async fn snow_test_prepare_receive_rejects_truncated_packets() {
     assert_eq!(
         pair.responder.prepare_receive(&[0, 16, 1]).unwrap_err(),
         PubkyNoiseError::BadLengthCiphertext
+    );
+
+    let mut oversized = vec![0; PUBKY_NOISE_CIPHERTEXT_LEN + 2];
+    let oversized_len = (PUBKY_NOISE_CIPHERTEXT_LEN as u16 + 1).to_be_bytes();
+    oversized[..2].copy_from_slice(&oversized_len);
+    assert_eq!(
+        pair.responder.prepare_receive(&oversized).unwrap_err(),
+        PubkyNoiseError::BadLengthCiphertext
+    );
+    assert_eq!(
+        pair.responder.snapshot().unwrap().serialize(),
+        receiver_before
+    );
+}
+
+/// A forged in-range length reaches Noise authentication and is rejected
+/// without advancing the receiving state.
+#[tokio::test]
+async fn snow_test_prepare_receive_rejects_forged_in_range_length() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+
+    let prepared = pair
+        .initiator
+        .prepare_send(b"authenticated ciphertext")
+        .unwrap();
+    let mut forged = prepared.ciphertext().to_vec();
+    let declared_len = u16::from_be_bytes([forged[0], forged[1]]);
+    forged[..2].copy_from_slice(&(declared_len - 1).to_be_bytes());
+    let receiver_before = pair.responder.snapshot().unwrap().serialize();
+
+    assert_eq!(
+        pair.responder.prepare_receive(&forged).unwrap_err(),
+        PubkyNoiseError::DecryptionError
+    );
+    assert_eq!(
+        pair.responder.snapshot().unwrap().serialize(),
+        receiver_before
     );
 }
 

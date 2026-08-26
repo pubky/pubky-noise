@@ -62,15 +62,15 @@ loop {
 // 4. Transition to transport phase
 let link_id = initiator.transition_transport().unwrap();
 
-// 5. Prepare, durably queue, and publish an encrypted message
+// 5. Prepare, persist, and publish an encrypted message
 let prepared = initiator.prepare_send(b"Hello, peer!")?;
-durable_store.commit_send(
+persistent_store.commit_send(
     prepared.destination_path(),
     prepared.ciphertext(),
     prepared.resulting_session_state(),
 )?;
 initiator.acknowledge_persisted_send(prepared)?;
-durable_publisher.flush_in_order().await?;
+ordered_publisher.flush_in_order().await?;
 
 // Receive convenience API; use prepare_receive for durable processing.
 let messages = initiator.receive_message().await?;
@@ -161,17 +161,18 @@ These APIs coordinate an application's durable state with transport processing.
 They do not acknowledge that the remote peer received a message.
 
 1. Call `prepare_send()` to obtain the destination path, exact ciphertext, and resulting session state.
-2. Atomically persist the exact ciphertext and resulting session state in a durable outbound queue.
+2. Atomically persist the exact ciphertext and resulting session state as one outbound record.
 3. Call `acknowledge_persisted_send()`. The handle is consumed and the encryptor may prepare the next message.
-4. Publish queued ciphertexts in order. If publication is uncertain, retry the exact stored ciphertext.
+4. Publish persisted outbound records in order. If publication is uncertain, retry the exact stored ciphertext.
 5. For inbound data, fetch `next_receive_path()`, call `prepare_receive()`, atomically persist the resulting state with the application's durable processing result, and call `acknowledge_persisted_receive()`.
 
-If the durable commit fails, drop the advanced encryptor and restore the previous
-durable state. There is no in-place discard operation. Callers sharing state
+If atomic persistence fails, drop the advanced encryptor and restore the previous
+persisted state. There is no in-place discard operation. Callers sharing state
 across processes must serialize preparation and use conditional state updates.
 Do not call `persist_snapshot()` to commit a staged operation: it is rejected
-while an operation is awaiting acknowledgement. Persist the state returned by
-the prepared operation through the caller-managed durable transaction instead.
+while an operation is awaiting acknowledgement. In the caller's atomic storage
+transaction, replace the previous session snapshot with `resulting_session_state`
+and persist the matching outbound record or inbound processing result.
 
 `send_message()` is deprecated because it cannot make the exact ciphertext and
 resulting state durable atomically. After an ambiguous in-process write failure,
@@ -281,8 +282,9 @@ Session snapshots contain static and ephemeral secret key material. Encrypt and
 authenticate them at rest, restrict access to apps or processes authorized for
 the same identity, and ensure superseded snapshots are no longer recoverable.
 Retaining restorable ephemeral material extends its lifetime and can expose
-messages from that Noise session if the snapshot is compromised. A fresh session
-bounds this exposure only when older snapshots are no longer recoverable.
+messages from that Noise session if the snapshot is compromised. Starting a
+fresh session does not protect old traffic while older snapshots remain
+recoverable.
 
 At-rest encryption protects the stored bytes but does not remove this tradeoff
 while a snapshot remains recoverable. The staged transport APIs also do not
