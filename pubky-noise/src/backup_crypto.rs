@@ -3,7 +3,7 @@
 //! A serialized [`PubkyNoiseSessionState`] contains the session's ephemeral
 //! secret (and optionally the static secret), so it must be encrypted before
 //! it leaves the device. Encryption follows the Pubky convention used for
-//! recovery files: `XSalsa20Poly1305` with a random 24-byte nonce per write.
+//! recovery files: `XSalsa20Poly1305` with a random 192-bit nonce per write.
 //!
 //! ## Envelope Format (version 1)
 //!
@@ -11,7 +11,7 @@
 //! [0..4]    magic: "PNBK"
 //! [4]       envelope format version (1)
 //! [5]       algorithm ID (1 = XSalsa20Poly1305 with the KDF below)
-//! [6..30]   nonce (24 bytes, random per write)
+//! [6..30]   nonce (192-bit, random per write)
 //! [30..]    ciphertext || Poly1305 tag
 //! ```
 //!
@@ -157,7 +157,7 @@ pub fn encrypt_backup_with_key(
     plaintext.extend_from_slice(&state.serialize());
     debug_assert_eq!(plaintext.len(), PLAINTEXT_LEN_V1);
 
-    // `pubky_common::crypto::encrypt` prepends a fresh random 24-byte nonce.
+    // `pubky_common::crypto::encrypt` prepends a fresh random 192-bit nonce.
     let ciphertext = crypto::encrypt(&plaintext, key);
 
     let mut out = Vec::with_capacity(BACKUP_RECORD_LEN_V1);
@@ -224,7 +224,7 @@ pub fn decrypt_backup_with_key(
 
     let header = &record[..HEADER_LEN];
 
-    // `pubky_common::crypto::decrypt` splits off the leading 24-byte nonce.
+    // `pubky_common::crypto::decrypt` splits off the leading 192-bit nonce.
     let plaintext =
         crypto::decrypt(&record[HEADER_LEN..], key).map_err(|_| BackupCryptoError::DecryptError)?;
     if plaintext.len() != PLAINTEXT_LEN_V1 {
