@@ -666,22 +666,26 @@ impl PubkyNoiseEncryptor {
     /// Persist the current session snapshot to the homeserver (encrypted path).
     ///
     /// The serialized snapshot contains the session's ephemeral and static
-    /// secrets, so it is encrypted with a key derived from the Pubky root
-    /// secret (`XSalsa20Poly1305`, see [`backup_crypto`]) before uploading.
+    /// secrets, so it is encrypted with a caller-provided key
+    /// (`XSalsa20Poly1305`, see [`backup_crypto`]) before uploading.
     ///
     /// # Parameters:
+    /// - `backup_key`: A 32-byte key used to encrypt the snapshot. For
+    ///   root-identity callers this can be obtained via
+    ///   [`backup_crypto::derive_backup_key(&root_secret)`]; delegated apps
+    ///   may supply a key derived from a shared Noise/state key instead.
     /// - `generation`: A caller-managed, monotonically increasing counter that
     ///   is bound into the encrypted backup. Persist the latest value in
     ///   trusted local storage and pass it as `min_generation` to
     ///   [`load_snapshot()`](Self::load_snapshot) to detect a stale or
     ///   malicious homeserver replaying an older backup.
-    pub async fn persist_snapshot(&self, generation: u64) -> Result<(), PubkyNoiseError> {
+    pub async fn persist_snapshot(
+        &self,
+        backup_key: &[u8; 32],
+        generation: u64,
+    ) -> Result<(), PubkyNoiseError> {
         let state = self.snapshot();
-        let encrypted = backup_crypto::encrypt_backup(
-            &self.config.pubky_root_keypair.secret(),
-            generation,
-            &state,
-        );
+        let encrypted = backup_crypto::encrypt_backup_with_key(backup_key, generation, &state);
         let path = format!("{}/backup", self.config.write_path);
         self.config
             .local_session
@@ -703,6 +707,11 @@ impl PubkyNoiseEncryptor {
     /// match the exact length of its envelope version.
     ///
     /// # Parameters:
+    /// - `backup_key`: A 32-byte key used to decrypt the snapshot. Must match
+    ///   the key used during [`persist_snapshot()`](Self::persist_snapshot).
+    ///   For root-identity callers this can be obtained via
+    ///   [`backup_crypto::derive_backup_key(&root_secret)`]; delegated apps
+    ///   may supply a key derived from a shared Noise/state key instead.
     /// - `min_generation`: The highest backup generation observed so far, from
     ///   the caller's trusted local checkpoint. Older backups are rejected
     ///   with [`PubkyNoiseError::RestoreBackupRollbackError`]. Pass `None`
@@ -715,7 +724,7 @@ impl PubkyNoiseEncryptor {
     ///   cannot be fetched (including when no backup exists yet) or the
     ///   response exceeds the size cap.
     /// - Returns [`PubkyNoiseError::RestoreBackupDecryptError`] if decryption
-    ///   fails (wrong root key or tampered/corrupted ciphertext).
+    ///   fails (wrong key or tampered/corrupted ciphertext).
     /// - Returns [`PubkyNoiseError::RestoreBackupRollbackError`] if the backup
     ///   generation is older than `min_generation`.
     /// - Returns [`PubkyNoiseError::RestoreDeserializeError`] if the record is
@@ -723,6 +732,7 @@ impl PubkyNoiseEncryptor {
     ///   session state.
     pub async fn load_snapshot(
         config: &PubkyNoiseConfig,
+        backup_key: &[u8; 32],
         min_generation: Option<u64>,
     ) -> Result<LoadedSnapshot, PubkyNoiseError> {
         let path = format!("{}/backup", config.write_path);
@@ -752,8 +762,8 @@ impl PubkyNoiseEncryptor {
             body.extend_from_slice(&chunk);
         }
 
-        let (generation, serialized) = backup_crypto::decrypt_backup(
-            &config.pubky_root_keypair.secret(),
+        let (generation, serialized) = backup_crypto::decrypt_backup_with_key(
+            backup_key,
             &body,
             min_generation,
         )

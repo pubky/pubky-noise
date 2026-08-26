@@ -48,7 +48,8 @@
 //! session has advanced. To detect this, every backup carries a monotonic
 //! `generation` in its authenticated plaintext. The caller persists each new
 //! generation in *trusted local storage* and passes the latest observed value
-//! as `min_generation` to [`decrypt_backup`]; older records are rejected with
+//! as `min_generation` to [`decrypt_backup_with_key`]; older records are
+//! rejected with
 //! [`BackupCryptoError::Rollback`]. Without a trusted checkpoint (fresh
 //! device, `min_generation = None`) rollback cannot be detected — a signed or
 //! hash-chained sequence alone is not sufficient either, since the homeserver
@@ -133,7 +134,8 @@ pub fn derive_backup_key(root_secret: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Encrypts a session snapshot into a versioned backup envelope.
+/// Encrypts a session snapshot into a versioned backup envelope using a
+/// caller-provided 32-byte encryption key directly.
 ///
 /// `generation` is a caller-managed, monotonically increasing counter used
 /// for rollback detection (see the module docs). The caller must persist the
@@ -142,8 +144,8 @@ pub fn derive_backup_key(root_secret: &[u8; 32]) -> [u8; 32] {
 ///
 /// Returns `magic || version || algorithm || nonce || ciphertext`, with the
 /// header duplicated inside the authenticated plaintext.
-pub fn encrypt_backup(
-    root_secret: &[u8; 32],
+pub fn encrypt_backup_with_key(
+    key: &[u8; 32],
     generation: u64,
     state: &PubkyNoiseSessionState,
 ) -> Vec<u8> {
@@ -155,9 +157,8 @@ pub fn encrypt_backup(
     plaintext.extend_from_slice(&state.serialize());
     debug_assert_eq!(plaintext.len(), PLAINTEXT_LEN_V1);
 
-    let key = derive_backup_key(root_secret);
     // `pubky_common::crypto::encrypt` prepends a fresh random 24-byte nonce.
-    let ciphertext = crypto::encrypt(&plaintext, &key);
+    let ciphertext = crypto::encrypt(&plaintext, key);
 
     let mut out = Vec::with_capacity(BACKUP_RECORD_LEN_V1);
     out.extend_from_slice(&header);
@@ -166,7 +167,23 @@ pub fn encrypt_backup(
     out
 }
 
-/// Decrypts and parses a backup envelope produced by [`encrypt_backup`].
+/// Encrypts a session snapshot into a versioned backup envelope, deriving the
+/// encryption key from the Pubky root secret via [`derive_backup_key()`].
+///
+/// Convenience wrapper around [`encrypt_backup_with_key()`] for callers that
+/// hold the root identity secret directly.
+pub fn encrypt_backup(
+    root_secret: &[u8; 32],
+    generation: u64,
+    state: &PubkyNoiseSessionState,
+) -> Vec<u8> {
+    let key = derive_backup_key(root_secret);
+    encrypt_backup_with_key(&key, generation, state)
+}
+
+/// Decrypts and parses a backup envelope produced by
+/// [`encrypt_backup_with_key()`] or [`encrypt_backup()`], using a
+/// caller-provided 32-byte decryption key directly.
 ///
 /// Only explicitly supported envelope versions and algorithms are accepted,
 /// and the record must match the exact length of its envelope version.
@@ -176,8 +193,8 @@ pub fn encrypt_backup(
 /// the checkpoint are rejected with [`BackupCryptoError::Rollback`].
 ///
 /// Returns the backup generation and the serialized session state.
-pub fn decrypt_backup(
-    root_secret: &[u8; 32],
+pub fn decrypt_backup_with_key(
+    key: &[u8; 32],
     record: &[u8],
     min_generation: Option<u64>,
 ) -> Result<(u64, Vec<u8>), BackupCryptoError> {
@@ -207,9 +224,8 @@ pub fn decrypt_backup(
 
     let header = &record[..HEADER_LEN];
 
-    let key = derive_backup_key(root_secret);
     // `pubky_common::crypto::decrypt` splits off the leading 24-byte nonce.
-    let plaintext = crypto::decrypt(&record[HEADER_LEN..], &key)
+    let plaintext = crypto::decrypt(&record[HEADER_LEN..], key)
         .map_err(|_| BackupCryptoError::DecryptError)?;
     if plaintext.len() != PLAINTEXT_LEN_V1 {
         return Err(BackupCryptoError::InvalidLength {
@@ -242,6 +258,20 @@ pub fn decrypt_backup(
         generation,
         plaintext[HEADER_LEN + GENERATION_LEN..].to_vec(),
     ))
+}
+
+/// Decrypts and parses a backup envelope, deriving the decryption key from
+/// the Pubky root secret via [`derive_backup_key()`].
+///
+/// Convenience wrapper around [`decrypt_backup_with_key()`] for callers that
+/// hold the root identity secret directly.
+pub fn decrypt_backup(
+    root_secret: &[u8; 32],
+    record: &[u8],
+    min_generation: Option<u64>,
+) -> Result<(u64, Vec<u8>), BackupCryptoError> {
+    let key = derive_backup_key(root_secret);
+    decrypt_backup_with_key(&key, record, min_generation)
 }
 
 /// Builds the authenticated 6-byte envelope header.

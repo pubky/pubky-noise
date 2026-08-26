@@ -10,6 +10,7 @@ use pubky_testnet::{
 };
 use tokio::sync::{Mutex, OnceCell};
 
+use pubky_noise::backup_crypto;
 use pubky_noise::serializer::PubkyNoiseSessionState;
 use pubky_noise::snow_crypto::{
     HandshakePattern, NoisePhase, NoiseStep, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
@@ -882,8 +883,11 @@ async fn snow_test_simple_backup() {
     )
     .await;
 
+    let backup_key =
+        backup_crypto::derive_backup_key(&pair.initiator_config.pubky_root_keypair.secret());
+
     // Persist generation 1 and keep a copy of the stored record.
-    pair.initiator.persist_snapshot(1).await.unwrap();
+    pair.initiator.persist_snapshot(&backup_key, 1).await.unwrap();
     let stored_a = pair
         .initiator_config
         .local_session
@@ -904,7 +908,7 @@ async fn snow_test_simple_backup() {
     );
 
     // The encrypted backup decrypts back to the same session state.
-    let loaded = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, Some(1))
+    let loaded = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, Some(1))
         .await
         .unwrap();
     assert_eq!(loaded.generation, 1);
@@ -912,7 +916,7 @@ async fn snow_test_simple_backup() {
 
     // Advance the session and persist generation 2.
     send_and_verify(&mut pair.initiator, &mut pair.responder, "Hello_Again").await;
-    pair.initiator.persist_snapshot(2).await.unwrap();
+    pair.initiator.persist_snapshot(&backup_key, 2).await.unwrap();
 
     // Simulate a stale/malicious homeserver replaying the generation-1 record.
     pair.initiator_config
@@ -923,14 +927,14 @@ async fn snow_test_simple_backup() {
         .unwrap();
 
     // A trusted local checkpoint rejects the rolled-back backup.
-    let err = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, Some(2))
+    let err = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, Some(2))
         .await
         .unwrap_err();
     assert_eq!(err, PubkyNoiseError::RestoreBackupRollbackError);
 
     // Without a checkpoint the stale backup is accepted: callers restoring on
     // a fresh device have no rollback protection.
-    let rolled_back = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, None)
+    let rolled_back = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, None)
         .await
         .unwrap();
     assert_eq!(rolled_back.generation, 1);
