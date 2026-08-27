@@ -163,7 +163,7 @@ They do not acknowledge that the remote peer received a message.
 1. Call `prepare_send()` to obtain the destination path, exact ciphertext, and resulting session state.
 2. Atomically persist the exact ciphertext and resulting session state as one outbound record.
 3. Call `acknowledge_persisted_send()`. The handle is consumed and the encryptor may prepare the next message.
-4. Publish persisted outbound records in order. If publication is uncertain, retry the exact stored ciphertext.
+4. Write persisted outbound records to their homeserver destination paths in order. If a write is uncertain, retry the exact stored ciphertext.
 5. For inbound data, fetch `next_receive_path()`, call `prepare_receive()`, atomically persist the resulting state with the application's durable processing result, and call `acknowledge_persisted_receive()`.
 
 If atomic persistence fails, drop the advanced encryptor and restore the previous
