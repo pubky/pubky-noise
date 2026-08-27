@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 use serializer::{PubkyNoiseSessionState, SESSION_STATE_VERSION};
 use snow_crypto::{
     full_handshake_actions, ContextError, DataLinkContext, HandshakeAction, HandshakePattern,
-    NoisePhase, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
+    NoisePhase, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN, PUBKY_NOISE_TRANSPORT_PACKET_LEN,
+    PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN,
 };
 
 /// A 32-byte identifier derived from the Noise handshake.
@@ -28,7 +29,7 @@ pub struct LinkId(pub [u8; 32]);
 /// Decode a length-prefixed packet into a message buffer and its length.
 ///
 /// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
-fn decode_packet(
+fn decode_handshake_packet(
     ciphertext: &[u8],
 ) -> Result<([u8; PUBKY_NOISE_CIPHERTEXT_LEN], usize), PubkyNoiseError> {
     if ciphertext.len() < 2 || ciphertext.len() > PUBKY_NOISE_CIPHERTEXT_LEN + 2 {
@@ -46,12 +47,42 @@ fn decode_packet(
 /// Encode a message into a length-prefixed packet.
 ///
 /// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
-fn encode_packet(data: &[u8], len: usize) -> [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2] {
+fn encode_handshake_packet(data: &[u8], len: usize) -> [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2] {
     let mut packet = [0u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2];
     let be_bytes = (len as u16).to_be_bytes();
     packet[0..2].copy_from_slice(&be_bytes);
     packet[2..len + 2].copy_from_slice(&data[..len]);
     packet
+}
+
+/// Build the fixed-size plaintext frame protected by Noise transport AEAD.
+///
+/// Format: `[body_len_hi, body_len_lo, body, zero padding]`.
+fn encode_transport_plaintext(
+    body: &[u8],
+) -> Result<[u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN], PubkyNoiseError> {
+    if body.len() > PUBKY_NOISE_MSG_LEN {
+        return Err(PubkyNoiseError::EncryptionError);
+    }
+
+    let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+    plaintext[..2].copy_from_slice(&(body.len() as u16).to_be_bytes());
+    plaintext[2..body.len() + 2].copy_from_slice(body);
+    Ok(plaintext)
+}
+
+/// Extract a message from an authenticated transport plaintext frame.
+fn decode_transport_plaintext(
+    plaintext: &[u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN],
+) -> Result<([u8; PUBKY_NOISE_MSG_LEN], usize), PubkyNoiseError> {
+    let body_len = u16::from_be_bytes([plaintext[0], plaintext[1]]) as usize;
+    if body_len > PUBKY_NOISE_MSG_LEN {
+        return Err(PubkyNoiseError::BadLengthCiphertext);
+    }
+
+    let mut body = [0; PUBKY_NOISE_MSG_LEN];
+    body[..body_len].copy_from_slice(&plaintext[2..body_len + 2]);
+    Ok((body, body_len))
 }
 
 fn map_context_overflow(err: ContextError) -> PubkyNoiseError {
@@ -129,7 +160,7 @@ pub struct PreparedSend {
     /// Pubky storage path for the ciphertext.
     destination_path: String,
     /// Exact ciphertext packet to publish or retry.
-    ciphertext: [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2],
+    ciphertext: [u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
     /// Session state to persist with this prepared ciphertext.
     resulting_session_state: PubkyNoiseSessionState,
     // Binds acknowledgement to this exact prepared operation; it is not a secret.
@@ -143,7 +174,7 @@ impl PreparedSend {
     }
 
     /// Return the exact ciphertext packet to publish or retry.
-    pub fn ciphertext(&self) -> &[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2] {
+    pub fn ciphertext(&self) -> &[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN] {
         &self.ciphertext
     }
 
@@ -213,7 +244,7 @@ struct PendingConvenienceSend {
     /// Pubky path targeted by the original send attempt.
     destination_path: String,
     /// Ciphertext that must be retried without re-encryption.
-    ciphertext: [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2],
+    ciphertext: [u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
     /// Digest used to acknowledge the matching prepared state transition.
     acknowledgement_digest: [u8; 32],
 }
@@ -364,7 +395,7 @@ pub struct PubkyNoiseEncryptor {
     #[cfg(feature = "test-utils")]
     simulate_write_failure: bool,
     #[cfg(feature = "test-utils")]
-    last_ciphertext: Option<[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]>,
+    last_ciphertext: Option<[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN]>,
 }
 
 impl PubkyNoiseEncryptor {
@@ -488,7 +519,7 @@ impl PubkyNoiseEncryptor {
                     {
                         if response.status().is_success() {
                             if let Ok(ciphertext) = response.bytes().await {
-                                let (mut message, len) = decode_packet(&ciphertext)?;
+                                let (mut message, len) = decode_handshake_packet(&ciphertext)?;
                                 let mut payload = [0; PUBKY_NOISE_MSG_LEN];
                                 let _ = self.context.read_act(&mut message, &mut payload, len);
                             } else {
@@ -514,7 +545,7 @@ impl PubkyNoiseEncryptor {
                         let path = self.config.write_path.as_str();
                         let counter = self.context.get_counter();
                         let formatted_path = format!("{path}/{counter}");
-                        let packet = encode_packet(&message, len);
+                        let packet = encode_handshake_packet(&message, len);
                         // Check for simulated write failure (test-only) or
                         // actual homeserver write failure.
                         #[cfg(feature = "test-utils")]
@@ -595,12 +626,15 @@ impl PubkyNoiseEncryptor {
             .ensure_can_advance_sending_nonce()
             .map_err(map_context_overflow)?;
 
-        let mut out = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let plaintext = encode_transport_plaintext(plaintext)?;
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
         let len = self
             .context
-            .prepare_transport_write(plaintext, &mut out)
+            .prepare_transport_write(&plaintext, &mut ciphertext)
             .map_err(|_| PubkyNoiseError::EncryptionError)?;
-        let ciphertext = encode_packet(&out, len);
+        if len != PUBKY_NOISE_TRANSPORT_PACKET_LEN {
+            return Err(PubkyNoiseError::EncryptionError);
+        }
         let counter = self.context.get_write_slot();
         let destination_path = format!("{}/{counter}", self.config.write_path);
 
@@ -803,24 +837,32 @@ impl PubkyNoiseEncryptor {
             .ensure_can_advance_receiving_nonce()
             .map_err(map_context_overflow)?;
 
-        let (message, len) = decode_packet(ciphertext)?;
+        let message: &[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN] = ciphertext
+            .try_into()
+            .map_err(|_| PubkyNoiseError::BadLengthCiphertext)?;
         #[cfg(feature = "test-utils")]
         let message = {
-            let mut message = message;
+            let mut message = *message;
             if self.simulate_tampering {
                 message[1] = 0xff;
             }
             message
         };
-        let mut plaintext = [0; PUBKY_NOISE_MSG_LEN];
+        #[cfg(feature = "test-utils")]
+        let message = &message;
+        let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
 
         let plaintext_len = self
             .context
-            .prepare_transport_read(&message, &mut plaintext, len)
+            .prepare_transport_read(message, &mut plaintext)
             .map_err(|err| match err {
                 ContextError::NonceOverflow => PubkyNoiseError::NonceOverflow,
                 _ => PubkyNoiseError::DecryptionError,
             })?;
+        if plaintext_len != PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN {
+            return Err(PubkyNoiseError::DecryptionError);
+        }
+        let (plaintext, plaintext_len) = decode_transport_plaintext(&plaintext)?;
 
         let mut resulting_session_state = self.snapshot_unchecked();
         resulting_session_state.receiving_nonce = resulting_session_state
@@ -1214,7 +1256,7 @@ impl PubkyNoiseEncryptor {
                         .await
                         .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
 
-                    let (mut message, len) = decode_packet(&ciphertext)?;
+                    let (mut message, len) = decode_handshake_packet(&ciphertext)?;
                     let mut payload = [0; PUBKY_NOISE_MSG_LEN];
 
                     context
@@ -1332,7 +1374,7 @@ impl PubkyNoiseEncryptor {
 
     /// Test-only: get the last ciphertext produced by `prepare_send`.
     #[cfg(feature = "test-utils")]
-    pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]> {
+    pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN]> {
         self.last_ciphertext
     }
 }
@@ -1345,5 +1387,46 @@ impl std::fmt::Debug for PubkyNoiseConfig {
             .field("pubky_noise_version", &self.pubky_noise_version)
             .field("default_pattern", &self.default_pattern)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_plaintext_round_trip_preserves_body_and_trailing_zeros() {
+        let body = b"message with trailing zeros\0\0";
+        let plaintext = encode_transport_plaintext(body).unwrap();
+        let (decoded, decoded_len) = decode_transport_plaintext(&plaintext).unwrap();
+
+        assert_eq!(&decoded[..decoded_len], body);
+        assert_eq!(decoded_len, body.len());
+        assert!(plaintext[body.len() + 2..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn transport_plaintext_accepts_maximum_body() {
+        let body = [42; PUBKY_NOISE_MSG_LEN];
+        let plaintext = encode_transport_plaintext(&body).unwrap();
+        let (decoded, decoded_len) = decode_transport_plaintext(&plaintext).unwrap();
+
+        assert_eq!(decoded, body);
+        assert_eq!(decoded_len, PUBKY_NOISE_MSG_LEN);
+    }
+
+    #[test]
+    fn transport_plaintext_rejects_invalid_lengths() {
+        assert_eq!(
+            encode_transport_plaintext(&[0; PUBKY_NOISE_MSG_LEN + 1]).unwrap_err(),
+            PubkyNoiseError::EncryptionError
+        );
+
+        let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+        plaintext[..2].copy_from_slice(&((PUBKY_NOISE_MSG_LEN + 1) as u16).to_be_bytes());
+        assert_eq!(
+            decode_transport_plaintext(&plaintext).unwrap_err(),
+            PubkyNoiseError::BadLengthCiphertext
+        );
     }
 }

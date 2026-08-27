@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, OnceCell};
 use pubky_noise::serializer::PubkyNoiseSessionState;
 use pubky_noise::snow_crypto::{
     HandshakePattern, NoisePhase, NoiseStep, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
+    PUBKY_NOISE_TRANSPORT_PACKET_LEN,
 };
 use pubky_noise::{HandshakeResult, PubkyNoiseConfig, PubkyNoiseEncryptor, PubkyNoiseError};
 
@@ -81,7 +82,7 @@ async fn create_grant_session(pubky: &Pubky, homeserver: &PublicKey) -> PubkySes
         .unwrap()
 }
 
-fn cipher_check(plaintext: &[u8], ciphertext: &[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]) {
+fn cipher_check(plaintext: &[u8], ciphertext: &[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN]) {
     let plaintext_len = plaintext.len();
     let mut match_check = 0;
     for counter in 0..plaintext_len {
@@ -322,14 +323,14 @@ async fn send_and_verify_tampered(
 #[tokio::test]
 #[should_panic]
 async fn cipher_check_utility_positive() {
-    let plaintext = [b'A'; PUBKY_NOISE_CIPHERTEXT_LEN + 2];
+    let plaintext = [b'A'; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
     let ciphertext = plaintext;
     cipher_check(&plaintext, &ciphertext);
 }
 
 #[tokio::test]
 async fn cipher_check_utility_negative() {
-    let plaintext = [b'A'; PUBKY_NOISE_CIPHERTEXT_LEN + 2];
+    let plaintext = [b'A'; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
     let mut ciphertext = plaintext;
     ciphertext[0] = b'B';
     cipher_check(&plaintext, &ciphertext);
@@ -761,19 +762,14 @@ async fn snow_test_XX_pattern_simple() {
         "Transport message should exist at /pub/data/3"
     );
     let slot3_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot3_bytes.len(), PUBKY_NOISE_CIPHERTEXT_LEN + 2);
-    let len3 = u16::from_be_bytes([slot3_bytes[0], slot3_bytes[1]]) as usize;
-    assert!(
-        len3 > 0 && len3 <= PUBKY_NOISE_CIPHERTEXT_LEN,
-        "Length prefix should be valid, got {len3}"
-    );
+    assert_eq!(slot3_bytes.len(), PUBKY_NOISE_TRANSPORT_PACKET_LEN);
     // Verify the stored data is actually encrypted (not plaintext)
-    let transport_ciphertext = &slot3_bytes[2..len3 + 2];
     let plaintext_bytes = "Hello_World_Pubky_Noise".as_bytes();
-    assert_ne!(
-        &transport_ciphertext[..plaintext_bytes.len()],
-        plaintext_bytes,
-        "Stored transport data should be encrypted, not plaintext"
+    assert!(
+        !slot3_bytes
+            .windows(plaintext_bytes.len())
+            .any(|window| window == plaintext_bytes),
+        "Stored transport data should not expose plaintext"
     );
 
     let _responder_list = verify_client
@@ -1001,19 +997,14 @@ async fn snow_test_XX_pattern_simple_out_of_order_handshake() {
         "Transport message should exist at /pub/data/3"
     );
     let slot3_bytes = response.bytes().await.unwrap();
-    assert_eq!(slot3_bytes.len(), PUBKY_NOISE_CIPHERTEXT_LEN + 2);
-    let len3 = u16::from_be_bytes([slot3_bytes[0], slot3_bytes[1]]) as usize;
-    assert!(
-        len3 > 0 && len3 <= PUBKY_NOISE_CIPHERTEXT_LEN,
-        "Length prefix should be valid, got {len3}"
-    );
+    assert_eq!(slot3_bytes.len(), PUBKY_NOISE_TRANSPORT_PACKET_LEN);
     // Verify the stored data is actually encrypted (not plaintext)
-    let transport_ciphertext = &slot3_bytes[2..len3 + 2];
     let plaintext_bytes = "Hello_World_Pubky_Noise".as_bytes();
-    assert_ne!(
-        &transport_ciphertext[..plaintext_bytes.len()],
-        plaintext_bytes,
-        "Stored transport data should be encrypted, not plaintext"
+    assert!(
+        !slot3_bytes
+            .windows(plaintext_bytes.len())
+            .any(|window| window == plaintext_bytes),
+        "Stored transport data should not expose plaintext"
     );
 
     let _responder_list = verify_client
@@ -1580,31 +1571,21 @@ async fn snow_test_send_message_failure_retries_exact_ciphertext() {
     assert_eq!(received, vec![b"retry exactly".to_vec()]);
 }
 
-/// Packets shorter than their declared length are rejected.
+/// Transport packets must have the fixed authenticated size.
 #[tokio::test]
-async fn snow_test_prepare_receive_rejects_malformed_lengths() {
+async fn snow_test_prepare_receive_rejects_non_fixed_packet_sizes() {
     let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
 
     let receiver_before = pair.responder.snapshot().unwrap().serialize();
 
+    let undersized = vec![0; PUBKY_NOISE_TRANSPORT_PACKET_LEN - 1];
     assert_eq!(
-        pair.responder.prepare_receive(&[]).unwrap_err(),
+        pair.responder.prepare_receive(&undersized).unwrap_err(),
         PubkyNoiseError::BadLengthCiphertext
     );
-    assert_eq!(
-        pair.responder.prepare_receive(&[0]).unwrap_err(),
-        PubkyNoiseError::BadLengthCiphertext
-    );
-    assert_eq!(
-        pair.responder.prepare_receive(&[0, 16, 1]).unwrap_err(),
-        PubkyNoiseError::BadLengthCiphertext
-    );
-
-    let mut oversized = vec![0; PUBKY_NOISE_CIPHERTEXT_LEN + 2];
-    let oversized_len = (PUBKY_NOISE_CIPHERTEXT_LEN as u16 + 1).to_be_bytes();
-    oversized[..2].copy_from_slice(&oversized_len);
+    let oversized = vec![0; PUBKY_NOISE_TRANSPORT_PACKET_LEN + 1];
     assert_eq!(
         pair.responder.prepare_receive(&oversized).unwrap_err(),
         PubkyNoiseError::BadLengthCiphertext
@@ -1615,10 +1596,10 @@ async fn snow_test_prepare_receive_rejects_malformed_lengths() {
     );
 }
 
-/// A forged in-range length reaches Noise authentication and is rejected
-/// without advancing the receiving state.
+/// Tampering with the encrypted length or body fails authentication without
+/// advancing the receiving state.
 #[tokio::test]
-async fn snow_test_prepare_receive_rejects_forged_in_range_length() {
+async fn snow_test_prepare_receive_rejects_tampered_transport_packet() {
     let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "NN").await;
     complete_nn_handshake(&mut pair).await;
@@ -1628,8 +1609,7 @@ async fn snow_test_prepare_receive_rejects_forged_in_range_length() {
         .prepare_send(b"authenticated ciphertext")
         .unwrap();
     let mut forged = prepared.ciphertext().to_vec();
-    let declared_len = u16::from_be_bytes([forged[0], forged[1]]);
-    forged[..2].copy_from_slice(&(declared_len - 1).to_be_bytes());
+    forged[0] ^= 1;
     let receiver_before = pair.responder.snapshot().unwrap().serialize();
 
     assert_eq!(
@@ -2431,8 +2411,8 @@ async fn snow_test_XX_initiator_put_failure_returns_error() {
 /// Test message payload sizes around the PUBKY_NOISE_MSG_LEN boundary.
 ///
 /// The maximum plaintext payload is PUBKY_NOISE_MSG_LEN (1000) bytes.
-/// The ciphertext buffer is PUBKY_NOISE_CIPHERTEXT_LEN (1016) bytes,
-/// which accounts for the 16-byte ChaChaPoly AEAD tag.
+/// Every transport packet is PUBKY_NOISE_TRANSPORT_PACKET_LEN (1018) bytes:
+/// a fixed 1002-byte plaintext frame plus the 16-byte ChaChaPoly AEAD tag.
 ///
 /// - 999 bytes (MSG_LEN - 1): under the limit, should succeed
 /// - 1000 bytes (MSG_LEN):    exactly at the limit, should succeed

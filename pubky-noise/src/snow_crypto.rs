@@ -7,10 +7,15 @@ use snow::{HandshakeState, StatelessTransportState};
 use crate::snow_crypto_resolver::ReplayResolver;
 
 pub const PUBKY_NOISE_MSG_LEN: usize = 1000;
+/// Length of the authenticated transport plaintext: body length, body, and padding.
+pub(crate) const PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + 2;
 /// ChaChaPoly AEAD authentication tag size (Poly1305).
 pub const PUBKY_NOISE_TAG_LEN: usize = 16;
-/// Ciphertext buffer size: plaintext + AEAD tag.
+/// Maximum ciphertext size for a [`PUBKY_NOISE_MSG_LEN`]-byte Noise message.
 pub const PUBKY_NOISE_CIPHERTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + PUBKY_NOISE_TAG_LEN;
+/// Fixed stored transport packet size: authenticated plaintext plus AEAD tag.
+pub const PUBKY_NOISE_TRANSPORT_PACKET_LEN: usize =
+    PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN + PUBKY_NOISE_TAG_LEN;
 /// Noise reserves `u64::MAX`. The preceding value is the exhausted cursor,
 /// making `u64::MAX - 2` the final usable nonce.
 const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
@@ -696,8 +701,8 @@ impl DataLinkContext {
     /// Encrypt a transport message without advancing the sending nonce.
     pub(crate) fn prepare_transport_write(
         &self,
-        payload: &[u8],
-        message: &mut [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
+        payload: &[u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN],
+        message: &mut [u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
     ) -> Result<usize, ContextError> {
         if !self.is_transport() {
             return Err(ContextError::OngoingHandshake);
@@ -713,9 +718,8 @@ impl DataLinkContext {
     /// Decrypt a transport message without advancing the receiving nonce.
     pub(crate) fn prepare_transport_read(
         &self,
-        message: &[u8; PUBKY_NOISE_CIPHERTEXT_LEN],
-        payload: &mut [u8; PUBKY_NOISE_MSG_LEN],
-        len: usize,
+        message: &[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
+        payload: &mut [u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN],
     ) -> Result<usize, ContextError> {
         if !self.is_transport() {
             return Err(ContextError::OngoingHandshake);
@@ -724,7 +728,7 @@ impl DataLinkContext {
         self.noise_transport
             .as_ref()
             .ok_or(ContextError::OngoingHandshake)?
-            .read_message(self.receiving_nonce, &message[..len], payload)
+            .read_message(self.receiving_nonce, message, payload)
             .map_err(|_| ContextError::InternalSnowReadErr)
     }
 
@@ -923,19 +927,20 @@ mod tests {
     #[test]
     fn test_prepared_transport_operations_do_not_advance_state() {
         let (initiator, responder) = transport_contexts();
-        let mut ciphertext = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
-        let mut plaintext = [0; PUBKY_NOISE_MSG_LEN];
-        let message = b"prepared transport message\0\0";
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
+        let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+        let message = [42; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
 
         let ciphertext_len = initiator
-            .prepare_transport_write(message, &mut ciphertext)
+            .prepare_transport_write(&message, &mut ciphertext)
             .unwrap();
         let plaintext_len = responder
-            .prepare_transport_read(&ciphertext, &mut plaintext, ciphertext_len)
+            .prepare_transport_read(&ciphertext, &mut plaintext)
             .unwrap();
 
-        assert_eq!(plaintext_len, message.len());
-        assert_eq!(&plaintext[..plaintext_len], message);
+        assert_eq!(ciphertext_len, PUBKY_NOISE_TRANSPORT_PACKET_LEN);
+        assert_eq!(plaintext_len, PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN);
+        assert_eq!(plaintext, message);
         assert_eq!(initiator.get_sending_nonce(), 0);
         assert_eq!(responder.get_receiving_nonce(), 0);
     }
