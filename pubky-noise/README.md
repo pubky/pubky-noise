@@ -242,22 +242,34 @@ be stored in plaintext. `persist_snapshot()` encrypts it before uploading to
 `{write_path}/backup` on the local homeserver, and `load_snapshot()` fetches and decrypts it:
 
 ```rust,ignore
+use pubky_noise::backup_crypto;
+
+// Obtain the 32-byte backup key. Root-identity callers can derive it from the
+// Pubky root secret; delegated apps that do not hold the root secret may
+// supply their own key (e.g. derived from a shared Noise/state key).
+let backup_key = backup_crypto::derive_backup_key(&root_secret);
+
 // Encrypt and upload the snapshot to the homeserver.
 // `generation` is a caller-managed monotonically increasing counter.
-encryptor.persist_snapshot(generation).await?;
-// -> record the generation in trusted local storage as your rollback checkpoint
+// IMPORTANT: advance your trusted local checkpoint to `generation` *before*
+// (or atomically with) this call -- see "Rollback protection" below.
+encryptor.persist_snapshot(&backup_key, generation).await?;
 
 // Later (e.g. after a crash or on another device): fetch, decrypt and restore
-let loaded = PubkyNoiseEncryptor::load_snapshot(&config, local_checkpoint).await?;
+let loaded = PubkyNoiseEncryptor::load_snapshot(&config, &backup_key, local_checkpoint).await?;
 let mut restored = PubkyNoiseEncryptor::restore(config, loaded.state, peer_pubkey).await?;
 // (`peer_pubkey` is the remote peer you were talking to; it is also stored
 //  in `loaded.state.endpoint_pubkey` and can be reconstructed from it via pkarr.)
 ```
 
 Encryption follows the same convention as Pubky recovery files: XSalsa20Poly1305 with a random
-24-byte nonce per write. The encryption key is derived from the Pubky root secret with a
-domain-separated KDF -- `SHA-256("pubky-noise/session-backup/v0" || root_secret)` --
-so the raw root secret is never used directly. The snapshot is not compressed: it is a fixed
+192-bit nonce per write, prepended to the ciphertext (the nonce is not secret -- it only needs
+to be unique per write, and decryption requires it). `persist_snapshot()` and `load_snapshot()`
+take a caller-provided 32-byte `backup_key`. The optional `backup_crypto::derive_backup_key()`
+helper derives it from the Pubky root secret with a domain-separated KDF --
+`SHA-256("pubky-noise/session-backup/v0" || root_secret)` -- so the raw root secret is never
+used directly; callers that do not hold the root secret supply their own key instead.
+The snapshot is not compressed: it is a fixed
 197 bytes of mostly high-entropy key material, which does not compress.
 
 The stored record is a closed, versioned envelope:
@@ -281,20 +293,27 @@ trusted checkpoint (`None`, e.g. a fresh device) rollback cannot be detected -- 
 hash-chained sequence alone is not sufficient either, since the homeserver can simply withhold
 the newest element.
 
+**Checkpoint update order matters.** Advance the trusted local checkpoint to the new
+`generation` *before* (or atomically with) calling `persist_snapshot()`. If the checkpoint is
+advanced only after the upload and the process crashes in between, the checkpoint still holds
+`generation - 1`, so a homeserver replaying the previous backup would be accepted. Crashing
+with the checkpoint already advanced is safe: the new upload is simply lost and loading then
+rejects the older record instead of silently accepting stale state.
+
 If you persist snapshots through your own storage instead of `persist_snapshot()`, you must
 encrypt the serialized bytes yourself.
 
 ### Recovery Flow
 
 ```rust,ignore
-// Take a snapshot (automatic during handle_handshake, or manual)
-let snapshot = encryptor.snapshot();
-let bytes = snapshot.serialize();
-// ... persist bytes to storage ...
+// Persist the encrypted snapshot to the homeserver (the snapshot contains
+// session secrets -- never store the serialized bytes in plaintext).
+// Advance your trusted local checkpoint to `generation` first.
+encryptor.persist_snapshot(&backup_key, generation).await?;
 
-// On crash/failure, deserialize and restore
-let state = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
-let mut restored = PubkyNoiseEncryptor::restore(config, state, endpoint_pubkey).await.unwrap();
+// On crash/failure: fetch, decrypt and restore
+let loaded = PubkyNoiseEncryptor::load_snapshot(&config, &backup_key, local_checkpoint).await?;
+let mut restored = PubkyNoiseEncryptor::restore(config, loaded.state, endpoint_pubkey).await.unwrap();
 // Continue from where you left off
 ```
 
@@ -362,35 +381,39 @@ Snow's `HandshakeState` is a one-way ratchet: once `write_message()` is called, 
 
 ```rust,ignore
 use pubky_noise::{PubkyNoiseEncryptor, PubkyNoiseConfig, PubkyNoiseError, HandshakeResult};
+use pubky_noise::backup_crypto;
 use pubky_noise::serializer::PubkyNoiseSessionState;
 
 // Persist the last good snapshot after every handshake call.
-// This is the safety net for crash recovery.
+// This is the safety net for crash recovery. Snapshots contain session
+// secrets, so only ever persist the encrypted envelope -- never plaintext.
 async fn handshake_with_recovery(
     encryptor: &mut PubkyNoiseEncryptor,
     config: Arc<PubkyNoiseConfig>,
     endpoint_pubkey: PublicKey,
+    backup_key: &[u8; 32],
+    generation: u64,
 ) -> Result<HandshakeResult, PubkyNoiseError> {
     match encryptor.handle_handshake().await {
         Ok(result) => {
             // Success -- persist the pre-mutation snapshot for future recovery.
             // (Each call overwrites the previous snapshot, so persist after every call.)
             if let Some(snapshot) = encryptor.last_good_snapshot() {
-                let bytes = snapshot.serialize();
-                save_to_disk(&bytes); // your persistence logic
+                let encrypted =
+                    backup_crypto::encrypt_backup_with_key(backup_key, generation, snapshot);
+                save_to_disk(&encrypted); // your persistence logic
             }
             Ok(result)
         }
         Err(PubkyNoiseError::HomeserverWriteError) => {
-            // The encryptor is now corrupted. Recover from the snapshot
-            // that was captured at the START of this failed call.
-            let snapshot = encryptor
-                .last_good_snapshot()
-                .expect("always Some after handle_handshake")
-                .clone();
-
-            let bytes = snapshot.serialize();
-            let state = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
+            // The encryptor is now corrupted. Recover from the encrypted
+            // envelope persisted above (or from `load_snapshot()` if it was
+            // uploaded to the homeserver).
+            let encrypted = load_from_disk(); // your persistence logic
+            let (_, bytes) = backup_crypto::decrypt_backup_with_key(backup_key, &encrypted, None)
+                .map_err(|_| PubkyNoiseError::RestoreBackupDecryptError)?;
+            let state = PubkyNoiseSessionState::deserialize(&bytes)
+                .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?;
 
             // Restore rebuilds the Noise state by replaying handshake
             // messages that are actually on the homeservers.
@@ -421,7 +444,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 - `last_good_snapshot()` returns `None` before the first `handle_handshake()` call.
 - Each `handle_handshake()` call overwrites the previous snapshot with the state from the start of *that* call.
 - The snapshot contains the ephemeral secret key, which is the critical piece that allows `restore()` to re-derive the same transport keys via replay. Any persisted snapshot must be encrypted (as `persist_snapshot()` does).
-- `restore()` verifies the handshake hash matches the saved one (for transport-phase restores), returning `RestoreHashMismatch` on mismatch.
+- `restore()` verifies the handshake hash matches the saved one (for transport-phase restores), returning `RestoreBackupHashMismatch` on mismatch.
 
 ## Error Handling
 
@@ -437,11 +460,12 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 | `DecryptionError` | Noise decryption failed during `receive_message()` | Message may be tampered or nonces desynchronized |
 | `CounterOverflow` | Message slot counter space is exhausted | Start a new Noise session |
 | `NonceOverflow` | Transport nonce space is exhausted | Start a new Noise session |
-| `RestoreReplayError` | Handshake replay failed during restore | Check that homeserver messages are intact |
-| `RestoreHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
-| `RestoreDeserializeError` | Snapshot deserialization failed | Check data integrity |
-| `RestoreBackupDecryptError` | Persisted snapshot decryption failed | Wrong root key, or tampered/corrupted backup |
+| `RestoreBackupReplayError` | Handshake replay failed during restore | Check that homeserver messages are intact |
+| `RestoreBackupHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
+| `RestoreBackupDeserializeError` | Backup envelope or snapshot deserialization failed | Check data integrity |
+| `RestoreBackupDecryptError` | Persisted snapshot decryption failed | Wrong backup key, or tampered/corrupted backup |
 | `RestoreBackupRollbackError` | Backup generation is older than the trusted local checkpoint | Restart from a fresh handshake; investigate homeserver |
+| `RestoreBackupNotFoundError` | No backup exists at the backup path (distinct from connectivity/server failures) | Persist a snapshot first, or start a new session |
 
 ## Features
 

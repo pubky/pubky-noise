@@ -3,7 +3,16 @@
 //! A serialized [`PubkyNoiseSessionState`] contains the session's ephemeral
 //! secret (and optionally the static secret), so it must be encrypted before
 //! it leaves the device. Encryption follows the Pubky convention used for
-//! recovery files: `XSalsa20Poly1305` with a random 192-bit nonce per write.
+//! recovery files (see `pubky_common::recovery_file`, built on
+//! `pubky_common::crypto::{encrypt, decrypt}`): `XSalsa20Poly1305` with a
+//! fresh random 192-bit nonce per write, prepended to the ciphertext.
+//!
+//! The nonce is not a secret — by design it only needs to be unique per
+//! encryption under the same key, which a random 192-bit value provides with
+//! overwhelming probability, so storing it alongside the ciphertext is
+//! standard practice (it is required for decryption). The AEAD tag
+//! authenticates the ciphertext against that same nonce, so tampering with
+//! the prepended nonce fails decryption.
 //!
 //! ## Envelope Format (version 1)
 //!
@@ -65,6 +74,18 @@
 //! device, `min_generation = None`) rollback cannot be detected — a signed or
 //! hash-chained sequence alone is not sufficient either, since the homeserver
 //! can simply withhold the newest element.
+//!
+//! ### Checkpoint update order
+//!
+//! The trusted local checkpoint must be advanced to the new `generation`
+//! **before** (or atomically with) uploading the backup to the homeserver.
+//! Advancing it only *after* the upload leaves a crash window: if generation
+//! `N` reaches the server but the process crashes before the checkpoint is
+//! updated, the checkpoint still holds `N - 1` and a replayed generation
+//! `N - 1` record is accepted — the exact rollback the checkpoint exists to
+//! prevent. Crashing with the checkpoint already advanced is safe: the new
+//! upload is simply lost, and loading then rejects the older record (or finds
+//! no usable backup) instead of silently accepting stale state.
 
 use pubky_common::crypto;
 use sha2::{Digest, Sha256};
@@ -570,6 +591,31 @@ mod tests {
         assert!(decrypt_backup(&root_secret, &record, Some(5)).is_ok());
         assert!(decrypt_backup(&root_secret, &record, Some(4)).is_ok());
         assert!(decrypt_backup(&root_secret, &record, None).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_first_ordering_closes_the_upload_crash_window() {
+        // Scenario: the caller persisted generation 2 to the homeserver and
+        // crashed before (or after) advancing its trusted local checkpoint.
+        // A stale/malicious homeserver then replays the generation-1 record.
+        let root_secret = [42u8; 32];
+        let replayed_gen_1 = encrypt_backup(&root_secret, 1, &test_state());
+
+        // Required order (checkpoint advanced to 2 before/with the upload):
+        // the replayed generation-1 record is rejected.
+        assert_eq!(
+            decrypt_backup(&root_secret, &replayed_gen_1, Some(2)),
+            Err(BackupCryptoError::Rollback {
+                generation: 1,
+                min_generation: 2,
+            })
+        );
+
+        // Wrong order (checkpoint still 1 because the process crashed after
+        // the upload but before updating it): the replayed record is
+        // silently accepted. This is why the checkpoint must be advanced
+        // before (or atomically with) the upload.
+        assert!(decrypt_backup(&root_secret, &replayed_gen_1, Some(1)).is_ok());
     }
 
     #[test]

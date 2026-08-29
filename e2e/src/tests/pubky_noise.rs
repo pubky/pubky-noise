@@ -886,6 +886,13 @@ async fn snow_test_simple_backup() {
     let backup_key =
         backup_crypto::derive_backup_key(&pair.initiator_config.pubky_root_keypair.secret());
 
+    // No backup has been persisted yet: the load reports the confirmed
+    // absence of a backup, distinctly from a connectivity or server failure.
+    let err = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err, PubkyNoiseError::RestoreBackupNotFoundError);
+
     // Persist generation 1 and keep a copy of the stored record.
     pair.initiator
         .persist_snapshot(&backup_key, 1)
@@ -945,6 +952,30 @@ async fn snow_test_simple_backup() {
         .unwrap();
     assert_eq!(rolled_back.generation, 1);
     assert_eq!(rolled_back.state.serialize(), plaintext_a);
+}
+
+#[tokio::test]
+async fn snow_test_backup_oversized_rejected() {
+    let testnet = build_testnet().await;
+    let pair = setup_encryptors(&testnet, "XX").await;
+
+    let backup_key =
+        backup_crypto::derive_backup_key(&pair.initiator_config.pubky_root_keypair.secret());
+
+    // A record larger than the hard cap must be rejected up front by the
+    // HEAD Content-Length probe, before any body bytes are streamed.
+    let oversized = vec![0u8; backup_crypto::MAX_BACKUP_RESPONSE_BYTES + 1];
+    pair.initiator_config
+        .local_session
+        .storage()
+        .put("/pub/data/backup", oversized)
+        .await
+        .unwrap();
+
+    let err = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err, PubkyNoiseError::HomeserverResponseError);
 }
 
 #[tokio::test]
