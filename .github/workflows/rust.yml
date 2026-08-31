@@ -7,94 +7,209 @@ on:
       - master
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: 1.93
-          components: rustfmt
-          override: true
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build
-
   format:
+    name: Formatting
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4.2.2
+      - name: Set up Rust 1.93 with rustfmt
+        uses: dtolnay/rust-toolchain@1.93
         with:
-          profile: minimal
-          toolchain: 1.93
+          toolchain: "1.93"
           components: rustfmt
-          override: true
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
   clippy:
+    name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4.2.2
+      - name: Set up Rust 1.93 with Clippy
+        uses: dtolnay/rust-toolchain@1.93
         with:
-          profile: minimal
-          toolchain: 1.93
+          toolchain: "1.93"
           components: clippy
-          override: true
-      - name: Check clippy
-        run: cargo clippy -p pubky-noise
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2.8.2
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-  test-unit:
+  build:
+    name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4.2.2
+      - name: Set up Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93
         with:
-          profile: minimal
-          toolchain: 1.93
-          override: true
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
-      - name: Install Nextest
-        uses: taiki-e/install-action@nextest
-      - name: Unit tests
-        run: cargo nextest run -p pubky-noise
+          toolchain: "1.93"
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2.8.2
+      - name: Build workspace
+        run: cargo build --workspace --all-targets --all-features --locked
 
-  test-e2e:
+  rustdoc:
+    name: Rustdoc
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4.2.2
+      - name: Set up Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93
         with:
-          profile: minimal
-          toolchain: 1.93
-          override: true
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
-      - name: Install Nextest
-        uses: taiki-e/install-action@nextest
-      - name: E2E tests
-        run: cargo nextest run -p e2e
+          toolchain: "1.93"
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2.8.2
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+  unit-tests:
+    name: Unit tests (${{ matrix.features.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - name: default features
+            args: ""
+          - name: all features
+            args: --all-features
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Set up Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93
+        with:
+          toolchain: "1.93"
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2.8.2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2.8.2
+        with:
+          tool: nextest
+      - name: Run unit tests
+        run: cargo nextest run --locked -p pubky-noise ${{ matrix.features.args }}
+
+  doctests:
+    name: Doctests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Set up Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93
+        with:
+          toolchain: "1.93"
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2.8.2
+      - name: Run doctests
+        run: cargo test --locked -p pubky-noise --doc --all-features
+
+  e2e-tests:
+    name: End-to-end tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Set up Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93
+        with:
+          toolchain: "1.93"
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2.8.2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2.8.2
+        with:
+          tool: nextest
+      - name: Run end-to-end tests
+        run: cargo nextest run --locked -p e2e
 
   msrv:
     name: MSRV (1.89)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4.2.2
+      - name: Set up Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89
+        with:
+          toolchain: "1.89"
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2.8.2
       - name: Check MSRV compatibility
-        run: cargo check --locked --workspace --all-features
+        run: cargo check --locked --workspace --all-targets --all-features
+
+  rustsec:
+    name: RustSec audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Scan dependencies for vulnerabilities
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # quick-xml fixes require an upstream E2E-stack migration; RSA has no fixed release.
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0194,RUSTSEC-2026-0195
+
+  ci-success:
+    name: CI success
+    if: always()
+    needs:
+      - format
+      - clippy
+      - build
+      - rustdoc
+      - unit-tests
+      - doctests
+      - e2e-tests
+      - msrv
+      - rustsec
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Verify required jobs succeeded
+        env:
+          FORMAT_RESULT: ${{ needs.format.result }}
+          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RUSTDOC_RESULT: ${{ needs.rustdoc.result }}
+          UNIT_TESTS_RESULT: ${{ needs.unit-tests.result }}
+          DOCTESTS_RESULT: ${{ needs.doctests.result }}
+          E2E_TESTS_RESULT: ${{ needs.e2e-tests.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          RUSTSEC_RESULT: ${{ needs.rustsec.result }}
+        run: |
+          for result in \
+            "$FORMAT_RESULT" \
+            "$CLIPPY_RESULT" \
+            "$BUILD_RESULT" \
+            "$RUSTDOC_RESULT" \
+            "$UNIT_TESTS_RESULT" \
+            "$DOCTESTS_RESULT" \
+            "$E2E_TESTS_RESULT" \
+            "$MSRV_RESULT" \
+            "$RUSTSEC_RESULT"
+          do
+            if [ "$result" != "success" ]; then
+              echo "Required CI job result: $result"
+              exit 1
+            fi
+          done

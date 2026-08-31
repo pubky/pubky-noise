@@ -1,5 +1,7 @@
 # pubky-noise
 
+[![CI](https://github.com/pubky/pubky-noise/actions/workflows/rust.yml/badge.svg?branch=master)](https://github.com/pubky/pubky-noise/actions/workflows/rust.yml)
+
 A Rust workspace for encrypted peer-to-peer communication over [Pubky](https://pubky.org) homeservers using the [Noise protocol](https://noiseprotocol.org/).
 
 ## Overview
