@@ -9,7 +9,7 @@ Peers use their homeservers as outboxes: each party writes encrypted Noise messa
 ```toml
 # Cargo.toml
 [dependencies]
-pubky-noise = "0.1.0-rc6"
+pubky-noise = "0.1.0-rc7"
 ```
 
 ### Actual dependencies (for reference)
@@ -62,8 +62,17 @@ loop {
 // 4. Transition to transport phase
 let link_id = initiator.transition_transport().unwrap();
 
-// 5. Send and receive encrypted messages
-initiator.send_message(b"Hello, peer!").await?;
+// 5. Prepare, persist, and publish an encrypted message
+let prepared = initiator.prepare_send(b"Hello, peer!")?;
+persistent_store.commit_send(
+    prepared.destination_path(),
+    prepared.ciphertext(),
+    prepared.resulting_session_state(),
+)?;
+initiator.acknowledge_persisted_send(prepared)?;
+ordered_publisher.flush_in_order().await?;
+
+// Receive convenience API; use prepare_receive for durable processing.
 let messages = initiator.receive_message().await?;
 
 // 6. Clean up
@@ -95,12 +104,12 @@ homeserver slot selection.
 Messages use a length-prefixed packet format:
 
 ```text
-[len_hi, len_lo, payload...]
+[len_hi, len_lo, ciphertext..., zero padding...]
 ```
 
-- `len`: big-endian u16 indicating payload length
-- `payload`: up to 1000 bytes (`PUBKY_NOISE_MSG_LEN`)
-- Total packet size: 1002 bytes
+- `len`: big-endian u16 indicating ciphertext length
+- `ciphertext`: up to 1016 bytes (1000-byte plaintext plus the 16-byte authentication tag)
+- Total stored packet size: 1018 bytes
 
 ### Crypto Primitives
 
@@ -129,6 +138,8 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 
 - **`PubkyNoiseSessionState`** -- Serializable snapshot of a session (197 bytes). Contains everything needed to restore a session by replaying persisted handshake messages through a fresh Noise state. Because it includes the session's secret keys, it is encrypted before homeserver storage (see [Session Backup & Restore](#session-backup--restore)).
 
+- **`PreparedSend` / `PreparedReceive`** -- Staged transport results containing the exact message data and resulting session state. Use these when message publication or processing must be committed atomically with session state.
+
 - **`DataLinkContext`** -- Internal Noise state machine managing the handshake and transport phases. Not used directly by consumers.
 
 ### Lifecycle
@@ -140,6 +151,36 @@ new() --> handle_handshake() [loop] --> transition_transport() --> send/receive 
         |                                     |
     restore() [on crash recovery]     load_snapshot() --> restore() [on crash recovery]
 ```
+
+### Staged Transport Operations
+
+Transport sends use staged state transitions so ambiguous homeserver responses
+cannot cause a fresh plaintext to reuse a nonce:
+
+These APIs coordinate an application's durable state with transport processing.
+They do not acknowledge that the remote peer received a message.
+
+1. Call `prepare_send()` to obtain the destination path, exact ciphertext, and resulting session state.
+2. Atomically persist the exact ciphertext and resulting session state as one outbound record.
+3. Call `acknowledge_persisted_send()`. The handle is consumed and the encryptor may prepare the next message.
+4. Write persisted outbound records to their homeserver destination paths in order. If a write is uncertain, retry the exact stored ciphertext.
+5. For inbound data, fetch `next_receive_path()`, call `prepare_receive()`, atomically persist the resulting state with the application's durable processing result, and call `acknowledge_persisted_receive()`.
+
+If atomic persistence fails, drop the advanced encryptor and restore the previous
+persisted state. There is no in-place discard operation. Callers sharing state
+across processes must serialize preparation and use conditional state updates.
+Do not call `persist_snapshot()` to commit a staged operation: it is rejected
+while an operation is awaiting acknowledgement. In the caller's atomic storage
+transaction, replace the previous session snapshot with `resulting_session_state`
+and persist the matching outbound record or inbound processing result.
+
+`send_message()` is deprecated because it cannot make the exact ciphertext and
+resulting state durable atomically. After an ambiguous in-process write failure,
+`retry_pending_send()` republishes the exact retained ciphertext. This recovery
+does not survive a process crash. `receive_message()` remains available for
+callers that do not need atomic application-state processing.
+
+Decrypted plaintext is sensitive application data. Avoid logging it, minimize copies, and protect it at rest whenever the application protocol requires persistence.
 
 ## Noise Handshake Patterns
 
@@ -303,6 +344,21 @@ rejects the older record instead of silently accepting stale state.
 If you persist snapshots through your own storage instead of `persist_snapshot()`, you must
 encrypt the serialized bytes yourself.
 
+### Snapshot Security
+
+Session snapshots contain static and ephemeral secret key material. Encrypt and
+authenticate them at rest (as `persist_snapshot()` does), restrict access to apps
+or processes authorized for the same identity, and ensure superseded snapshots are
+no longer recoverable. Retaining restorable ephemeral material extends its lifetime
+and can expose messages from that Noise session if the snapshot is compromised.
+Starting a fresh session does not protect old traffic while older snapshots remain
+recoverable.
+
+At-rest encryption protects the stored bytes but does not remove this tradeoff
+while a snapshot remains recoverable. The staged transport APIs also do not
+provide cross-process authentication, authorization, credential management, or
+locking; callers must enforce those requirements.
+
 ### Recovery Flow
 
 ```rust,ignore
@@ -455,11 +511,14 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 | `BadLengthCiphertext` | Received message exceeds max size | Discard message, check sender |
 | `HomeserverResponseError` | Failed to parse homeserver response | Retry |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
-| `IsHandshake` | Called `transition_transport()`, `send_message()`, or `receive_message()` before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
+| `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
 | `DecryptionError` | Noise decryption failed during `receive_message()` | Message may be tampered or nonces desynchronized |
 | `CounterOverflow` | Message slot counter space is exhausted | Start a new Noise session |
 | `NonceOverflow` | Transport nonce space is exhausted | Start a new Noise session |
+| `UnacknowledgedPreparedTransport` | A prepared operation has not been durably acknowledged | Persist and acknowledge its handle, or restore the previous durable state if persistence failed |
+| `NoPreparedTransport` | An acknowledgement was attempted with no pending operation | Check the caller's operation lifecycle |
+| `PreparedTransportMismatch` | A prepared handle belongs to another encryptor or operation | Use the handle returned by the current encryptor |
 | `RestoreBackupReplayError` | Handshake replay failed during restore | Check that homeserver messages are intact |
 | `RestoreBackupHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
 | `RestoreBackupDeserializeError` | Backup envelope or snapshot deserialization failed | Check data integrity |

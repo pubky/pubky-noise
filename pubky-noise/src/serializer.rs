@@ -10,14 +10,19 @@ use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
 pub const SESSION_STATE_VERSION: u8 = 1;
 /// Exact length in bytes of a serialized v1 session state.
 pub const SESSION_STATE_V1_LEN: usize = 197;
-/// Noise reserves 2^64 - 1, so 2^64 - 2 is the last usable nonce.
-const MAX_USABLE_NOISE_NONCE: u64 = u64::MAX - 1;
+/// Exhausted nonce cursor sentinel.
+const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
 
 /// Serializable snapshot of a `PubkyNoiseEncryptor` session.
 ///
 /// This struct contains everything needed to reconstruct the Noise session
 /// by replaying persisted handshake messages through a fresh `HandshakeState`
 /// built with the same ephemeral key material.
+///
+/// This state contains secret key material. Serialized snapshots must be
+/// encrypted, authenticated, access-controlled, and deleted when superseded.
+/// Retaining a restorable snapshot extends the lifetime of the session's
+/// ephemeral material and therefore its exposure window.
 #[derive(Clone)]
 pub struct PubkyNoiseSessionState {
     /// Format version for forward compatibility.
@@ -338,7 +343,7 @@ fn validate_counters(
         return Err(SerializerError::InvalidCounter);
     }
 
-    if sending_nonce > MAX_USABLE_NOISE_NONCE || receiving_nonce > MAX_USABLE_NOISE_NONCE {
+    if sending_nonce > EXHAUSTED_NOISE_NONCE || receiving_nonce > EXHAUSTED_NOISE_NONCE {
         return Err(SerializerError::NonceOverflow);
     }
 
@@ -438,15 +443,15 @@ mod tests {
     }
 
     #[test]
-    fn transport_snapshot_accepts_max_usable_noise_nonce() {
+    fn transport_snapshot_accepts_exhausted_noise_nonce_sentinel() {
         let mut state = transport_state();
-        state.sending_nonce = MAX_USABLE_NOISE_NONCE;
-        state.receiving_nonce = MAX_USABLE_NOISE_NONCE;
+        state.sending_nonce = EXHAUSTED_NOISE_NONCE;
+        state.receiving_nonce = EXHAUSTED_NOISE_NONCE;
         let bytes = state.serialize();
 
         let restored = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
-        assert_eq!(restored.sending_nonce, MAX_USABLE_NOISE_NONCE);
-        assert_eq!(restored.receiving_nonce, MAX_USABLE_NOISE_NONCE);
+        assert_eq!(restored.sending_nonce, EXHAUSTED_NOISE_NONCE);
+        assert_eq!(restored.receiving_nonce, EXHAUSTED_NOISE_NONCE);
     }
 
     #[test]
