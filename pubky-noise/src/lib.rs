@@ -495,13 +495,20 @@ impl PubkyNoiseEncryptor {
     ///
     ///   **Recovery**: each call to `handle_handshake` automatically captures
     ///   a pre-mutation snapshot accessible via
-    ///   [`last_good_snapshot()`](Self::last_good_snapshot). Callers should
-    ///   persist this snapshot (e.g. via [`persist_snapshot()`](Self::persist_snapshot))
-    ///   so that on restart they can pass it to if there has been a failure
-    ///   [`restore()`](Self::restore).
-    ///   The replay mechanism will rebuild the Noise state from what is
+    ///   [`last_good_snapshot()`](Self::last_good_snapshot). For in-process
+    ///   recovery, pass that snapshot directly to [`restore()`](Self::restore);
+    ///   the replay mechanism will rebuild the Noise state from what is
     ///   actually on the homeservers, correcting the state and allowing the
     ///   handshake to resume from the right position.
+    ///
+    ///   Callers that need crash recovery must durably persist the
+    ///   pre-mutation snapshot themselves: encrypt it with
+    ///   [`backup_crypto::encrypt_backup_with_key`] and store it through
+    ///   caller-managed storage *before* the risky call. Note that
+    ///   [`persist_snapshot()`](Self::persist_snapshot) snapshots the
+    ///   encryptor's state at call time — it cannot persist
+    ///   `last_good_snapshot()`, and after a write failure the current state
+    ///   may already be advanced and corrupted.
     ///
     ///   Note: if the `put()` succeeds but the data is subsequently lost
     ///   (e.g. homeserver crash after acknowledgment), the same snapshot-based
