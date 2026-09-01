@@ -438,44 +438,29 @@ Snow's `HandshakeState` is a one-way ratchet: once `write_message()` is called, 
 ```rust,ignore
 use pubky_noise::{PubkyNoiseEncryptor, PubkyNoiseConfig, PubkyNoiseError, HandshakeResult};
 use pubky_noise::backup_crypto;
-use pubky_noise::serializer::PubkyNoiseSessionState;
 
-// Persist the last good snapshot after every handshake call.
-// This is the safety net for crash recovery. Snapshots contain session
-// secrets, so only ever persist the encrypted envelope -- never plaintext.
+// Recover from homeserver write failures *in-process*: the fresh
+// `last_good_snapshot()` captured at the start of the failed call is the
+// recovery point, so no disk is involved.
 async fn handshake_with_recovery(
     encryptor: &mut PubkyNoiseEncryptor,
     config: Arc<PubkyNoiseConfig>,
     endpoint_pubkey: PublicKey,
-    backup_key: &[u8; 32],
-    generation: u64,
 ) -> Result<HandshakeResult, PubkyNoiseError> {
     match encryptor.handle_handshake().await {
-        Ok(result) => {
-            // Success -- persist the pre-mutation snapshot for future recovery.
-            // (Each call overwrites the previous snapshot, so persist after every call.)
-            if let Some(snapshot) = encryptor.last_good_snapshot() {
-                let encrypted =
-                    backup_crypto::encrypt_backup_with_key(backup_key, generation, snapshot);
-                save_to_disk(&encrypted); // your persistence logic
-            }
-            Ok(result)
-        }
+        Ok(result) => Ok(result),
         Err(PubkyNoiseError::HomeserverWriteError) => {
-            // The encryptor is now corrupted. Recover from the encrypted
-            // envelope persisted above (or from `load_snapshot()` if it was
-            // uploaded to the homeserver).
-            let encrypted = load_from_disk(); // your persistence logic
-            let (_, bytes) = backup_crypto::decrypt_backup_with_key(backup_key, &encrypted, None)
-                .map_err(|_| PubkyNoiseError::RestoreBackupDecryptError)?;
-            let state = PubkyNoiseSessionState::deserialize(&bytes)
-                .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?;
+            // The encryptor is corrupted, but the snapshot captured at the
+            // start of the failed call is still in memory -- restore directly
+            // from it. This also works when no prior call ever succeeded.
+            let snapshot = encryptor
+                .last_good_snapshot()
+                .expect("always Some after handle_handshake")
+                .clone();
 
-            // Restore rebuilds the Noise state by replaying handshake
-            // messages that are actually on the homeservers.
             *encryptor = PubkyNoiseEncryptor::restore(
                 config,
-                state,
+                snapshot,
                 endpoint_pubkey,
             )
             .await?;
@@ -486,6 +471,30 @@ async fn handshake_with_recovery(
         }
         Err(e) => Err(e),
     }
+}
+
+// Crash coverage additionally requires the recovery point to be durable.
+// Persist the encrypted envelope BEFORE the call: the snapshot held in
+// `last_good_snapshot()` (or `snapshot()` before the first call) is exactly
+// the pre-call state, so the persisted recovery point always matches.
+// Snapshots contain session secrets, so only ever persist the encrypted
+// envelope -- never plaintext.
+async fn handshake_with_crash_recovery(
+    encryptor: &mut PubkyNoiseEncryptor,
+    config: Arc<PubkyNoiseConfig>,
+    endpoint_pubkey: PublicKey,
+    backup_key: &[u8; 32],
+    generation: u64,
+) -> Result<HandshakeResult, PubkyNoiseError> {
+    let snapshot = match encryptor.last_good_snapshot() {
+        Some(snapshot) => snapshot.clone(),
+        None => encryptor.snapshot().unwrap(),
+    };
+    let encrypted =
+        backup_crypto::encrypt_backup_with_key(backup_key, generation, &snapshot);
+    save_to_disk(&encrypted); // your persistence logic
+
+    handshake_with_recovery(encryptor, config, endpoint_pubkey).await
 }
 ```
 
