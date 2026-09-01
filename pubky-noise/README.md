@@ -9,7 +9,7 @@ Peers use their homeservers as outboxes: each party writes encrypted Noise messa
 ```toml
 # Cargo.toml
 [dependencies]
-pubky-noise = "0.1.0-rc8"
+pubky-noise = "0.1.0-rc9"
 ```
 
 ### Actual dependencies (for reference)
@@ -474,9 +474,10 @@ async fn handshake_with_recovery(
 }
 
 // Crash coverage additionally requires the recovery point to be durable.
-// Persist the encrypted envelope BEFORE the call: the snapshot held in
-// `last_good_snapshot()` (or `snapshot()` before the first call) is exactly
-// the pre-call state, so the persisted recovery point always matches.
+// Persist the encrypted envelope BEFORE the call: the pre-call state is
+// always `encryptor.snapshot()` -- `last_good_snapshot()` is captured at the
+// start of each handle_handshake() call, so after any successful call it is
+// one call behind current state. Persisting it would restore a stale point.
 // Snapshots contain session secrets, so only ever persist the encrypted
 // envelope -- never plaintext.
 async fn handshake_with_crash_recovery(
@@ -486,10 +487,7 @@ async fn handshake_with_crash_recovery(
     backup_key: &[u8; 32],
     generation: u64,
 ) -> Result<HandshakeResult, PubkyNoiseError> {
-    let snapshot = match encryptor.last_good_snapshot() {
-        Some(snapshot) => snapshot.clone(),
-        None => encryptor.snapshot().unwrap(),
-    };
+    let snapshot = encryptor.snapshot().unwrap();
     let encrypted =
         backup_crypto::encrypt_backup_with_key(backup_key, generation, &snapshot);
     save_to_disk(&encrypted); // your persistence logic
