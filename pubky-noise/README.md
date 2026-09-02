@@ -474,13 +474,17 @@ async fn handshake_with_recovery(
 }
 
 // Crash coverage additionally requires the recovery point to be durable.
-// Persist the encrypted envelope BEFORE the call: the pre-call state is
-// always `encryptor.snapshot()` -- `last_good_snapshot()` is captured at the
-// start of each handle_handshake() call, so after any successful call it is
-// one call behind current state. Persisting it would restore a stale point.
-// Snapshots contain session secrets, so only ever persist the encrypted
-// envelope -- never plaintext.
-async fn handshake_with_crash_recovery(
+// This helper scopes that to explicit `HomeserverWriteError` failures only:
+// it persists the current state before each call, so if the `put()` inside
+// that call explicitly fails (returns an error), restoring the persisted
+// checkpoint replays correctly and the write can be retried. It does NOT
+// cover the lost-message case (Case a2, described below), where `put()`
+// succeeded and the server later lost the write: restoring the post-write
+// state would skip the lost write rather than republish it. Case a2 recovery
+// needs the durable checkpoint to remain at the *pre-write* state until peer
+// progress confirms the write actually persisted — call-side persistence
+// alone cannot establish that.
+async fn handshake_recovery_explicit_write_errors(
     encryptor: &mut PubkyNoiseEncryptor,
     config: Arc<PubkyNoiseConfig>,
     endpoint_pubkey: PublicKey,
