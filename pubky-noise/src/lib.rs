@@ -847,7 +847,7 @@ impl PubkyNoiseEncryptor {
         let message = {
             let mut message = *message;
             if self.simulate_tampering {
-                message[1] = 0xff;
+                message[1] ^= 1;
             }
             message
         };
