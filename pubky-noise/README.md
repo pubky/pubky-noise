@@ -451,7 +451,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 |---|---|---|
 | `UnknownNoisePattern` | Invalid pattern string | Use a supported pattern: "NN", "XX" |
 | `SnowNoiseBuildError` | Noise stack failed to initialize | Check key material and pattern compatibility |
-| `BadLengthCiphertext` | Received packet or authenticated body length is malformed | Discard message, check sender |
+| `BadLengthCiphertext` | Received packet or authenticated transport frame is malformed | Discard message, check sender |
 | `HomeserverResponseError` | Failed to parse homeserver response | Retry |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
 | `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |

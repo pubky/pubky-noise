@@ -79,6 +79,9 @@ fn decode_transport_plaintext(
     if body_len > PUBKY_NOISE_MSG_LEN {
         return Err(PubkyNoiseError::BadLengthCiphertext);
     }
+    if plaintext[body_len + 2..].iter().any(|byte| *byte != 0) {
+        return Err(PubkyNoiseError::BadLengthCiphertext);
+    }
 
     let mut body = [0; PUBKY_NOISE_MSG_LEN];
     body[..body_len].copy_from_slice(&plaintext[2..body_len + 2]);
@@ -1424,6 +1427,17 @@ mod tests {
 
         let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
         plaintext[..2].copy_from_slice(&((PUBKY_NOISE_MSG_LEN + 1) as u16).to_be_bytes());
+        assert_eq!(
+            decode_transport_plaintext(&plaintext).unwrap_err(),
+            PubkyNoiseError::BadLengthCiphertext
+        );
+    }
+
+    #[test]
+    fn transport_plaintext_rejects_non_zero_padding() {
+        let mut plaintext = encode_transport_plaintext(b"message").unwrap();
+        *plaintext.last_mut().unwrap() = 1;
+
         assert_eq!(
             decode_transport_plaintext(&plaintext).unwrap_err(),
             PubkyNoiseError::BadLengthCiphertext
