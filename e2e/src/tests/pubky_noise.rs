@@ -307,7 +307,7 @@ async fn send_and_verify_tampered(
     let raw_bytes = message.as_bytes();
     sender.send_message(raw_bytes).await.unwrap();
 
-    // Tampered ciphertext causes read_act to fail, surfaced as DecryptionError
+    // Tampered ciphertext fails authenticated transport decoding.
     let result = receiver.receive_message().await;
     assert!(result.is_err());
     assert_eq!(result.unwrap_err(), PubkyNoiseError::DecryptionError);

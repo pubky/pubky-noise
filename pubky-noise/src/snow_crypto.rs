@@ -350,9 +350,10 @@ pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec
 
 /// Internal Noise state-machine errors.
 #[derive(Debug)]
-pub enum ContextError {
+pub(crate) enum ContextError {
     Init,
     OngoingHandshake,
+    InvalidPhase,
     InternalSnowTransitionErr,
     InternalSnowWriteErr,
     InternalSnowReadErr,
@@ -379,7 +380,7 @@ fn ensure_nonce_can_increment(nonce: u64) -> Result<(), ContextError> {
 
 /// A Noise state machine
 #[derive(Debug)]
-pub struct DataLinkContext {
+pub(crate) struct DataLinkContext {
     initiator: bool,
     message_patterns: HandshakePattern,
 
@@ -627,7 +628,7 @@ impl DataLinkContext {
         None
     }
 
-    pub fn to_transport(&mut self) -> Result<(), ContextError> {
+    pub(crate) fn transition_to_transport(&mut self) -> Result<(), ContextError> {
         let hs = self
             .noise_handshake
             .as_ref()
@@ -669,33 +670,20 @@ impl DataLinkContext {
         self.sub_step_index = 0;
     }
 
-    pub fn write_act(
+    pub(crate) fn write_handshake_message(
         &mut self,
         payload: &[u8],
         message: &mut [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
     ) -> Result<usize, ContextError> {
-        match self.noise_phase {
-            NoisePhase::HandShake => self
-                .noise_handshake
-                .as_mut()
-                .unwrap()
-                .write_message(payload, message.as_mut())
-                .map_err(|_| ContextError::InternalSnowWriteErr),
-            NoisePhase::Transport => {
-                let nonce = self.sending_nonce;
-                let size = self
-                    .noise_transport
-                    .as_ref()
-                    .unwrap()
-                    .write_message(nonce, payload, message.as_mut())
-                    .map_err(|_| ContextError::InternalSnowWriteErr)?;
-                // NOTE: sending_nonce is NOT incremented here. The caller
-                // must call increment_sending_nonce() after confirming the
-                // write reached the homeserver. This prevents nonce desync
-                // when put() fails after a successful encryption.
-                Ok(size)
-            }
+        if self.noise_phase != NoisePhase::HandShake {
+            return Err(ContextError::InvalidPhase);
         }
+
+        self.noise_handshake
+            .as_mut()
+            .ok_or(ContextError::InvalidPhase)?
+            .write_message(payload, message.as_mut())
+            .map_err(|_| ContextError::InternalSnowWriteErr)
     }
 
     /// Encrypt a transport message without advancing the sending nonce.
@@ -732,35 +720,22 @@ impl DataLinkContext {
             .map_err(|_| ContextError::InternalSnowReadErr)
     }
 
-    pub fn read_act(
+    pub(crate) fn read_handshake_message(
         &mut self,
         message: &mut [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
         payload: &mut [u8; PUBKY_NOISE_MSG_LEN],
         index: usize,
     ) -> Result<(), ContextError> {
-        match self.noise_phase {
-            NoisePhase::HandShake => {
-                self.noise_handshake
-                    .as_mut()
-                    .unwrap()
-                    .read_message(&message[..index], payload)
-                    .map_err(|_| ContextError::InternalSnowReadErr)?;
-                Ok(())
-            }
-            NoisePhase::Transport => {
-                self.ensure_can_advance_receiving_nonce()?;
-                self.noise_transport
-                    .as_ref()
-                    .unwrap()
-                    .read_message(self.receiving_nonce, &message[..index], payload)
-                    .map_err(|_| ContextError::InternalSnowReadErr)?;
-                self.receiving_nonce = self
-                    .receiving_nonce
-                    .checked_add(1)
-                    .ok_or(ContextError::NonceOverflow)?;
-                Ok(())
-            }
+        if self.noise_phase != NoisePhase::HandShake {
+            return Err(ContextError::InvalidPhase);
         }
+
+        self.noise_handshake
+            .as_mut()
+            .ok_or(ContextError::InvalidPhase)?
+            .read_message(&message[..index], payload)
+            .map(|_| ())
+            .map_err(|_| ContextError::InternalSnowReadErr)
     }
 
     // --- Snapshot / restore accessors ---
@@ -845,37 +820,6 @@ impl DataLinkContext {
         self.sub_step_index = index;
     }
 
-    /// Advance the sending nonce by 1.
-    ///
-    /// Call this **after** confirming the encrypted message was successfully
-    /// written to the homeserver. This ensures the nonce stays in sync with
-    /// what the receiver expects, even if a write fails.
-    pub fn increment_sending_nonce(&mut self) -> Result<(), ContextError> {
-        self.sending_nonce = self
-            .sending_nonce
-            .checked_add(1)
-            .ok_or(ContextError::NonceOverflow)?;
-        Ok(())
-    }
-
-    /// Advance the outbound homeserver slot counter by 1.
-    pub fn increment_write_counter(&mut self) -> Result<(), ContextError> {
-        self.write_counter = self
-            .write_counter
-            .checked_add(1)
-            .ok_or(ContextError::CounterOverflow)?;
-        Ok(())
-    }
-
-    /// Advance the remote outbound homeserver slot counter by 1.
-    pub fn increment_read_counter(&mut self) -> Result<(), ContextError> {
-        self.read_counter = self
-            .read_counter
-            .checked_add(1)
-            .ok_or(ContextError::CounterOverflow)?;
-        Ok(())
-    }
-
     /// Set the sending nonce (used during restore after transport transition).
     pub fn set_sending_nonce(&mut self, nonce: u64) {
         self.sending_nonce = nonce;
@@ -916,14 +860,22 @@ mod tests {
 
         let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
         let mut payload = [0; PUBKY_NOISE_MSG_LEN];
-        let len = initiator.write_act(&[], &mut message).unwrap();
-        responder.read_act(&mut message, &mut payload, len).unwrap();
+        let len = initiator
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        responder
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
 
-        let len = responder.write_act(&[], &mut message).unwrap();
-        initiator.read_act(&mut message, &mut payload, len).unwrap();
+        let len = responder
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        initiator
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
 
-        initiator.to_transport().unwrap();
-        responder.to_transport().unwrap();
+        initiator.transition_to_transport().unwrap();
+        responder.transition_to_transport().unwrap();
         (initiator, responder)
     }
 
@@ -963,6 +915,38 @@ mod tests {
         assert_eq!(
             hex::encode(Sha256::digest(ciphertext)),
             "a1eeedce594a1947e52c950ec6f207b133a93d1f09c92f01f0f66169d26d5c0c"
+        );
+    }
+
+    #[test]
+    fn test_handshake_message_methods_reject_transport_phase() {
+        let (mut initiator, mut responder) = transport_contexts();
+        let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+        let initiator_before = (initiator.get_sending_nonce(), initiator.get_write_counter());
+        let responder_before = (
+            responder.get_receiving_nonce(),
+            responder.get_read_counter(),
+        );
+
+        assert!(matches!(
+            initiator.write_handshake_message(&[], &mut message),
+            Err(ContextError::InvalidPhase)
+        ));
+        assert!(matches!(
+            responder.read_handshake_message(&mut message, &mut payload, 0),
+            Err(ContextError::InvalidPhase)
+        ));
+        assert_eq!(
+            (initiator.get_sending_nonce(), initiator.get_write_counter()),
+            initiator_before
+        );
+        assert_eq!(
+            (
+                responder.get_receiving_nonce(),
+                responder.get_read_counter()
+            ),
+            responder_before
         );
     }
 

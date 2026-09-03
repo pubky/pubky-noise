@@ -131,9 +131,9 @@ pub enum PubkyNoiseError {
     RestoreHashMismatch,
     /// Restore failed: deserialization error.
     RestoreDeserializeError,
-    /// Transport-phase encryption (write_act) failed.
+    /// Transport-phase encryption failed.
     EncryptionError,
-    /// Transport-phase decryption (read_act) failed.
+    /// Transport-phase decryption failed.
     DecryptionError,
     /// Message slot counter space is exhausted.
     CounterOverflow,
@@ -524,7 +524,11 @@ impl PubkyNoiseEncryptor {
                             if let Ok(ciphertext) = response.bytes().await {
                                 let (mut message, len) = decode_handshake_packet(&ciphertext)?;
                                 let mut payload = [0; PUBKY_NOISE_MSG_LEN];
-                                let _ = self.context.read_act(&mut message, &mut payload, len);
+                                let _ = self.context.read_handshake_message(
+                                    &mut message,
+                                    &mut payload,
+                                    len,
+                                );
                             } else {
                                 return Err(PubkyNoiseError::HomeserverResponseError);
                             }
@@ -544,7 +548,7 @@ impl PubkyNoiseEncryptor {
                         .ensure_can_increment_counter()
                         .map_err(|_| PubkyNoiseError::CounterOverflow)?;
                     let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
-                    if let Ok(len) = self.context.write_act(&[], &mut message) {
+                    if let Ok(len) = self.context.write_handshake_message(&[], &mut message) {
                         let path = self.config.write_path.as_str();
                         let counter = self.context.get_counter();
                         let formatted_path = format!("{path}/{counter}");
@@ -609,7 +613,7 @@ impl PubkyNoiseEncryptor {
             return Err(PubkyNoiseError::IsHandshake);
         }
         let link_id = LinkId(self.context.get_handshake_hash().unwrap());
-        let _ = self.context.to_transport();
+        let _ = self.context.transition_to_transport();
         self.link_id = Some(link_id);
         Ok(link_id)
     }
@@ -1234,7 +1238,7 @@ impl PubkyNoiseEncryptor {
                     // internal state advances correctly.
                     let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
                     context
-                        .write_act(&[], &mut message)
+                        .write_handshake_message(&[], &mut message)
                         .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
                     replay_counter += 1;
                 }
@@ -1263,7 +1267,7 @@ impl PubkyNoiseEncryptor {
                     let mut payload = [0; PUBKY_NOISE_MSG_LEN];
 
                     context
-                        .read_act(&mut message, &mut payload, len)
+                        .read_handshake_message(&mut message, &mut payload, len)
                         .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
                     replay_counter += 1;
                 }
@@ -1292,7 +1296,7 @@ impl PubkyNoiseEncryptor {
             // Transition to transport
             let hash = context.get_handshake_hash().unwrap();
             context
-                .to_transport()
+                .transition_to_transport()
                 .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
 
             // Set nonces from saved state
