@@ -1622,33 +1622,6 @@ async fn snow_test_prepare_receive_rejects_tampered_transport_packet() {
     );
 }
 
-/// Authenticated but non-canonical padding is rejected without advancing state.
-#[tokio::test]
-async fn snow_test_prepare_receive_rejects_non_zero_authenticated_padding() {
-    let testnet = build_testnet().await;
-    let mut pair = setup_encryptors(&testnet, "NN").await;
-    complete_nn_handshake(&mut pair).await;
-
-    let mut plaintext = vec![0; PUBKY_NOISE_MSG_LEN + 2];
-    plaintext[..2].copy_from_slice(&7u16.to_be_bytes());
-    plaintext[2..9].copy_from_slice(b"message");
-    *plaintext.last_mut().unwrap() = 1;
-    let ciphertext = pair
-        .initiator
-        .test_encrypt_transport_plaintext(&plaintext)
-        .unwrap();
-    let receiver_before = pair.responder.snapshot().unwrap().serialize();
-
-    assert_eq!(
-        pair.responder.prepare_receive(&ciphertext).unwrap_err(),
-        PubkyNoiseError::BadLengthCiphertext
-    );
-    assert_eq!(
-        pair.responder.snapshot().unwrap().serialize(),
-        receiver_before
-    );
-}
-
 /// Test that snapshot serialization round-trips correctly.
 #[tokio::test]
 async fn snow_test_restore_serialization_roundtrip() {

@@ -1384,26 +1384,6 @@ impl PubkyNoiseEncryptor {
     pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN]> {
         self.last_ciphertext
     }
-
-    /// Test-only: encrypt an exact transport plaintext frame without advancing state.
-    #[cfg(feature = "test-utils")]
-    pub fn test_encrypt_transport_plaintext(
-        &self,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, PubkyNoiseError> {
-        let plaintext: &[u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN] = plaintext
-            .try_into()
-            .map_err(|_| PubkyNoiseError::EncryptionError)?;
-        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
-        let len = self
-            .context
-            .prepare_transport_write(plaintext, &mut ciphertext)
-            .map_err(|_| PubkyNoiseError::EncryptionError)?;
-        if len != PUBKY_NOISE_TRANSPORT_PACKET_LEN {
-            return Err(PubkyNoiseError::EncryptionError);
-        }
-        Ok(ciphertext.to_vec())
-    }
 }
 
 impl std::fmt::Debug for PubkyNoiseConfig {

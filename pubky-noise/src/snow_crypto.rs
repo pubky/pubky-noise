@@ -919,6 +919,37 @@ mod tests {
     }
 
     #[test]
+    fn test_authenticated_transport_rejects_non_zero_padding_without_advancing_state() {
+        let (initiator, responder) = transport_contexts();
+        let mut plaintext = crate::encode_transport_plaintext(b"message").unwrap();
+        *plaintext.last_mut().unwrap() = 1;
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
+        let sender_before = initiator.get_sending_nonce();
+        let receiver_before = responder.get_receiving_nonce();
+
+        assert_eq!(
+            initiator
+                .prepare_transport_write(&plaintext, &mut ciphertext)
+                .unwrap(),
+            PUBKY_NOISE_TRANSPORT_PACKET_LEN
+        );
+
+        let mut decrypted = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+        assert_eq!(
+            responder
+                .prepare_transport_read(&ciphertext, &mut decrypted)
+                .unwrap(),
+            PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN
+        );
+        assert_eq!(
+            crate::decode_transport_plaintext(&decrypted).unwrap_err(),
+            crate::PubkyNoiseError::BadLengthCiphertext
+        );
+        assert_eq!(initiator.get_sending_nonce(), sender_before);
+        assert_eq!(responder.get_receiving_nonce(), receiver_before);
+    }
+
+    #[test]
     fn test_handshake_message_methods_reject_transport_phase() {
         let (mut initiator, mut responder) = transport_contexts();
         let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
