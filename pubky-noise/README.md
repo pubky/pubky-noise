@@ -9,7 +9,7 @@ Peers use their homeservers as outboxes: each party writes encrypted Noise messa
 ```toml
 # Cargo.toml
 [dependencies]
-pubky-noise = "0.1.0-rc8"
+pubky-noise = "0.1.0-rc9"
 ```
 
 ### Actual dependencies (for reference)

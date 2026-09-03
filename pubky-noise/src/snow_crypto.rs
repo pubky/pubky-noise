@@ -890,24 +890,27 @@ impl DataLinkContext {
 #[cfg(test)]
 mod tests {
     use pubky::Keypair;
+    use sha2::{Digest, Sha256};
 
     use super::*;
 
     fn transport_contexts() -> (DataLinkContext, DataLinkContext) {
-        let initiator_keypair = Keypair::random();
-        let responder_keypair = Keypair::random();
-        let mut initiator = DataLinkContext::new(
+        let initiator_keypair = Keypair::from_secret(&[3; 32]);
+        let responder_keypair = Keypair::from_secret(&[4; 32]);
+        let mut initiator = DataLinkContext::new_with_ephemeral(
             HandshakePattern::PatternNN,
             true,
             None,
             responder_keypair.public_key(),
+            Some([1; 32]),
         )
         .unwrap();
-        let mut responder = DataLinkContext::new(
+        let mut responder = DataLinkContext::new_with_ephemeral(
             HandshakePattern::PatternNN,
             false,
             None,
             initiator_keypair.public_key(),
+            Some([2; 32]),
         )
         .unwrap();
 
@@ -943,6 +946,24 @@ mod tests {
         assert_eq!(plaintext, message);
         assert_eq!(initiator.get_sending_nonce(), 0);
         assert_eq!(responder.get_receiving_nonce(), 0);
+    }
+
+    #[test]
+    fn test_authenticated_transport_wire_vector() {
+        let (initiator, _) = transport_contexts();
+        let plaintext = crate::encode_transport_plaintext(b"paykit!").unwrap();
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
+
+        assert_eq!(
+            initiator
+                .prepare_transport_write(&plaintext, &mut ciphertext)
+                .unwrap(),
+            PUBKY_NOISE_TRANSPORT_PACKET_LEN
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(ciphertext)),
+            "a1eeedce594a1947e52c950ec6f207b133a93d1f09c92f01f0f66169d26d5c0c"
+        );
     }
 
     #[test]
