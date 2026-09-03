@@ -7,10 +7,15 @@ use snow::{HandshakeState, StatelessTransportState};
 use crate::snow_crypto_resolver::ReplayResolver;
 
 pub const PUBKY_NOISE_MSG_LEN: usize = 1000;
+/// Length of the authenticated transport plaintext: body length, body, and padding.
+pub(crate) const PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + 2;
 /// ChaChaPoly AEAD authentication tag size (Poly1305).
 pub const PUBKY_NOISE_TAG_LEN: usize = 16;
-/// Ciphertext buffer size: plaintext + AEAD tag.
+/// Maximum ciphertext size for a [`PUBKY_NOISE_MSG_LEN`]-byte Noise message.
 pub const PUBKY_NOISE_CIPHERTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + PUBKY_NOISE_TAG_LEN;
+/// Fixed stored transport packet size: authenticated plaintext plus AEAD tag.
+pub const PUBKY_NOISE_TRANSPORT_PACKET_LEN: usize =
+    PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN + PUBKY_NOISE_TAG_LEN;
 /// Noise reserves `u64::MAX`. The preceding value is the exhausted cursor,
 /// making `u64::MAX - 2` the final usable nonce.
 const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
@@ -345,9 +350,10 @@ pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec
 
 /// Internal Noise state-machine errors.
 #[derive(Debug)]
-pub enum ContextError {
+pub(crate) enum ContextError {
     Init,
     OngoingHandshake,
+    InvalidPhase,
     InternalSnowTransitionErr,
     InternalSnowWriteErr,
     InternalSnowReadErr,
@@ -374,7 +380,7 @@ fn ensure_nonce_can_increment(nonce: u64) -> Result<(), ContextError> {
 
 /// A Noise state machine
 #[derive(Debug)]
-pub struct DataLinkContext {
+pub(crate) struct DataLinkContext {
     initiator: bool,
     message_patterns: HandshakePattern,
 
@@ -622,7 +628,7 @@ impl DataLinkContext {
         None
     }
 
-    pub fn to_transport(&mut self) -> Result<(), ContextError> {
+    pub(crate) fn transition_to_transport(&mut self) -> Result<(), ContextError> {
         let hs = self
             .noise_handshake
             .as_ref()
@@ -664,40 +670,27 @@ impl DataLinkContext {
         self.sub_step_index = 0;
     }
 
-    pub fn write_act(
+    pub(crate) fn write_handshake_message(
         &mut self,
         payload: &[u8],
         message: &mut [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
     ) -> Result<usize, ContextError> {
-        match self.noise_phase {
-            NoisePhase::HandShake => self
-                .noise_handshake
-                .as_mut()
-                .unwrap()
-                .write_message(payload, message.as_mut())
-                .map_err(|_| ContextError::InternalSnowWriteErr),
-            NoisePhase::Transport => {
-                let nonce = self.sending_nonce;
-                let size = self
-                    .noise_transport
-                    .as_ref()
-                    .unwrap()
-                    .write_message(nonce, payload, message.as_mut())
-                    .map_err(|_| ContextError::InternalSnowWriteErr)?;
-                // NOTE: sending_nonce is NOT incremented here. The caller
-                // must call increment_sending_nonce() after confirming the
-                // write reached the homeserver. This prevents nonce desync
-                // when put() fails after a successful encryption.
-                Ok(size)
-            }
+        if self.noise_phase != NoisePhase::HandShake {
+            return Err(ContextError::InvalidPhase);
         }
+
+        self.noise_handshake
+            .as_mut()
+            .ok_or(ContextError::InvalidPhase)?
+            .write_message(payload, message.as_mut())
+            .map_err(|_| ContextError::InternalSnowWriteErr)
     }
 
     /// Encrypt a transport message without advancing the sending nonce.
     pub(crate) fn prepare_transport_write(
         &self,
-        payload: &[u8],
-        message: &mut [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
+        payload: &[u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN],
+        message: &mut [u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
     ) -> Result<usize, ContextError> {
         if !self.is_transport() {
             return Err(ContextError::OngoingHandshake);
@@ -713,9 +706,8 @@ impl DataLinkContext {
     /// Decrypt a transport message without advancing the receiving nonce.
     pub(crate) fn prepare_transport_read(
         &self,
-        message: &[u8; PUBKY_NOISE_CIPHERTEXT_LEN],
-        payload: &mut [u8; PUBKY_NOISE_MSG_LEN],
-        len: usize,
+        message: &[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
+        payload: &mut [u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN],
     ) -> Result<usize, ContextError> {
         if !self.is_transport() {
             return Err(ContextError::OngoingHandshake);
@@ -724,39 +716,26 @@ impl DataLinkContext {
         self.noise_transport
             .as_ref()
             .ok_or(ContextError::OngoingHandshake)?
-            .read_message(self.receiving_nonce, &message[..len], payload)
+            .read_message(self.receiving_nonce, message, payload)
             .map_err(|_| ContextError::InternalSnowReadErr)
     }
 
-    pub fn read_act(
+    pub(crate) fn read_handshake_message(
         &mut self,
         message: &mut [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
         payload: &mut [u8; PUBKY_NOISE_MSG_LEN],
         index: usize,
     ) -> Result<(), ContextError> {
-        match self.noise_phase {
-            NoisePhase::HandShake => {
-                self.noise_handshake
-                    .as_mut()
-                    .unwrap()
-                    .read_message(&message[..index], payload)
-                    .map_err(|_| ContextError::InternalSnowReadErr)?;
-                Ok(())
-            }
-            NoisePhase::Transport => {
-                self.ensure_can_advance_receiving_nonce()?;
-                self.noise_transport
-                    .as_ref()
-                    .unwrap()
-                    .read_message(self.receiving_nonce, &message[..index], payload)
-                    .map_err(|_| ContextError::InternalSnowReadErr)?;
-                self.receiving_nonce = self
-                    .receiving_nonce
-                    .checked_add(1)
-                    .ok_or(ContextError::NonceOverflow)?;
-                Ok(())
-            }
+        if self.noise_phase != NoisePhase::HandShake {
+            return Err(ContextError::InvalidPhase);
         }
+
+        self.noise_handshake
+            .as_mut()
+            .ok_or(ContextError::InvalidPhase)?
+            .read_message(&message[..index], payload)
+            .map(|_| ())
+            .map_err(|_| ContextError::InternalSnowReadErr)
     }
 
     // --- Snapshot / restore accessors ---
@@ -841,37 +820,6 @@ impl DataLinkContext {
         self.sub_step_index = index;
     }
 
-    /// Advance the sending nonce by 1.
-    ///
-    /// Call this **after** confirming the encrypted message was successfully
-    /// written to the homeserver. This ensures the nonce stays in sync with
-    /// what the receiver expects, even if a write fails.
-    pub fn increment_sending_nonce(&mut self) -> Result<(), ContextError> {
-        self.sending_nonce = self
-            .sending_nonce
-            .checked_add(1)
-            .ok_or(ContextError::NonceOverflow)?;
-        Ok(())
-    }
-
-    /// Advance the outbound homeserver slot counter by 1.
-    pub fn increment_write_counter(&mut self) -> Result<(), ContextError> {
-        self.write_counter = self
-            .write_counter
-            .checked_add(1)
-            .ok_or(ContextError::CounterOverflow)?;
-        Ok(())
-    }
-
-    /// Advance the remote outbound homeserver slot counter by 1.
-    pub fn increment_read_counter(&mut self) -> Result<(), ContextError> {
-        self.read_counter = self
-            .read_counter
-            .checked_add(1)
-            .ok_or(ContextError::CounterOverflow)?;
-        Ok(())
-    }
-
     /// Set the sending nonce (used during restore after transport transition).
     pub fn set_sending_nonce(&mut self, nonce: u64) {
         self.sending_nonce = nonce;
@@ -886,58 +834,151 @@ impl DataLinkContext {
 #[cfg(test)]
 mod tests {
     use pubky::Keypair;
+    use sha2::{Digest, Sha256};
 
     use super::*;
 
     fn transport_contexts() -> (DataLinkContext, DataLinkContext) {
-        let initiator_keypair = Keypair::random();
-        let responder_keypair = Keypair::random();
-        let mut initiator = DataLinkContext::new(
+        let initiator_keypair = Keypair::from_secret(&[3; 32]);
+        let responder_keypair = Keypair::from_secret(&[4; 32]);
+        let mut initiator = DataLinkContext::new_with_ephemeral(
             HandshakePattern::PatternNN,
             true,
             None,
             responder_keypair.public_key(),
+            Some([1; 32]),
         )
         .unwrap();
-        let mut responder = DataLinkContext::new(
+        let mut responder = DataLinkContext::new_with_ephemeral(
             HandshakePattern::PatternNN,
             false,
             None,
             initiator_keypair.public_key(),
+            Some([2; 32]),
         )
         .unwrap();
 
         let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
         let mut payload = [0; PUBKY_NOISE_MSG_LEN];
-        let len = initiator.write_act(&[], &mut message).unwrap();
-        responder.read_act(&mut message, &mut payload, len).unwrap();
+        let len = initiator
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        responder
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
 
-        let len = responder.write_act(&[], &mut message).unwrap();
-        initiator.read_act(&mut message, &mut payload, len).unwrap();
+        let len = responder
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        initiator
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
 
-        initiator.to_transport().unwrap();
-        responder.to_transport().unwrap();
+        initiator.transition_to_transport().unwrap();
+        responder.transition_to_transport().unwrap();
         (initiator, responder)
     }
 
     #[test]
     fn test_prepared_transport_operations_do_not_advance_state() {
         let (initiator, responder) = transport_contexts();
-        let mut ciphertext = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
-        let mut plaintext = [0; PUBKY_NOISE_MSG_LEN];
-        let message = b"prepared transport message\0\0";
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
+        let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+        let message = [42; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
 
         let ciphertext_len = initiator
-            .prepare_transport_write(message, &mut ciphertext)
+            .prepare_transport_write(&message, &mut ciphertext)
             .unwrap();
         let plaintext_len = responder
-            .prepare_transport_read(&ciphertext, &mut plaintext, ciphertext_len)
+            .prepare_transport_read(&ciphertext, &mut plaintext)
             .unwrap();
 
-        assert_eq!(plaintext_len, message.len());
-        assert_eq!(&plaintext[..plaintext_len], message);
+        assert_eq!(ciphertext_len, PUBKY_NOISE_TRANSPORT_PACKET_LEN);
+        assert_eq!(plaintext_len, PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN);
+        assert_eq!(plaintext, message);
         assert_eq!(initiator.get_sending_nonce(), 0);
         assert_eq!(responder.get_receiving_nonce(), 0);
+    }
+
+    #[test]
+    fn test_authenticated_transport_wire_vector() {
+        let (initiator, _) = transport_contexts();
+        let plaintext = crate::encode_transport_plaintext(b"paykit!").unwrap();
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
+
+        assert_eq!(
+            initiator
+                .prepare_transport_write(&plaintext, &mut ciphertext)
+                .unwrap(),
+            PUBKY_NOISE_TRANSPORT_PACKET_LEN
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(ciphertext)),
+            "a1eeedce594a1947e52c950ec6f207b133a93d1f09c92f01f0f66169d26d5c0c"
+        );
+    }
+
+    #[test]
+    fn test_authenticated_transport_rejects_non_zero_padding_without_advancing_state() {
+        let (initiator, responder) = transport_contexts();
+        let mut plaintext = crate::encode_transport_plaintext(b"message").unwrap();
+        *plaintext.last_mut().unwrap() = 1;
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
+        let sender_before = initiator.get_sending_nonce();
+        let receiver_before = responder.get_receiving_nonce();
+
+        assert_eq!(
+            initiator
+                .prepare_transport_write(&plaintext, &mut ciphertext)
+                .unwrap(),
+            PUBKY_NOISE_TRANSPORT_PACKET_LEN
+        );
+
+        let mut decrypted = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+        assert_eq!(
+            responder
+                .prepare_transport_read(&ciphertext, &mut decrypted)
+                .unwrap(),
+            PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN
+        );
+        assert_eq!(
+            crate::decode_transport_plaintext(&decrypted).unwrap_err(),
+            crate::PubkyNoiseError::BadLengthCiphertext
+        );
+        assert_eq!(initiator.get_sending_nonce(), sender_before);
+        assert_eq!(responder.get_receiving_nonce(), receiver_before);
+    }
+
+    #[test]
+    fn test_handshake_message_methods_reject_transport_phase() {
+        let (mut initiator, mut responder) = transport_contexts();
+        let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+        let initiator_before = (initiator.get_sending_nonce(), initiator.get_write_counter());
+        let responder_before = (
+            responder.get_receiving_nonce(),
+            responder.get_read_counter(),
+        );
+
+        assert!(matches!(
+            initiator.write_handshake_message(&[], &mut message),
+            Err(ContextError::InvalidPhase)
+        ));
+        assert!(matches!(
+            responder.read_handshake_message(&mut message, &mut payload, 0),
+            Err(ContextError::InvalidPhase)
+        ));
+        assert_eq!(
+            (initiator.get_sending_nonce(), initiator.get_write_counter()),
+            initiator_before
+        );
+        assert_eq!(
+            (
+                responder.get_receiving_nonce(),
+                responder.get_read_counter()
+            ),
+            responder_before
+        );
     }
 
     #[test]

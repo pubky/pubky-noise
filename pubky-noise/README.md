@@ -9,7 +9,7 @@ Peers use their homeservers as outboxes: each party writes encrypted Noise messa
 ```toml
 # Cargo.toml
 [dependencies]
-pubky-noise = "0.1.0-rc7"
+pubky-noise = "0.1.0-rc9"
 ```
 
 ### Actual dependencies (for reference)
@@ -101,15 +101,25 @@ homeserver slot selection.
 
 ### Wire Format
 
-Messages use a length-prefixed packet format:
+Handshake messages use a length-prefixed, fixed-size storage packet:
 
 ```text
 [len_hi, len_lo, ciphertext..., zero padding...]
 ```
 
 - `len`: big-endian u16 indicating ciphertext length
-- `ciphertext`: up to 1016 bytes (1000-byte plaintext plus the 16-byte authentication tag)
+- `ciphertext`: the Noise handshake message
 - Total stored packet size: 1018 bytes
+
+Transport messages encrypt and authenticate one fixed-size plaintext frame:
+
+```text
+NoiseAEAD([body_len_hi, body_len_lo, body..., zero padding...])
+```
+
+- `body_len`: encrypted big-endian u16 indicating the application message length
+- `body`: up to 1000 bytes (`PUBKY_NOISE_MSG_LEN`)
+- Total stored packet size: 1018 bytes, independent of the body length
 
 ### Crypto Primitives
 
@@ -441,7 +451,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 |---|---|---|
 | `UnknownNoisePattern` | Invalid pattern string | Use a supported pattern: "NN", "XX" |
 | `SnowNoiseBuildError` | Noise stack failed to initialize | Check key material and pattern compatibility |
-| `BadLengthCiphertext` | Received message exceeds max size | Discard message, check sender |
+| `BadLengthCiphertext` | Received packet or authenticated transport frame is malformed | Discard message, check sender |
 | `HomeserverResponseError` | Failed to parse homeserver response | Retry |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
 | `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
