@@ -9,8 +9,12 @@ The list of secret keys managed by a single instance of the `PubkyDataEncryptor`
 
 This secret key is held by the `PubkyNoiseConfig` structure as part of the pubky root keypair.
 
-Currently, this secret key is unused. It is destined to encrypt `PubkyNoiseSessionState` snapshot
-on storage external from a `PubkyDataEncryptor` instance.
+It is used to encrypt `PubkyNoiseSessionState` snapshots persisted to storage external from a
+`PubkyDataEncryptor` instance. `persist_snapshot()` and `load_snapshot()` take a caller-provided
+32-byte `backup_key`; for root-identity callers the `backup_crypto::derive_backup_key()` helper
+derives it via `SHA-256("pubky-noise/session-backup/v0" || pubky_root_seckey)`. Delegated apps
+that do not hold the root secret may supply their own key instead (e.g. derived from a shared
+Noise/state key). The root secret itself is never used directly as an encryption key.
 
 The memory allocation of the pubky root secret key is shared for all the `PubkyNoiseConfig`
 references given to `PubkyDataEncryptor` instances. When the last reference to the memory

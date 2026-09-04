@@ -12,6 +12,7 @@ use pubky_testnet::{
 };
 use tokio::sync::{Mutex, OnceCell};
 
+use pubky_noise::backup_crypto;
 use pubky_noise::serializer::PubkyNoiseSessionState;
 use pubky_noise::snow_crypto::{
     HandshakePattern, NoisePhase, NoiseStep, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
@@ -884,7 +885,99 @@ async fn snow_test_simple_backup() {
     )
     .await;
 
-    let _ = pair.initiator.persist_snapshot().await;
+    let backup_key =
+        backup_crypto::derive_backup_key(&pair.initiator_config.pubky_root_keypair.secret());
+
+    // No backup has been persisted yet: the load reports the confirmed
+    // absence of a backup, distinctly from a connectivity or server failure.
+    let err = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err, PubkyNoiseError::RestoreBackupNotFoundError);
+
+    // Persist generation 1 and keep a copy of the stored record.
+    pair.initiator
+        .persist_snapshot(&backup_key, 1)
+        .await
+        .unwrap();
+    let stored_a = pair
+        .initiator_config
+        .local_session
+        .storage()
+        .get("/pub/data/backup")
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    // The backup must be stored encrypted, not as the plaintext serialized state.
+    let plaintext_a = pair.initiator.snapshot().unwrap().serialize();
+    assert_ne!(
+        stored_a.as_ref(),
+        plaintext_a.as_slice(),
+        "Stored backup should be encrypted, not plaintext"
+    );
+
+    // The encrypted backup decrypts back to the same session state.
+    let loaded = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(loaded.generation, 1);
+    assert_eq!(loaded.state.serialize(), plaintext_a);
+
+    // Advance the session and persist generation 2.
+    send_and_verify(&mut pair.initiator, &mut pair.responder, "Hello_Again").await;
+    pair.initiator
+        .persist_snapshot(&backup_key, 2)
+        .await
+        .unwrap();
+
+    // Simulate a stale/malicious homeserver replaying the generation-1 record.
+    pair.initiator_config
+        .local_session
+        .storage()
+        .put("/pub/data/backup", stored_a.to_vec())
+        .await
+        .unwrap();
+
+    // A trusted local checkpoint rejects the rolled-back backup.
+    let err = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, Some(2))
+        .await
+        .unwrap_err();
+    assert_eq!(err, PubkyNoiseError::RestoreBackupRollbackError);
+
+    // Without a checkpoint the stale backup is accepted: callers restoring on
+    // a fresh device have no rollback protection.
+    let rolled_back = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, None)
+        .await
+        .unwrap();
+    assert_eq!(rolled_back.generation, 1);
+    assert_eq!(rolled_back.state.serialize(), plaintext_a);
+}
+
+#[tokio::test]
+async fn snow_test_backup_oversized_rejected() {
+    let testnet = build_testnet().await;
+    let pair = setup_encryptors(&testnet, "XX").await;
+
+    let backup_key =
+        backup_crypto::derive_backup_key(&pair.initiator_config.pubky_root_keypair.secret());
+
+    // A record larger than the hard cap must be rejected up front by the
+    // HEAD Content-Length probe, before any body bytes are streamed.
+    let oversized = vec![0u8; backup_crypto::MAX_BACKUP_RESPONSE_BYTES + 1];
+    pair.initiator_config
+        .local_session
+        .storage()
+        .put("/pub/data/backup", oversized)
+        .await
+        .unwrap();
+
+    let err = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err, PubkyNoiseError::HomeserverResponseError);
 }
 
 #[tokio::test]
@@ -1256,8 +1349,13 @@ async fn snow_test_prepared_transport_state_handoff() {
         pair.initiator.next_receive_path().unwrap_err(),
         PubkyNoiseError::UnacknowledgedPreparedTransport
     );
+    let backup_key =
+        backup_crypto::derive_backup_key(&pair.initiator_config.pubky_root_keypair.secret());
     assert_eq!(
-        pair.initiator.persist_snapshot().await.unwrap_err(),
+        pair.initiator
+            .persist_snapshot(&backup_key, 1)
+            .await
+            .unwrap_err(),
         PubkyNoiseError::UnacknowledgedPreparedTransport
     );
 

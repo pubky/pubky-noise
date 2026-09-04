@@ -373,7 +373,6 @@ fn ensure_nonce_can_increment(nonce: u64) -> Result<(), ContextError> {
 }
 
 /// A Noise state machine
-#[derive(Debug)]
 pub struct DataLinkContext {
     initiator: bool,
     message_patterns: HandshakePattern,
@@ -409,6 +408,28 @@ pub struct DataLinkContext {
     // When a Read fails (peer hasn't written yet), we return Pending without advancing
     // sub_step_index, so the next poll retries from the same action.
     sub_step_index: usize,
+}
+
+/// Redacted `Debug`: secret key material (`local_static_seckey`,
+/// `local_ephemeral_seckey`) and the Snow handshake/transport internals are
+/// never rendered.
+impl std::fmt::Debug for DataLinkContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataLinkContext")
+            .field("initiator", &self.initiator)
+            .field("message_patterns", &self.message_patterns)
+            .field("has_static_secret", &self.local_static_seckey.is_some())
+            .field("noise_step", &self.noise_step)
+            .field("noise_phase", &self.noise_phase)
+            .field("sending_nonce", &self.sending_nonce)
+            .field("receiving_nonce", &self.receiving_nonce)
+            .field("endpoint_pubkey", &self.endpoint_pubkey)
+            .field("counter", &self.counter)
+            .field("write_counter", &self.write_counter)
+            .field("read_counter", &self.read_counter)
+            .field("sub_step_index", &self.sub_step_index)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DataLinkContext {
@@ -885,9 +906,37 @@ impl DataLinkContext {
 
 #[cfg(test)]
 mod tests {
-    use pubky::Keypair;
+    use pubky::prelude::Keypair;
 
     use super::*;
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let endpoint = Keypair::random().public_key();
+        let context = match DataLinkContext::new_with_ephemeral(
+            HandshakePattern::PatternXX,
+            true,
+            Some([0xDD; 32]),
+            endpoint,
+            Some([0xCC; 32]),
+        ) {
+            Ok(context) => context,
+            Err(_) => panic!("failed to build DataLinkContext"),
+        };
+
+        let rendered = format!("{context:?}");
+
+        assert!(
+            !rendered.contains(format!("{:?}", [0xCC; 32]).as_str()),
+            "ephemeral secret leaked in Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains(format!("{:?}", [0xDD; 32]).as_str()),
+            "static secret leaked in Debug: {rendered}"
+        );
+        // Non-secret fields remain visible for debugging.
+        assert!(rendered.contains("sending_nonce"));
+    }
 
     fn transport_contexts() -> (DataLinkContext, DataLinkContext) {
         let initiator_keypair = Keypair::random();

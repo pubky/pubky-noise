@@ -1,3 +1,4 @@
+pub mod backup_crypto;
 pub mod identity_payload;
 pub mod path_derivation;
 pub mod serializer;
@@ -62,6 +63,18 @@ fn map_context_overflow(err: ContextError) -> PubkyNoiseError {
     }
 }
 
+fn map_backup_error(err: backup_crypto::BackupCryptoError) -> PubkyNoiseError {
+    match err {
+        backup_crypto::BackupCryptoError::Rollback { .. } => {
+            PubkyNoiseError::RestoreBackupRollbackError
+        }
+        backup_crypto::BackupCryptoError::DecryptError => {
+            PubkyNoiseError::RestoreBackupDecryptError
+        }
+        _ => PubkyNoiseError::RestoreBackupDeserializeError,
+    }
+}
+
 // Hash the exact prepared operation so stale or modified values cannot be acknowledged.
 fn prepared_transport_digest(
     operation_kind: u8,
@@ -79,6 +92,34 @@ fn prepared_transport_digest(
     hasher.finalize().into()
 }
 
+/// A session snapshot loaded and decrypted from the homeserver.
+///
+/// Returned by [`PubkyNoiseEncryptor::load_snapshot`]. The `generation` is
+/// the caller-managed monotonic counter bound into the backup; after a
+/// successful load, callers should record it in trusted local storage as
+/// their new rollback checkpoint (the accepted generation is never lower
+/// than the `min_generation` the load was checked against, but may be
+/// higher).
+#[derive(Clone)]
+pub struct LoadedSnapshot {
+    /// The generation the backup was persisted with.
+    pub generation: u64,
+    /// The decrypted session state, ready for
+    /// [`PubkyNoiseEncryptor::restore`].
+    pub state: PubkyNoiseSessionState,
+}
+
+/// Redacted `Debug`: delegates to the redacted `Debug` of
+/// [`PubkyNoiseSessionState`], which never renders secret key material.
+impl std::fmt::Debug for LoadedSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedSnapshot")
+            .field("generation", &self.generation)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
 #[derive(Eq, Hash, PartialEq, Debug)]
 pub enum PubkyNoiseError {
     UnknownNoisePattern,
@@ -92,11 +133,22 @@ pub enum PubkyNoiseError {
     HomeserverWriteError,
     IsHandshake,
     /// Restore failed: handshake replay error.
-    RestoreReplayError,
+    RestoreBackupReplayError,
     /// Restore failed: handshake hash mismatch after replay.
-    RestoreHashMismatch,
+    RestoreBackupHashMismatch,
     /// Restore failed: deserialization error.
-    RestoreDeserializeError,
+    RestoreBackupDeserializeError,
+    /// Restore failed: persisted snapshot decryption failed.
+    RestoreBackupDecryptError,
+    /// Restore failed: persisted snapshot is older than the trusted local
+    /// checkpoint (rollback detected).
+    RestoreBackupRollbackError,
+    /// Restore failed: no backup exists at the backup path on the homeserver.
+    ///
+    /// Distinct from [`PubkyNoiseError::HomeserverResponseError`], which
+    /// signals a connectivity or server problem rather than the confirmed
+    /// absence of a backup.
+    RestoreBackupNotFoundError,
     /// Transport-phase encryption (write_act) failed.
     EncryptionError,
     /// Transport-phase decryption (read_act) failed.
@@ -443,13 +495,20 @@ impl PubkyNoiseEncryptor {
     ///
     ///   **Recovery**: each call to `handle_handshake` automatically captures
     ///   a pre-mutation snapshot accessible via
-    ///   [`last_good_snapshot()`](Self::last_good_snapshot). Callers should
-    ///   persist this snapshot (e.g. via [`persist_snapshot()`](Self::persist_snapshot))
-    ///   so that on restart they can pass it to if there has been a failure
-    ///   [`restore()`](Self::restore).
-    ///   The replay mechanism will rebuild the Noise state from what is
+    ///   [`last_good_snapshot()`](Self::last_good_snapshot). For in-process
+    ///   recovery, pass that snapshot directly to [`restore()`](Self::restore);
+    ///   the replay mechanism will rebuild the Noise state from what is
     ///   actually on the homeservers, correcting the state and allowing the
     ///   handshake to resume from the right position.
+    ///
+    ///   Callers that need crash recovery must durably persist the
+    ///   pre-mutation snapshot themselves: encrypt it with
+    ///   [`backup_crypto::encrypt_backup_with_key`] and store it through
+    ///   caller-managed storage *before* the risky call. Note that
+    ///   [`persist_snapshot()`](Self::persist_snapshot) snapshots the
+    ///   encryptor's state at call time — it cannot persist
+    ///   `last_good_snapshot()`, and after a write failure the current state
+    ///   may already be advanced and corrupted.
     ///
     ///   Note: if the `put()` succeeds but the data is subsequently lost
     ///   (e.g. homeserver crash after acknowledgment), the same snapshot-based
@@ -1076,33 +1135,167 @@ impl PubkyNoiseEncryptor {
         }
     }
 
-    /// Persist the current session snapshot to the configured Pubky path.
+    /// Persist the current session snapshot to the homeserver (encrypted path).
     ///
-    /// This method writes the serialized secret-bearing snapshot without
-    /// application-layer encryption. Use [`snapshot()`](Self::snapshot) and
-    /// caller-managed authenticated encryption when the configured storage is
-    /// not confidential.
+    /// The serialized snapshot contains the session's ephemeral and static
+    /// secrets, so it is encrypted with a caller-provided key
+    /// (`XChaCha20Poly1305`, see [`backup_crypto`]) before uploading.
+    ///
+    /// # Parameters:
+    /// - `backup_key`: A 32-byte key used to encrypt the snapshot. For
+    ///   root-identity callers this can be obtained by calling
+    ///   [`backup_crypto::derive_backup_key`] with the root secret; delegated
+    ///   apps may supply a key derived from a shared Noise/state key instead.
+    /// - `generation`: A caller-managed, monotonically increasing counter that
+    ///   is bound into the encrypted backup. Persist the latest value in
+    ///   trusted local storage and pass it as `min_generation` to
+    ///   [`load_snapshot()`](Self::load_snapshot) to detect a stale or
+    ///   malicious homeserver replaying an older backup.
+    ///
+    /// # Checkpoint update order
+    ///
+    /// The trusted local checkpoint must be advanced to `generation`
+    /// **before** (or atomically with) this upload. If the checkpoint is
+    /// advanced only after the upload and the process crashes in between, the
+    /// checkpoint still holds `generation - 1`, so a homeserver replaying the
+    /// previous backup would be accepted — the exact rollback the checkpoint
+    /// exists to prevent. Crashing with the checkpoint already advanced only
+    /// loses the new upload: loading then fails (or rejects the older record)
+    /// instead of silently accepting stale state.
     ///
     /// # Errors
     /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] if a prepared
     ///   message and its resulting state must first be persisted together.
     /// - Returns [`PubkyNoiseError::OtherError`] if the homeserver write fails.
-    pub async fn persist_snapshot(&self) -> Result<(), PubkyNoiseError> {
+    pub async fn persist_snapshot(
+        &self,
+        backup_key: &[u8; 32],
+        generation: u64,
+    ) -> Result<(), PubkyNoiseError> {
         if self.unacknowledged_transport_digest.is_some() {
             return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
         }
         let state = self.snapshot()?;
-        let serialized = state.serialize();
-        // TODO: encrypt serialized bytes with a key derived from pubky_root_keypair
-        // before storing. For now, store as-is.
+        let encrypted = backup_crypto::encrypt_backup_with_key(backup_key, generation, &state);
         let path = format!("{}/backup", self.config.write_path);
         self.config
             .local_session
             .storage()
-            .put(path, serialized)
+            .put(path, encrypted)
             .await
             .map_err(|_| PubkyNoiseError::OtherError)?;
         Ok(())
+    }
+
+    /// Load and decrypt a session snapshot previously stored with
+    /// [`persist_snapshot()`](Self::persist_snapshot).
+    ///
+    /// The returned state can be passed to [`restore()`](Self::restore) to
+    /// reconstruct the encryptor.
+    ///
+    /// The response body is read with a hard size cap
+    /// ([`backup_crypto::MAX_BACKUP_RESPONSE_BYTES`]) and the record must
+    /// match the exact length of its envelope version. The backup path is
+    /// probed with a `HEAD` request first: `HEAD` responses carry no body,
+    /// so a malicious homeserver cannot use the probe itself to force a
+    /// large allocation, and a confirmed-absent backup can be reported
+    /// distinctly from a connectivity or server failure.
+    ///
+    /// # Parameters:
+    /// - `backup_key`: A 32-byte key used to decrypt the snapshot. Must match
+    ///   the key used during [`persist_snapshot()`](Self::persist_snapshot).
+    ///   For root-identity callers this can be obtained by calling
+    ///   [`backup_crypto::derive_backup_key`] with the root secret; delegated
+    ///   apps may supply a key derived from a shared Noise/state key instead.
+    /// - `min_generation`: The highest backup generation observed so far, from
+    ///   the caller's trusted local checkpoint. Older backups are rejected
+    ///   with [`PubkyNoiseError::RestoreBackupRollbackError`]. Pass `None`
+    ///   only when no trusted checkpoint exists (e.g. restoring onto a fresh
+    ///   device) — in that case rollback to an older backup cannot be
+    ///   detected.
+    ///
+    /// # Errors:
+    /// - Returns [`PubkyNoiseError::RestoreBackupNotFoundError`] if no backup
+    ///   exists at the backup path.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the backup
+    ///   cannot be fetched (connectivity or server failure) or the response
+    ///   exceeds the size cap.
+    /// - Returns [`PubkyNoiseError::RestoreBackupDecryptError`] if decryption
+    ///   fails (wrong key or tampered/corrupted ciphertext).
+    /// - Returns [`PubkyNoiseError::RestoreBackupRollbackError`] if the backup
+    ///   generation is older than `min_generation`.
+    /// - Returns [`PubkyNoiseError::RestoreBackupDeserializeError`] if the record is
+    ///   not a valid backup envelope or the decrypted bytes are not a valid
+    ///   session state.
+    pub async fn load_snapshot(
+        config: &PubkyNoiseConfig,
+        backup_key: &[u8; 32],
+        min_generation: Option<u64>,
+    ) -> Result<LoadedSnapshot, PubkyNoiseError> {
+        let path = format!("{}/backup", config.write_path);
+        let storage = config.local_session.storage();
+
+        // Probe with HEAD first. Responses to HEAD carry no body
+        // (RFC 9110, Section 9.3.2), so this step cannot be tricked into an
+        // unbounded allocation the way a non-2xx GET body can — the pubky
+        // SDK's `get()` consumes error bodies in full (`Response::text()`)
+        // before returning, i.e. before the size cap below could run.
+        match storage.stats(&path).await {
+            // Reject an oversized backup before issuing the GET.
+            Ok(Some(stats)) => {
+                if let Some(len) = stats.content_length {
+                    if len > backup_crypto::MAX_BACKUP_RESPONSE_BYTES as u64 {
+                        return Err(PubkyNoiseError::HomeserverResponseError);
+                    }
+                }
+            }
+            // 404/410: the backup path is confirmed empty.
+            Ok(None) => return Err(PubkyNoiseError::RestoreBackupNotFoundError),
+            Err(_) => return Err(PubkyNoiseError::HomeserverResponseError),
+        }
+
+        // NOTE: a non-2xx GET body is still consumed by the SDK before this
+        // code regains control; the HEAD probe above covers the common cases
+        // (absent backup, oversized Content-Length), and fully closing that
+        // gap needs a raw streaming API in the pubky SDK.
+        let mut response = storage.get(&path).await.map_err(|err| match err {
+            Error::Request(RequestError::Server { status, .. })
+                if status == StatusCode::NOT_FOUND || status == StatusCode::GONE =>
+            {
+                PubkyNoiseError::RestoreBackupNotFoundError
+            }
+            _ => PubkyNoiseError::HomeserverResponseError,
+        })?;
+
+        // Bounded body read: reject oversized responses before proportional
+        // allocation, regardless of what the Content-Length header claims
+        // (the HEAD probe above is only advisory — the GET response may
+        // differ from it).
+        if let Some(len) = response.content_length() {
+            if len > backup_crypto::MAX_BACKUP_RESPONSE_BYTES as u64 {
+                return Err(PubkyNoiseError::HomeserverResponseError);
+            }
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| PubkyNoiseError::HomeserverResponseError)?
+        {
+            if body.len() + chunk.len() > backup_crypto::MAX_BACKUP_RESPONSE_BYTES {
+                return Err(PubkyNoiseError::HomeserverResponseError);
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        let (generation, serialized) =
+            backup_crypto::decrypt_backup_with_key(backup_key, &body, min_generation)
+                .map_err(map_backup_error)?;
+
+        let state = PubkyNoiseSessionState::deserialize(&serialized)
+            .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?;
+
+        Ok(LoadedSnapshot { generation, state })
     }
 
     /// Restore a `PubkyNoiseEncryptor` from a previously saved session state.
@@ -1120,8 +1313,8 @@ impl PubkyNoiseEncryptor {
     ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
-    /// - Returns [`PubkyNoiseError::RestoreReplayError`] if handshake replay fails.
-    /// - Returns [`PubkyNoiseError::RestoreHashMismatch`] if the replayed handshake
+    /// - Returns [`PubkyNoiseError::RestoreBackupReplayError`] if handshake replay fails.
+    /// - Returns [`PubkyNoiseError::RestoreBackupHashMismatch`] if the replayed handshake
     ///   produces a different hash than the saved one.
     pub async fn restore(
         config: Arc<PubkyNoiseConfig>,
@@ -1130,7 +1323,7 @@ impl PubkyNoiseEncryptor {
     ) -> Result<Self, PubkyNoiseError> {
         // Verify the caller-provided pubkey matches the snapshot (consistency check)
         if endpoint_pubkey.to_bytes() != state.endpoint_pubkey {
-            return Err(PubkyNoiseError::RestoreDeserializeError);
+            return Err(PubkyNoiseError::RestoreBackupDeserializeError);
         }
 
         // Build a fresh context with the saved ephemeral key
@@ -1190,7 +1383,7 @@ impl PubkyNoiseEncryptor {
                     let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
                     context
                         .write_act(&[], &mut message)
-                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
+                        .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
                     replay_counter += 1;
                 }
                 HandshakeAction::Read => {
@@ -1203,23 +1396,23 @@ impl PubkyNoiseEncryptor {
                         .public_storage()
                         .get(formatted_path)
                         .await
-                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
+                        .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
 
                     if !response.status().is_success() {
-                        return Err(PubkyNoiseError::RestoreReplayError);
+                        return Err(PubkyNoiseError::RestoreBackupReplayError);
                     }
 
                     let ciphertext = response
                         .bytes()
                         .await
-                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
+                        .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
 
                     let (mut message, len) = decode_packet(&ciphertext)?;
                     let mut payload = [0; PUBKY_NOISE_MSG_LEN];
 
                     context
                         .read_act(&mut message, &mut payload, len)
-                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
+                        .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
                     replay_counter += 1;
                 }
                 HandshakeAction::Pending | HandshakeAction::Terminal => {
@@ -1232,14 +1425,14 @@ impl PubkyNoiseEncryptor {
         let link_id = if state.phase == NoisePhase::Transport {
             // Verify the handshake completed
             if context.is_handshake() {
-                return Err(PubkyNoiseError::RestoreReplayError);
+                return Err(PubkyNoiseError::RestoreBackupReplayError);
             }
 
             // Verify handshake hash matches (integrity check)
             if let Some(saved_hash) = state.handshake_hash {
                 if let Some(replayed_hash) = context.get_handshake_hash() {
                     if saved_hash != replayed_hash {
-                        return Err(PubkyNoiseError::RestoreHashMismatch);
+                        return Err(PubkyNoiseError::RestoreBackupHashMismatch);
                     }
                 }
             }
@@ -1248,7 +1441,7 @@ impl PubkyNoiseEncryptor {
             let hash = context.get_handshake_hash().unwrap();
             context
                 .to_transport()
-                .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
+                .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
 
             // Set nonces from saved state
             context.set_sending_nonce(state.sending_nonce);
@@ -1345,5 +1538,52 @@ impl std::fmt::Debug for PubkyNoiseConfig {
             .field("pubky_noise_version", &self.pubky_noise_version)
             .field("default_pattern", &self.default_pattern)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
+
+    fn state_with_secrets() -> PubkyNoiseSessionState {
+        PubkyNoiseSessionState {
+            version: SESSION_STATE_VERSION,
+            phase: NoisePhase::Transport,
+            pattern: HandshakePattern::PatternNN,
+            initiator: true,
+            ephemeral_secret: [0xAA; 32],
+            static_secret: Some([0xBB; 32]),
+            counter: 2,
+            noise_step: NoiseStep::Final,
+            sub_step_index: 0,
+            handshake_hash: Some([2; 32]),
+            link_id: Some([3; 32]),
+            sending_nonce: 2,
+            receiving_nonce: 1,
+            write_counter: 9,
+            read_counter: 7,
+            endpoint_pubkey: [4; 32],
+        }
+    }
+
+    #[test]
+    fn loaded_snapshot_debug_redacts_secrets() {
+        let loaded = LoadedSnapshot {
+            generation: 7,
+            state: state_with_secrets(),
+        };
+
+        let rendered = format!("{loaded:?}");
+
+        assert!(
+            !rendered.contains(format!("{:?}", [0xAA; 32]).as_str()),
+            "ephemeral secret leaked in Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains(format!("{:?}", [0xBB; 32]).as_str()),
+            "static secret leaked in Debug: {rendered}"
+        );
+        assert!(rendered.contains("generation"));
     }
 }

@@ -8,8 +8,9 @@ use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
 
 /// Current serialization format version.
 pub const SESSION_STATE_VERSION: u8 = 1;
-const SESSION_STATE_LEN: usize = 197;
-/// Exhausted nonce cursor; Noise reserves `u64::MAX`.
+/// Exact length in bytes of a serialized v1 session state.
+pub const SESSION_STATE_V1_LEN: usize = 197;
+/// Exhausted nonce cursor sentinel.
 const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
 
 /// Serializable snapshot of a `PubkyNoiseEncryptor` session.
@@ -22,7 +23,7 @@ const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
 /// encrypted, authenticated, access-controlled, and deleted when superseded.
 /// Retaining a restorable snapshot extends the lifetime of the session's
 /// ephemeral material and therefore its exposure window.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PubkyNoiseSessionState {
     /// Format version for forward compatibility.
     pub version: u8,
@@ -60,6 +61,33 @@ pub struct PubkyNoiseSessionState {
     pub endpoint_pubkey: [u8; 32],
 }
 
+/// Redacted `Debug`: the ephemeral and static secrets are never rendered.
+impl std::fmt::Debug for PubkyNoiseSessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PubkyNoiseSessionState")
+            .field("version", &self.version)
+            .field("phase", &self.phase)
+            .field("pattern", &self.pattern)
+            .field("initiator", &self.initiator)
+            .field("ephemeral_secret", &"[redacted]")
+            .field(
+                "static_secret",
+                &self.static_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("counter", &self.counter)
+            .field("noise_step", &self.noise_step)
+            .field("sub_step_index", &self.sub_step_index)
+            .field("handshake_hash", &self.handshake_hash)
+            .field("link_id", &self.link_id)
+            .field("sending_nonce", &self.sending_nonce)
+            .field("receiving_nonce", &self.receiving_nonce)
+            .field("write_counter", &self.write_counter)
+            .field("read_counter", &self.read_counter)
+            .field("endpoint_pubkey", &self.endpoint_pubkey)
+            .finish()
+    }
+}
+
 impl PubkyNoiseSessionState {
     /// Serialize to a compact binary format.
     ///
@@ -87,7 +115,7 @@ impl PubkyNoiseSessionState {
     /// ```
     /// Total: 197 bytes
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(SESSION_STATE_LEN);
+        let mut buf = Vec::with_capacity(SESSION_STATE_V1_LEN);
 
         // [0] version
         buf.push(SESSION_STATE_VERSION);
@@ -158,19 +186,26 @@ impl PubkyNoiseSessionState {
         // [165..197] endpoint_pubkey
         buf.extend_from_slice(&self.endpoint_pubkey);
 
-        debug_assert_eq!(buf.len(), SESSION_STATE_LEN);
+        debug_assert_eq!(buf.len(), SESSION_STATE_V1_LEN);
         buf
     }
 
     /// Deserialize from the compact binary format.
+    ///
+    /// The input must be exactly [`SESSION_STATE_V1_LEN`] bytes: shorter input is
+    /// rejected as truncated, longer input as containing trailing bytes.
     pub fn deserialize(data: &[u8]) -> Result<Self, SerializerError> {
-        if data.len() < SESSION_STATE_LEN {
+        if data.len() < SESSION_STATE_V1_LEN {
             return Err(SerializerError::TooShort);
         }
 
         let version = data[0];
         if version != SESSION_STATE_VERSION {
             return Err(SerializerError::UnsupportedVersion(version));
+        }
+
+        if data.len() != SESSION_STATE_V1_LEN {
+            return Err(SerializerError::TrailingBytes);
         }
 
         let phase = match data[1] {
@@ -275,6 +310,8 @@ impl PubkyNoiseSessionState {
 pub enum SerializerError {
     /// The input data is too short.
     TooShort,
+    /// The input data has trailing bytes after the session state.
+    TrailingBytes,
     /// Unsupported format version.
     UnsupportedVersion(u8),
     /// An invalid value was found for a field.
@@ -351,7 +388,7 @@ mod tests {
         let state = transport_state();
         let bytes = state.serialize();
 
-        assert_eq!(bytes.len(), SESSION_STATE_LEN);
+        assert_eq!(bytes.len(), SESSION_STATE_V1_LEN);
 
         let restored = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
         assert_eq!(restored.version, SESSION_STATE_VERSION);
@@ -360,6 +397,38 @@ mod tests {
         assert_eq!(restored.receiving_nonce, state.receiving_nonce);
         assert_eq!(restored.write_counter, state.write_counter);
         assert_eq!(restored.read_counter, state.read_counter);
+    }
+
+    #[test]
+    fn rejects_trailing_bytes() {
+        let mut bytes = transport_state().serialize();
+        bytes.push(0);
+
+        assert!(matches!(
+            PubkyNoiseSessionState::deserialize(&bytes),
+            Err(SerializerError::TrailingBytes)
+        ));
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let mut state = transport_state();
+        state.ephemeral_secret = [0xAA; 32];
+        state.static_secret = Some([0xBB; 32]);
+
+        let rendered = format!("{state:?}");
+
+        assert!(
+            !rendered.contains(format!("{:?}", [0xAA; 32]).as_str()),
+            "ephemeral secret leaked in Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains(format!("{:?}", [0xBB; 32]).as_str()),
+            "static secret leaked in Debug: {rendered}"
+        );
+        assert!(rendered.contains("redacted"));
+        // Non-secret fields remain visible for debugging.
+        assert!(rendered.contains("sending_nonce"));
     }
 
     #[test]
