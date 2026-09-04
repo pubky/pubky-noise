@@ -14,7 +14,7 @@ test-utils = []
 
 [dependencies]
 pubky = "0.11.0"
-pubky-common = "0.11"
+chacha20poly1305 = "0.10.1"
 ed25519-dalek = "3.0.0"
 curve25519-dalek = "5.0.0"
 snow = { version = "0.10.0", features = ["use-sha2"] }

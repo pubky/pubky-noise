@@ -2,10 +2,10 @@
 //!
 //! A serialized [`PubkyNoiseSessionState`] contains the session's ephemeral
 //! secret (and optionally the static secret), so it must be encrypted before
-//! it leaves the device. Encryption follows the Pubky convention used for
-//! recovery files (see `pubky_common::recovery_file`, built on
-//! `pubky_common::crypto::{encrypt, decrypt}`): `XSalsa20Poly1305` with a
-//! fresh random 192-bit nonce per write, prepended to the ciphertext.
+//! it leaves the device. Encryption uses `XChaCha20Poly1305` from the
+//! [`chacha20poly1305`] crate — already in the dependency tree via `snow`
+//! (the Noise transport itself runs `Noise_*_25519_ChaChaPoly_SHA256`) — with
+//! a fresh random 192-bit nonce per write, prepended to the ciphertext.
 //!
 //! The nonce is not a secret — by design it only needs to be unique per
 //! encryption under the same key, which a random 192-bit value provides with
@@ -14,21 +14,28 @@
 //! authenticates the ciphertext against that same nonce, so tampering with
 //! the prepended nonce fails decryption.
 //!
+//! `XChaCha20Poly1305` is used instead of the Pubky recovery-file convention
+//! (`pubky_common::crypto`'s XSalsa20Poly1305 / NaCl `crypto_secretbox`)
+//! because the NaCl construction accepts no associated data, which would
+//! force the envelope header to be duplicated inside the authenticated
+//! plaintext and re-validated after decryption. Native AAD binds the header
+//! directly into the Poly1305 tag, and the envelope's closed dispatch on
+//! `algorithm_id` below keeps future AEAD changes unambiguous.
+//!
 //! ## Envelope Format (version 1)
 //!
 //! ```text
 //! [0..4]    magic: "PNBK"
 //! [4]       envelope format version (1)
-//! [5]       algorithm ID (1 = XSalsa20Poly1305 with the KDF below)
+//! [5]       algorithm ID (1 = XChaCha20Poly1305 with the KDF below)
 //! [6..30]   nonce (192-bit, random per write)
 //! [30..]    ciphertext || Poly1305 tag
 //! ```
 //!
-//! The NaCl `XSalsa20Poly1305` construction used by [`pubky_common::crypto`]
-//! does not support AAD, so the 6-byte header is duplicated at the start of
-//! the authenticated plaintext and validated against the outer header on
-//! decryption. The authenticated plaintext is therefore
-//! `header (6) || generation (8, big-endian) || session state (197 bytes)`.
+//! The 6-byte header is passed to the AEAD as associated data: it stays in
+//! cleartext so the decoder can dispatch on it, while any modification makes
+//! tag verification fail. The authenticated plaintext is therefore just
+//! `generation (8, big-endian) || session state (197 bytes)`.
 //! Envelope versioning is intentionally separate from the session-state
 //! serialization version inside the plaintext.
 //!
@@ -56,7 +63,10 @@
 //! wanted — e.g. alongside a new encryption algorithm, so keys are separated
 //! across algorithms. Note that a tag bump changes the derived key, so
 //! backups written under the old tag become undecryptable; that is usually
-//! desirable when the bump accompanies an algorithm change.
+//! desirable when the bump accompanies an algorithm change. The switch from
+//! XSalsa20Poly1305 to XChaCha20Poly1305 predates any deployed backup, so the
+//! tag stays at `v0`: the KDF itself is unchanged and no old-tag records
+//! exist in the wild.
 //!
 //! No compression is applied: the serialized snapshot is a fixed 197 bytes of
 //! mostly high-entropy key material, which does not compress.
@@ -87,7 +97,8 @@
 //! upload is simply lost, and loading then rejects the older record (or finds
 //! no usable backup) instead of silently accepting stale state.
 
-use pubky_common::crypto;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use sha2::{Digest, Sha256};
 
 use crate::serializer::{PubkyNoiseSessionState, SESSION_STATE_V1_LEN};
@@ -99,29 +110,27 @@ const BACKUP_KEY_DOMAIN: &[u8] = b"pubky-noise/session-backup/v0";
 const ENVELOPE_MAGIC: &[u8; 4] = b"PNBK";
 /// Current backup envelope format version.
 const ENVELOPE_VERSION: u8 = 1;
-/// Algorithm ID: XSalsa20Poly1305 with the domain-separated SHA-256 KDF.
-const ALG_XSALSA20POLY1305: u8 = 1;
+/// Algorithm ID: XChaCha20Poly1305 with the domain-separated SHA-256 KDF.
+const ALG_XCHACHA20POLY1305: u8 = 1;
 
 /// Header length: magic (4) || version (1) || algorithm (1).
 const HEADER_LEN: usize = 6;
-/// XSalsa20Poly1305 nonce length.
+/// XChaCha20Poly1305 nonce length.
 const NONCE_LEN: usize = 24;
 /// Poly1305 authentication tag length.
 const TAG_LEN: usize = 16;
 /// Monotonic generation counter length (big-endian u64).
 const GENERATION_LEN: usize = 8;
 
-/// v1 authenticated plaintext length: header (6) || generation (8) ||
-/// session state (197). The header is duplicated inside the plaintext because
-/// `crypto_secretbox` does not support AAD.
-const PLAINTEXT_LEN_V1: usize = HEADER_LEN + GENERATION_LEN + SESSION_STATE_V1_LEN;
-/// v1 record length: header (6) || nonce (24) || ciphertext (211 + tag 16).
+/// v1 authenticated plaintext length: generation (8) || session state (197).
+const PLAINTEXT_LEN_V1: usize = GENERATION_LEN + SESSION_STATE_V1_LEN;
+/// v1 record length: header (6) || nonce (24) || ciphertext (205 + tag 16).
 pub const BACKUP_RECORD_LEN_V1: usize = HEADER_LEN + NONCE_LEN + PLAINTEXT_LEN_V1 + TAG_LEN;
 
 /// Hard cap on the homeserver response body when fetching a backup.
 ///
 /// Bounds memory allocation against a malicious homeserver returning a huge
-/// body. The v1 record is 257 bytes; this leaves ample room for future
+/// body. The v1 record is 251 bytes; this leaves ample room for future
 /// envelope versions while keeping allocation strictly bounded.
 pub const MAX_BACKUP_RESPONSE_BYTES: usize = 4096;
 
@@ -175,7 +184,7 @@ pub fn derive_backup_key(root_secret: &[u8; 32]) -> [u8; 32] {
 /// `min_generation` when loading.
 ///
 /// Returns `magic || version || algorithm || nonce || ciphertext`, with the
-/// header duplicated inside the authenticated plaintext.
+/// header bound into the Poly1305 tag as associated data.
 pub fn encrypt_backup_with_key(
     key: &[u8; 32],
     generation: u64,
@@ -184,16 +193,25 @@ pub fn encrypt_backup_with_key(
     let header = envelope_header();
 
     let mut plaintext = Vec::with_capacity(PLAINTEXT_LEN_V1);
-    plaintext.extend_from_slice(&header);
     plaintext.extend_from_slice(&generation.to_be_bytes());
     plaintext.extend_from_slice(&state.serialize());
     debug_assert_eq!(plaintext.len(), PLAINTEXT_LEN_V1);
 
-    // `pubky_common::crypto::encrypt` prepends a fresh random 192-bit nonce.
-    let ciphertext = crypto::encrypt(&plaintext, key);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let nonce = random_nonce();
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: &plaintext,
+                aad: &header,
+            },
+        )
+        .expect("encryption with a fresh random nonce cannot fail");
 
     let mut out = Vec::with_capacity(BACKUP_RECORD_LEN_V1);
     out.extend_from_slice(&header);
+    out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
     debug_assert_eq!(out.len(), BACKUP_RECORD_LEN_V1);
     out
@@ -218,7 +236,9 @@ pub fn encrypt_backup(
 /// caller-provided 32-byte decryption key directly.
 ///
 /// Only explicitly supported envelope versions and algorithms are accepted,
-/// and the record must match the exact length of its envelope version.
+/// and the record must match the exact length of its envelope version. The
+/// header is authenticated as AEAD associated data, so any modification of
+/// it, the nonce, or the ciphertext fails decryption.
 ///
 /// `min_generation` is the caller's trusted local checkpoint: the highest
 /// generation previously observed for this backup path. Records older than
@@ -244,7 +264,7 @@ pub fn decrypt_backup_with_key(
         return Err(BackupCryptoError::UnsupportedEnvelopeVersion(version));
     }
     let algorithm = record[5];
-    if algorithm != ALG_XSALSA20POLY1305 {
+    if algorithm != ALG_XCHACHA20POLY1305 {
         return Err(BackupCryptoError::UnsupportedAlgorithm(algorithm));
     }
     if record.len() != BACKUP_RECORD_LEN_V1 {
@@ -254,11 +274,19 @@ pub fn decrypt_backup_with_key(
         });
     }
 
-    let header = &record[..HEADER_LEN];
+    let (header, body) = record.split_at(HEADER_LEN);
+    let (nonce, ciphertext) = body.split_at(NONCE_LEN);
 
-    // `pubky_common::crypto::decrypt` splits off the leading 192-bit nonce.
-    let plaintext =
-        crypto::decrypt(&record[HEADER_LEN..], key).map_err(|_| BackupCryptoError::DecryptError)?;
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let plaintext = cipher
+        .decrypt(
+            nonce.into(),
+            Payload {
+                msg: ciphertext,
+                aad: header,
+            },
+        )
+        .map_err(|_| BackupCryptoError::DecryptError)?;
     if plaintext.len() != PLAINTEXT_LEN_V1 {
         return Err(BackupCryptoError::InvalidLength {
             expected: PLAINTEXT_LEN_V1,
@@ -266,14 +294,8 @@ pub fn decrypt_backup_with_key(
         });
     }
 
-    // The header is duplicated inside the authenticated plaintext (the NaCl
-    // construction has no AAD): a mismatch means the outer header was swapped.
-    if plaintext[..HEADER_LEN] != *header {
-        return Err(BackupCryptoError::DecryptError);
-    }
-
     let generation = u64::from_be_bytes(
-        plaintext[HEADER_LEN..HEADER_LEN + GENERATION_LEN]
+        plaintext[..GENERATION_LEN]
             .try_into()
             .expect("plaintext length is validated above"),
     );
@@ -286,10 +308,7 @@ pub fn decrypt_backup_with_key(
         }
     }
 
-    Ok((
-        generation,
-        plaintext[HEADER_LEN + GENERATION_LEN..].to_vec(),
-    ))
+    Ok((generation, plaintext[GENERATION_LEN..].to_vec()))
 }
 
 /// Decrypts and parses a backup envelope, deriving the decryption key from
@@ -306,12 +325,19 @@ pub fn decrypt_backup(
     decrypt_backup_with_key(&key, record, min_generation)
 }
 
-/// Builds the authenticated 6-byte envelope header.
+/// Draws a fresh random 192-bit nonce from the OS CSPRNG.
+fn random_nonce() -> XNonce {
+    let mut nonce = XNonce::default();
+    getrandom::fill(&mut nonce).expect("OS entropy source must be available");
+    nonce
+}
+
+/// Builds the 6-byte envelope header, authenticated as AEAD associated data.
 fn envelope_header() -> [u8; HEADER_LEN] {
     let mut header = [0u8; HEADER_LEN];
     header[..4].copy_from_slice(ENVELOPE_MAGIC);
     header[4] = ENVELOPE_VERSION;
-    header[5] = ALG_XSALSA20POLY1305;
+    header[5] = ALG_XCHACHA20POLY1305;
     header
 }
 
@@ -341,14 +367,26 @@ mod tests {
         }
     }
 
-    /// Manually build a record encrypting an arbitrary `plaintext`. Used to
-    /// construct records the public API would never produce (wrong inner
-    /// header, non-standard plaintext lengths).
+    /// Manually build a record encrypting an arbitrary `plaintext` with the
+    /// standard header as AAD. Used to construct records the public API would
+    /// never produce (non-standard plaintext lengths).
     fn craft_record(root_secret: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
         let key = derive_backup_key(root_secret);
-        let ciphertext = crypto::encrypt(plaintext, &key);
+        let header = envelope_header();
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let nonce = random_nonce();
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &header,
+                },
+            )
+            .unwrap();
 
-        let mut record = envelope_header().to_vec();
+        let mut record = header.to_vec();
+        record.extend_from_slice(&nonce);
         record.extend_from_slice(&ciphertext);
         record
     }
@@ -373,7 +411,7 @@ mod tests {
         assert_eq!(record.len(), BACKUP_RECORD_LEN_V1);
         assert_eq!(&record[..4], ENVELOPE_MAGIC);
         assert_eq!(record[4], ENVELOPE_VERSION);
-        assert_eq!(record[5], ALG_XSALSA20POLY1305);
+        assert_eq!(record[5], ALG_XCHACHA20POLY1305);
     }
 
     #[test]
@@ -435,20 +473,29 @@ mod tests {
     }
 
     #[test]
-    fn header_is_authenticated() {
-        // The outer header is duplicated inside the authenticated plaintext;
-        // a record whose inner header differs from the outer one must fail.
+    fn header_is_authenticated_as_aad() {
+        // The header is bound into the Poly1305 tag as associated data: a
+        // ciphertext produced under one header cannot be re-framed under a
+        // different one, even though the header travels in cleartext.
         let root_secret = [42u8; 32];
-        let state = test_state();
-        let mut plaintext = b"XXXXXX".to_vec();
-        plaintext.extend_from_slice(&1u64.to_be_bytes());
-        plaintext.extend_from_slice(&state.serialize());
-        let record = craft_record(&root_secret, &plaintext);
+        let record = encrypt_backup(&root_secret, 1, &test_state());
+        let key = derive_backup_key(&root_secret);
 
-        assert_eq!(record.len(), BACKUP_RECORD_LEN_V1);
-        assert_eq!(
-            decrypt_backup(&root_secret, &record, None),
-            Err(BackupCryptoError::DecryptError)
+        // Same nonce and ciphertext, but decrypt against a modified header.
+        let mut other_header = envelope_header();
+        other_header[5] = 2;
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let result = cipher.decrypt(
+            record[HEADER_LEN..HEADER_LEN + NONCE_LEN].into(),
+            Payload {
+                msg: &record[HEADER_LEN + NONCE_LEN..],
+                aad: &other_header,
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "tag verification must fail on AAD mismatch"
         );
     }
 
@@ -553,8 +600,7 @@ mod tests {
         // the exact v1 contract.
         let root_secret = [42u8; 32];
         let state = test_state();
-        let mut plaintext = envelope_header().to_vec();
-        plaintext.extend_from_slice(&1u64.to_be_bytes());
+        let mut plaintext = 1u64.to_be_bytes().to_vec();
         plaintext.extend_from_slice(&state.serialize());
         plaintext.push(0);
         let record = craft_record(&root_secret, &plaintext);

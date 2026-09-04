@@ -303,10 +303,10 @@ let mut restored = PubkyNoiseEncryptor::restore(config, loaded.state, peer_pubke
 //  in `loaded.state.endpoint_pubkey` and can be reconstructed from it via pkarr.)
 ```
 
-Encryption follows the same convention as Pubky recovery files: XSalsa20Poly1305 with a random
-192-bit nonce per write, prepended to the ciphertext (the nonce is not secret -- it only needs
-to be unique per write, and decryption requires it). `persist_snapshot()` and `load_snapshot()`
-take a caller-provided 32-byte `backup_key`. The optional `backup_crypto::derive_backup_key()`
+Encryption uses XChaCha20Poly1305 (the same AEAD the Noise transport runs on, via `snow`)
+with a random 192-bit nonce per write, prepended to the ciphertext (the nonce is not secret --
+it only needs to be unique per write, and decryption requires it). `persist_snapshot()` and
+`load_snapshot()` take a caller-provided 32-byte `backup_key`. The optional `backup_crypto::derive_backup_key()`
 helper derives it from the Pubky root secret with a domain-separated KDF --
 `SHA-256("pubky-noise/session-backup/v0" || root_secret)` -- so the raw root secret is never
 used directly; callers that do not hold the root secret supply their own key instead.
@@ -319,10 +319,11 @@ The stored record is a closed, versioned envelope:
 magic ("PNBK") || envelope_version || algorithm_id || nonce || ciphertext
 ```
 
-The header is duplicated inside the authenticated plaintext (the NaCl construction has no
-AAD) and validated on decryption. Only explicitly supported envelope versions are accepted,
-the record must match the exact length of its version, and the response body is read with a
-hard size cap -- malformed, truncated, trailing, and oversized records are all rejected.
+The 6-byte header is authenticated as AEAD associated data (AAD): it stays in cleartext so the
+decoder can dispatch on it, and any modification fails decryption. Only explicitly supported
+envelope versions are accepted, the record must match the exact length of its version, and the
+response body is read with a hard size cap -- malformed, truncated, trailing, and oversized
+records are all rejected.
 
 **Rollback protection.** AEAD authenticates the bytes but provides no freshness: a stale or
 malicious homeserver can return an older, still-valid backup after the session has advanced,

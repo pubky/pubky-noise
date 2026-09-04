@@ -10,7 +10,7 @@ Key capabilities:
 
 - **Noise protocol handshakes** -- NN (anonymous) and XX (mutually authenticated) patterns, with polling-safe async execution
 - **Encrypted transport** -- ChaCha20-Poly1305 authenticated encryption with explicit nonces via `Noise_*_25519_ChaChaPoly_SHA256`
-- **Session backup & restore** -- Compact 197-byte snapshots enable crash recovery by replaying handshake messages through a fresh Noise state; snapshots are encrypted at rest (XSalsa20Poly1305 under a caller-provided key, derivable from the Pubky root key) before homeserver upload, with generation-based rollback protection
+- **Session backup & restore** -- Compact 197-byte snapshots enable crash recovery by replaying handshake messages through a fresh Noise state; snapshots are encrypted at rest (XChaCha20Poly1305 under a caller-provided key, derivable from the Pubky root key) before homeserver upload, with generation-based rollback protection
 - **Asymmetric path derivation** -- Per-peer-pair private storage paths derived from DH shared secrets, preventing third-party enumeration of communication relationships
 - **Write failure recovery** -- Automatic pre-mutation snapshots during handshake allow recovery from homeserver write failures
 

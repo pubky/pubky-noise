@@ -3613,12 +3613,12 @@ dependencies = [
 name = "pubky-noise"
 version = "0.1.0-rc9"
 dependencies = [
+ "chacha20poly1305",
  "curve25519-dalek 5.0.0",
  "ed25519-dalek",
  "getrandom 0.3.4",
  "hex",
  "pubky",
- "pubky-common",
  "rand 0.9.4",
  "sha2 0.11.0",
  "snow",

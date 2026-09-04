@@ -1139,7 +1139,7 @@ impl PubkyNoiseEncryptor {
     ///
     /// The serialized snapshot contains the session's ephemeral and static
     /// secrets, so it is encrypted with a caller-provided key
-    /// (`XSalsa20Poly1305`, see [`backup_crypto`]) before uploading.
+    /// (`XChaCha20Poly1305`, see [`backup_crypto`]) before uploading.
     ///
     /// # Parameters:
     /// - `backup_key`: A 32-byte key used to encrypt the snapshot. For
