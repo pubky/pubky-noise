@@ -141,8 +141,9 @@ const _: () = assert!(BACKUP_RECORD_LEN_V1 <= MAX_BACKUP_RESPONSE_BYTES);
 #[derive(Debug, PartialEq, Eq)]
 pub enum BackupCryptoError {
     /// Record does not start with the backup magic bytes (e.g. a legacy
-    /// plaintext snapshot or unrelated data).
-    InvalidMagic,
+    /// plaintext snapshot or unrelated data). Carries the first four bytes
+    /// of the record (zero-padded if shorter).
+    InvalidMagic([u8; 4]),
     /// Unsupported envelope format version.
     UnsupportedEnvelopeVersion(u8),
     /// Unsupported algorithm identifier.
@@ -257,7 +258,10 @@ pub fn decrypt_backup_with_key(
         });
     }
     if &record[..4] != ENVELOPE_MAGIC {
-        return Err(BackupCryptoError::InvalidMagic);
+        let mut magic = [0u8; 4];
+        let len = record.len().min(4);
+        magic[..len].copy_from_slice(&record[..len]);
+        return Err(BackupCryptoError::InvalidMagic(magic));
     }
     let version = record[4];
     if version != ENVELOPE_VERSION {
@@ -506,7 +510,7 @@ mod tests {
 
         assert_eq!(
             decrypt_backup(&root_secret, &legacy, None),
-            Err(BackupCryptoError::InvalidMagic)
+            Err(BackupCryptoError::InvalidMagic([1, 1, 1, 1]))
         );
     }
 
@@ -518,7 +522,12 @@ mod tests {
 
         assert_eq!(
             decrypt_backup(&root_secret, &record, None),
-            Err(BackupCryptoError::InvalidMagic)
+            Err(BackupCryptoError::InvalidMagic([
+                b'P' ^ 1,
+                b'N',
+                b'B',
+                b'K'
+            ]))
         );
     }
 
