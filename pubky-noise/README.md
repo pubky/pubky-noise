@@ -285,19 +285,34 @@ be stored in plaintext. `persist_snapshot()` encrypts it before uploading to
 ```rust,ignore
 use pubky_noise::backup_crypto;
 
+// `save_checkpoint` is caller-side trusted local storage: it must durably
+// persist the given generation (e.g. to disk) before returning.
+
 // Obtain the 32-byte backup key. Root-identity callers can derive it from the
 // Pubky root secret; delegated apps that do not hold the root secret may
 // supply their own key (e.g. derived from a shared Noise/state key).
 let backup_key = backup_crypto::derive_backup_key(&root_secret);
 
-// Encrypt and upload the snapshot to the homeserver.
-// `generation` is a caller-managed monotonically increasing counter.
+// Encrypt and upload the snapshot to the homeserver. `generation` is a
+// caller-managed counter that must be *strictly* higher for each new
+// snapshot (equality with the checkpoint is accepted on load, so a reused
+// generation would not be flagged as a rollback).
+let generation = local_checkpoint.map_or(1, |checkpoint| checkpoint + 1);
+
 // IMPORTANT: advance your trusted local checkpoint to `generation` *before*
 // (or atomically with) this call -- see "Rollback protection" below.
+save_checkpoint(generation)?;
 encryptor.persist_snapshot(&backup_key, generation).await?;
 
 // Later (e.g. after a crash or on another device): fetch, decrypt and restore
 let loaded = PubkyNoiseEncryptor::load_snapshot(&config, &backup_key, local_checkpoint).await?;
+
+// The accepted generation may be higher than your checkpoint; record it as
+// the new checkpoint *before* the restored session resumes activity.
+// Otherwise a crash could leave the old checkpoint in place, letting a
+// stale homeserver replay an older backup and reuse counters or nonces.
+save_checkpoint(loaded.generation)?;
+
 let mut restored = PubkyNoiseEncryptor::restore(config, loaded.state, peer_pubkey).await?;
 // (`peer_pubkey` is the remote peer you were talking to; it is also stored
 //  in `loaded.state.endpoint_pubkey` and can be reconstructed from it via pkarr.)
@@ -340,7 +355,11 @@ the newest element.
 advanced only after the upload and the process crashes in between, the checkpoint still holds
 `generation - 1`, so a homeserver replaying the previous backup would be accepted. Crashing
 with the checkpoint already advanced is safe: the new upload is simply lost and loading then
-rejects the older record instead of silently accepting stale state.
+rejects the older record instead of silently accepting stale state. Two rules follow: (1) each
+new snapshot must use a *strictly* higher generation, because a backup whose generation equals
+the checkpoint is accepted; (2) after a successful `load_snapshot()`, persist
+`loaded.generation` as the new checkpoint before the restored session resumes activity, since
+the accepted generation can be higher than the checkpoint you supplied.
 
 If you persist snapshots through your own storage instead of `persist_snapshot()`, you must
 encrypt the serialized bytes yourself.
