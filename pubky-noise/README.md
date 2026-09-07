@@ -9,14 +9,14 @@ Peers use their homeservers as outboxes: each party writes encrypted Noise messa
 ```toml
 # Cargo.toml
 [dependencies]
-pubky-noise = "0.1.0-rc7"
+pubky-noise = "0.1.0-rc8"
 ```
 
 ### Actual dependencies (for reference)
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `pubky` | 0.10.0 | Pubky SDK (homeserver client, sessions, keys) |
+| `pubky` | 0.11.0 | Pubky SDK (homeserver client, sessions, keys) |
 | `snow` | 0.10.0 | Noise protocol implementation |
 | `ed25519-dalek` | 3.0.0 | Ed25519 signatures and key conversions |
 | `curve25519-dalek` | 5.0.0 | X25519 Diffie-Hellman for path derivation |
