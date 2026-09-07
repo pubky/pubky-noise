@@ -32,16 +32,16 @@ cargo build
 ### Unit tests (path derivation, serialization)
 
 ```sh
-cargo nextest -p pubky-noise
+cargo nextest run -p pubky-noise
 ```
 
-### End-to-end tests (requires embedded Postgres)
+### End-to-end tests (requires Docker)
 
 ```sh
-cargo nextest -p e2e
+cargo nextest run -p e2e
 ```
 
-The E2E tests spin up ephemeral Pubky testnets with embedded Postgres and exercise the full handshake-to-transport lifecycle, including:
+The E2E tests start a disposable PostgreSQL container through Testcontainers, spin up ephemeral Pubky testnets in-process, and exercise the full handshake-to-transport lifecycle, including:
 
 - NN and XX pattern handshakes (normal and out-of-order polling)
 - Bidirectional encrypted message exchange
