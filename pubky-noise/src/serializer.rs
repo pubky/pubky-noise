@@ -62,11 +62,10 @@ pub struct PubkyNoiseSessionState {
 }
 
 /// Redacted `Debug`: the ephemeral and static secrets are never rendered.
-/// The sending/receiving nonces are redacted as well: they belong to the
-/// Noise `CipherState`, and the transport keys are derivable from the
-/// handshake transcript hash — which this same state retains — so rendering
-/// nonce values in logs would place key material and nonces one log line
-/// apart.
+/// The sending/receiving nonce values are redacted as a logging policy as
+/// well: they are not secret (Noise nonce counters are public values), but
+/// hiding live cipher-state cursors keeps debug output free of session
+/// internals and consistent with `DataLinkContext`'s redaction.
 impl std::fmt::Debug for PubkyNoiseSessionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PubkyNoiseSessionState")
@@ -432,9 +431,9 @@ mod tests {
             "static secret leaked in Debug: {rendered}"
         );
         assert!(rendered.contains("redacted"));
-        // The transport nonces are part of the Noise cipher state and must
-        // not be rendered either (key material is derivable from the
-        // handshake hash this state retains).
+        // Transport nonce values are hidden as a logging policy (they are
+        // not secret, but live cipher-state cursors stay out of debug
+        // output); the field names remain visible.
         assert!(rendered.contains("sending_nonce"));
         assert!(
             !rendered.contains("sending_nonce: 2"),

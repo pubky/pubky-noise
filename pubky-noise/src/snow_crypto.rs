@@ -412,7 +412,9 @@ pub struct DataLinkContext {
 
 /// Redacted `Debug`: secret key material (`local_static_seckey`,
 /// `local_ephemeral_seckey`) and the Snow handshake/transport internals are
-/// never rendered.
+/// never rendered. Transport nonce values are hidden as a logging policy
+/// (consistent with `PubkyNoiseSessionState`), not because they are secret —
+/// Noise nonce counters are public values.
 impl std::fmt::Debug for DataLinkContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DataLinkContext")
@@ -421,8 +423,8 @@ impl std::fmt::Debug for DataLinkContext {
             .field("has_static_secret", &self.local_static_seckey.is_some())
             .field("noise_step", &self.noise_step)
             .field("noise_phase", &self.noise_phase)
-            .field("sending_nonce", &self.sending_nonce)
-            .field("receiving_nonce", &self.receiving_nonce)
+            .field("sending_nonce", &"[redacted]")
+            .field("receiving_nonce", &"[redacted]")
             .field("endpoint_pubkey", &self.endpoint_pubkey)
             .field("counter", &self.counter)
             .field("write_counter", &self.write_counter)
@@ -936,6 +938,16 @@ mod tests {
         );
         // Non-secret fields remain visible for debugging.
         assert!(rendered.contains("sending_nonce"));
+        // Transport nonce values are hidden as a logging policy; the field
+        // names remain visible.
+        assert!(
+            !rendered.contains("sending_nonce: 0"),
+            "sending nonce value leaked in Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains("receiving_nonce: 0"),
+            "receiving nonce value leaked in Debug: {rendered}"
+        );
     }
 
     fn transport_contexts() -> (DataLinkContext, DataLinkContext) {

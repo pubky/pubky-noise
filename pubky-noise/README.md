@@ -285,8 +285,8 @@ be stored in plaintext. `persist_snapshot()` encrypts it before uploading to
 ```rust,ignore
 use pubky_noise::backup_crypto;
 
-// `save_checkpoint` is caller-side trusted local storage: it must durably
-// persist the given generation (e.g. to disk) before returning.
+// `save_checkpoint`/`load_checkpoint` are caller-side trusted local storage:
+// they must durably persist and return the generation (e.g. on disk).
 
 // Obtain the 32-byte backup key. Root-identity callers can derive it from the
 // Pubky root secret; delegated apps that do not hold the root secret may
@@ -304,7 +304,10 @@ let generation = local_checkpoint.map_or(1, |checkpoint| checkpoint + 1);
 save_checkpoint(generation)?;
 encryptor.persist_snapshot(&backup_key, generation).await?;
 
-// Later (e.g. after a crash or on another device): fetch, decrypt and restore
+// Later (e.g. after a crash or on another device): fetch, decrypt and restore.
+// Reload the checkpoint (it may have advanced since this process cached it):
+// passing a stale or missing checkpoint would weaken rollback detection.
+let local_checkpoint = load_checkpoint();
 let loaded = PubkyNoiseEncryptor::load_snapshot(&config, &backup_key, local_checkpoint).await?;
 
 // The accepted generation may be higher than your checkpoint; record it as
@@ -385,10 +388,15 @@ locking; callers must enforce those requirements.
 // Persist the encrypted snapshot to the homeserver (the snapshot contains
 // session secrets -- never store the serialized bytes in plaintext).
 // Advance your trusted local checkpoint to `generation` first.
+save_checkpoint(generation)?;
 encryptor.persist_snapshot(&backup_key, generation).await?;
 
-// On crash/failure: fetch, decrypt and restore
+// On crash/failure: fetch, decrypt and restore. Reload the checkpoint first
+// so rollback detection uses the latest value.
+let local_checkpoint = load_checkpoint();
 let loaded = PubkyNoiseEncryptor::load_snapshot(&config, &backup_key, local_checkpoint).await?;
+// Record the accepted generation as the new checkpoint *before* restoring.
+save_checkpoint(loaded.generation)?;
 let mut restored = PubkyNoiseEncryptor::restore(config, loaded.state, endpoint_pubkey).await.unwrap();
 // Continue from where you left off
 ```
