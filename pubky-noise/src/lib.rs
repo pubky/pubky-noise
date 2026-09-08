@@ -1143,8 +1143,8 @@ impl PubkyNoiseEncryptor {
     ///
     /// # Parameters:
     /// - `backup_key`: A 32-byte key used to encrypt the snapshot. For
-    ///   root-identity callers this can be obtained by calling
-    ///   [`backup_crypto::derive_backup_key`] with the root secret; delegated
+    ///   apps with access to the Pubky root secret this can be obtained by
+    ///   calling [`backup_crypto::derive_backup_key`]; delegated
     ///   apps may supply a key derived from a shared Noise/state key instead.
     /// - `generation`: A caller-managed, monotonically increasing counter that
     ///   is bound into the encrypted backup. Persist the latest value in
@@ -1204,8 +1204,8 @@ impl PubkyNoiseEncryptor {
     /// # Parameters:
     /// - `backup_key`: A 32-byte key used to decrypt the snapshot. Must match
     ///   the key used during [`persist_snapshot()`](Self::persist_snapshot).
-    ///   For root-identity callers this can be obtained by calling
-    ///   [`backup_crypto::derive_backup_key`] with the root secret; delegated
+    ///   For apps with access to the Pubky root secret this can be obtained
+    ///   by calling [`backup_crypto::derive_backup_key`]; delegated
     ///   apps may supply a key derived from a shared Noise/state key instead.
     /// - `min_generation`: The highest backup generation observed so far, from
     ///   the caller's trusted local checkpoint. Older backups are rejected

@@ -288,9 +288,10 @@ use pubky_noise::backup_crypto;
 // `save_checkpoint`/`load_checkpoint` are caller-side trusted local storage:
 // they must durably persist and return the generation (e.g. on disk).
 
-// Obtain the 32-byte backup key. Root-identity callers can derive it from the
-// Pubky root secret; delegated apps that do not hold the root secret may
-// supply their own key (e.g. derived from a shared Noise/state key).
+// Obtain the 32-byte backup key. Apps with access to the Pubky root secret
+// can derive it via `derive_backup_key()`; delegated apps that do not hold
+// the root secret may supply their own key instead (e.g. derived from a
+// shared Noise/state key).
 let backup_key = backup_crypto::derive_backup_key(&root_secret);
 
 // Encrypt and upload the snapshot to the homeserver. `generation` is a

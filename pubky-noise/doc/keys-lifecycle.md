@@ -11,8 +11,9 @@ This secret key is held by the `PubkyNoiseConfig` structure as part of the pubky
 
 It is used to encrypt `PubkyNoiseSessionState` snapshots persisted to storage external from a
 `PubkyDataEncryptor` instance. `persist_snapshot()` and `load_snapshot()` take a caller-provided
-32-byte `backup_key`; for root-identity callers the `backup_crypto::derive_backup_key()` helper
-derives it via `SHA-256("pubky-noise/session-backup/v0" || pubky_root_seckey)`. Delegated apps
+32-byte `backup_key`; for apps with access to `pubky_root_seckey` the
+`backup_crypto::derive_backup_key()` helper derives it via
+`SHA-256("pubky-noise/session-backup/v0" || pubky_root_seckey)`. Delegated apps
 that do not hold the root secret may supply their own key instead (e.g. derived from a shared
 Noise/state key). The root secret itself is never used directly as an encryption key.
 

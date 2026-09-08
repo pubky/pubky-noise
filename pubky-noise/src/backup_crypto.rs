@@ -96,6 +96,12 @@
 //! prevent. Crashing with the checkpoint already advanced is safe: the new
 //! upload is simply lost, and loading then rejects the older record (or finds
 //! no usable backup) instead of silently accepting stale state.
+//!
+//! One residual case remains uncovered: a crash during checkpoint generation
+//! itself — before either the checkpoint or any backup of a new session is
+//! durable — loses in-memory handshake progress irrecoverably, and the
+//! standard Noise protocol offers no clean peer-initiated message replay.
+//! Callers must treat that window as a fresh-start signal.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
