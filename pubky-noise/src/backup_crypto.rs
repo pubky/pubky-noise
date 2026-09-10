@@ -32,10 +32,15 @@
 //! [30..]    ciphertext || Poly1305 tag
 //! ```
 //!
-//! The 6-byte header is passed to the AEAD as associated data: it stays in
+//! The associated data is `header || backup_path`: the header stays in
 //! cleartext so the decoder can dispatch on it, while any modification makes
-//! tag verification fail. The authenticated plaintext is therefore just
-//! `generation (8, big-endian) || session state (197 bytes)`.
+//! tag verification fail. Binding the intended backup path commits each
+//! record to its storage location — a malicious homeserver cannot substitute
+//! a backup written for a *different* path under the same key (e.g. a
+//! higher-generation backup from another session sharing the root-derived
+//! key), because the AAD mismatch fails decryption before the checkpoint or
+//! the session state can be poisoned. The authenticated plaintext is
+//! therefore just `generation (8, big-endian) || session state (197 bytes)`.
 //! Envelope versioning is intentionally separate from the session-state
 //! serialization version inside the plaintext.
 //!
@@ -190,14 +195,21 @@ pub fn derive_backup_key(root_secret: &[u8; 32]) -> [u8; 32] {
 /// latest generation in trusted local storage and supply it as
 /// `min_generation` when loading.
 ///
+/// `backup_path` is the homeserver path the record will be stored at; it is
+/// bound into the Poly1305 tag as associated data (together with the
+/// header), so the record cannot be replayed at — or accepted from — a
+/// different path.
+///
 /// Returns `magic || version || algorithm || nonce || ciphertext`, with the
-/// header bound into the Poly1305 tag as associated data.
+/// header and backup path bound into the Poly1305 tag as associated data.
 pub fn encrypt_backup_with_key(
     key: &[u8; 32],
+    backup_path: &str,
     generation: u64,
     state: &PubkyNoiseSessionState,
 ) -> Vec<u8> {
     let header = envelope_header();
+    let aad = build_aad(&header, backup_path);
 
     let mut plaintext = Vec::with_capacity(PLAINTEXT_LEN_V1);
     plaintext.extend_from_slice(&generation.to_be_bytes());
@@ -211,7 +223,7 @@ pub fn encrypt_backup_with_key(
             &nonce,
             Payload {
                 msg: &plaintext,
-                aad: &header,
+                aad: &aad,
             },
         )
         .expect("encryption with a fresh random nonce cannot fail");
@@ -231,21 +243,25 @@ pub fn encrypt_backup_with_key(
 /// hold the root identity secret directly.
 pub fn encrypt_backup(
     root_secret: &[u8; 32],
+    backup_path: &str,
     generation: u64,
     state: &PubkyNoiseSessionState,
 ) -> Vec<u8> {
     let key = derive_backup_key(root_secret);
-    encrypt_backup_with_key(&key, generation, state)
+    encrypt_backup_with_key(&key, backup_path, generation, state)
 }
 
 /// Decrypts and parses a backup envelope produced by
 /// [`encrypt_backup_with_key()`] or [`encrypt_backup()`], using a
 /// caller-provided 32-byte decryption key directly.
 ///
+/// `backup_path` is the homeserver path the record was fetched from; it is
+/// bound into the Poly1305 tag as associated data (together with the
+/// header). A record encrypted for a different path fails decryption, which
+/// defeats cross-path substitution by a malicious homeserver.
+///
 /// Only explicitly supported envelope versions and algorithms are accepted,
-/// and the record must match the exact length of its envelope version. The
-/// header is authenticated as AEAD associated data, so any modification of
-/// it, the nonce, or the ciphertext fails decryption.
+/// and the record must match the exact length of its envelope version.
 ///
 /// `min_generation` is the caller's trusted local checkpoint: the highest
 /// generation previously observed for this backup path. Records older than
@@ -254,6 +270,7 @@ pub fn encrypt_backup(
 /// Returns the backup generation and the serialized session state.
 pub fn decrypt_backup_with_key(
     key: &[u8; 32],
+    backup_path: &str,
     record: &[u8],
     min_generation: Option<u64>,
 ) -> Result<(u64, Vec<u8>), BackupCryptoError> {
@@ -287,13 +304,17 @@ pub fn decrypt_backup_with_key(
     let (header, body) = record.split_at(HEADER_LEN);
     let (nonce, ciphertext) = body.split_at(NONCE_LEN);
 
+    let aad = build_aad(
+        header.try_into().expect("header length is validated above"),
+        backup_path,
+    );
     let cipher = XChaCha20Poly1305::new(key.into());
     let plaintext = cipher
         .decrypt(
             nonce.into(),
             Payload {
                 msg: ciphertext,
-                aad: header,
+                aad: &aad,
             },
         )
         .map_err(|_| BackupCryptoError::DecryptError)?;
@@ -328,11 +349,12 @@ pub fn decrypt_backup_with_key(
 /// hold the root identity secret directly.
 pub fn decrypt_backup(
     root_secret: &[u8; 32],
+    backup_path: &str,
     record: &[u8],
     min_generation: Option<u64>,
 ) -> Result<(u64, Vec<u8>), BackupCryptoError> {
     let key = derive_backup_key(root_secret);
-    decrypt_backup_with_key(&key, record, min_generation)
+    decrypt_backup_with_key(&key, backup_path, record, min_generation)
 }
 
 /// Draws a fresh random 192-bit nonce from the OS CSPRNG.
@@ -349,6 +371,16 @@ fn envelope_header() -> [u8; HEADER_LEN] {
     header[4] = ENVELOPE_VERSION;
     header[5] = ALG_XCHACHA20POLY1305;
     header
+}
+
+/// Builds the AEAD associated data: the 6-byte envelope header followed by
+/// the intended backup path. The fixed-length header prefix makes the
+/// concatenation unambiguous.
+fn build_aad(header: &[u8; HEADER_LEN], backup_path: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(HEADER_LEN + backup_path.len());
+    aad.extend_from_slice(header);
+    aad.extend_from_slice(backup_path.as_bytes());
+    aad
 }
 
 #[cfg(test)]
@@ -377,12 +409,21 @@ mod tests {
         }
     }
 
+    /// Path used as AAD throughout the tests.
+    const TEST_PATH: &str = "/pub/test/backup";
+
     /// Manually build a record encrypting an arbitrary `plaintext` with the
-    /// standard header as AAD. Used to construct records the public API would
-    /// never produce (non-standard plaintext lengths).
+    /// standard header and `TEST_PATH` as AAD. Used to construct records the
+    /// public API would never produce (non-standard plaintext lengths).
     fn craft_record(root_secret: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+        craft_record_for_path(root_secret, TEST_PATH, plaintext)
+    }
+
+    /// Like [`craft_record`], but binds the record to an arbitrary path.
+    fn craft_record_for_path(root_secret: &[u8; 32], path: &str, plaintext: &[u8]) -> Vec<u8> {
         let key = derive_backup_key(root_secret);
         let header = envelope_header();
+        let aad = build_aad(&header, path);
         let cipher = XChaCha20Poly1305::new((&key).into());
         let nonce = random_nonce();
         let ciphertext = cipher
@@ -390,7 +431,7 @@ mod tests {
                 &nonce,
                 Payload {
                     msg: plaintext,
-                    aad: &header,
+                    aad: &aad,
                 },
             )
             .unwrap();
@@ -406,8 +447,9 @@ mod tests {
         let root_secret = [42u8; 32];
         let state = test_state();
 
-        let record = encrypt_backup(&root_secret, 7, &state);
-        let (generation, plaintext) = decrypt_backup(&root_secret, &record, Some(7)).unwrap();
+        let record = encrypt_backup(&root_secret, TEST_PATH, 7, &state);
+        let (generation, plaintext) =
+            decrypt_backup(&root_secret, TEST_PATH, &record, Some(7)).unwrap();
 
         assert_eq!(generation, 7);
         assert_eq!(plaintext, state.serialize());
@@ -416,7 +458,7 @@ mod tests {
     #[test]
     fn record_has_exact_envelope_length() {
         let root_secret = [42u8; 32];
-        let record = encrypt_backup(&root_secret, 1, &test_state());
+        let record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
 
         assert_eq!(record.len(), BACKUP_RECORD_LEN_V1);
         assert_eq!(&record[..4], ENVELOPE_MAGIC);
@@ -429,7 +471,7 @@ mod tests {
         let root_secret = [42u8; 32];
         let state = test_state();
 
-        let record = encrypt_backup(&root_secret, 1, &state);
+        let record = encrypt_backup(&root_secret, TEST_PATH, 1, &state);
 
         assert!(!record
             .windows(SESSION_STATE_V1_LEN)
@@ -441,18 +483,18 @@ mod tests {
         let root_secret = [42u8; 32];
         let state = test_state();
 
-        let a = encrypt_backup(&root_secret, 1, &state);
-        let b = encrypt_backup(&root_secret, 1, &state);
+        let a = encrypt_backup(&root_secret, TEST_PATH, 1, &state);
+        let b = encrypt_backup(&root_secret, TEST_PATH, 1, &state);
 
         assert_ne!(a, b, "each encryption must use a fresh random nonce");
     }
 
     #[test]
     fn wrong_root_secret_fails() {
-        let record = encrypt_backup(&[1u8; 32], 1, &test_state());
+        let record = encrypt_backup(&[1u8; 32], TEST_PATH, 1, &test_state());
 
         assert_eq!(
-            decrypt_backup(&[2u8; 32], &record, None),
+            decrypt_backup(&[2u8; 32], TEST_PATH, &record, None),
             Err(BackupCryptoError::DecryptError)
         );
     }
@@ -460,12 +502,12 @@ mod tests {
     #[test]
     fn tampered_ciphertext_fails() {
         let root_secret = [42u8; 32];
-        let mut record = encrypt_backup(&root_secret, 1, &test_state());
+        let mut record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         let last = record.len() - 1;
         record[last] ^= 1;
 
         assert_eq!(
-            decrypt_backup(&root_secret, &record, None),
+            decrypt_backup(&root_secret, TEST_PATH, &record, None),
             Err(BackupCryptoError::DecryptError)
         );
     }
@@ -473,11 +515,11 @@ mod tests {
     #[test]
     fn tampered_nonce_fails() {
         let root_secret = [42u8; 32];
-        let mut record = encrypt_backup(&root_secret, 1, &test_state());
+        let mut record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         record[HEADER_LEN] ^= 1;
 
         assert_eq!(
-            decrypt_backup(&root_secret, &record, None),
+            decrypt_backup(&root_secret, TEST_PATH, &record, None),
             Err(BackupCryptoError::DecryptError)
         );
     }
@@ -488,18 +530,19 @@ mod tests {
         // ciphertext produced under one header cannot be re-framed under a
         // different one, even though the header travels in cleartext.
         let root_secret = [42u8; 32];
-        let record = encrypt_backup(&root_secret, 1, &test_state());
+        let record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         let key = derive_backup_key(&root_secret);
 
         // Same nonce and ciphertext, but decrypt against a modified header.
         let mut other_header = envelope_header();
         other_header[5] = 2;
+        let other_aad = build_aad(&other_header, TEST_PATH);
         let cipher = XChaCha20Poly1305::new((&key).into());
         let result = cipher.decrypt(
             record[HEADER_LEN..HEADER_LEN + NONCE_LEN].into(),
             Payload {
                 msg: &record[HEADER_LEN + NONCE_LEN..],
-                aad: &other_header,
+                aad: &other_aad,
             },
         );
 
@@ -510,12 +553,40 @@ mod tests {
     }
 
     #[test]
+    fn cross_path_substitution_fails() {
+        // A record encrypted for one backup path must not decrypt against a
+        // different path, even under the same key: a malicious homeserver
+        // cannot substitute a backup from another session sharing the key.
+        let root_secret = [42u8; 32];
+        let state = test_state();
+        let record = encrypt_backup(&root_secret, TEST_PATH, 1, &state);
+
+        assert_eq!(
+            decrypt_backup(&root_secret, "/pub/other/backup", &record, None),
+            Err(BackupCryptoError::DecryptError)
+        );
+
+        // The intended path still decrypts, and a well-formed record
+        // crafted for a foreign path is rejected at the intended path with
+        // a tag mismatch (not a length or classification error).
+        assert!(decrypt_backup(&root_secret, TEST_PATH, &record, None).is_ok());
+        let mut plaintext = 9u64.to_be_bytes().to_vec();
+        plaintext.extend_from_slice(&test_state().serialize());
+        let foreign = craft_record_for_path(&root_secret, "/pub/other/backup", &plaintext);
+        assert_eq!(foreign.len(), BACKUP_RECORD_LEN_V1);
+        assert_eq!(
+            decrypt_backup(&root_secret, TEST_PATH, &foreign, None),
+            Err(BackupCryptoError::DecryptError)
+        );
+    }
+
+    #[test]
     fn legacy_plaintext_snapshot_is_classified() {
         let root_secret = [42u8; 32];
         let legacy = test_state().serialize();
 
         assert_eq!(
-            decrypt_backup(&root_secret, &legacy, None),
+            decrypt_backup(&root_secret, TEST_PATH, &legacy, None),
             Err(BackupCryptoError::InvalidMagic([1, 1, 1, 1]))
         );
     }
@@ -523,11 +594,11 @@ mod tests {
     #[test]
     fn bad_magic_is_classified() {
         let root_secret = [42u8; 32];
-        let mut record = encrypt_backup(&root_secret, 1, &test_state());
+        let mut record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         record[0] ^= 1;
 
         assert_eq!(
-            decrypt_backup(&root_secret, &record, None),
+            decrypt_backup(&root_secret, TEST_PATH, &record, None),
             Err(BackupCryptoError::InvalidMagic([
                 b'P' ^ 1,
                 b'N',
@@ -540,11 +611,11 @@ mod tests {
     #[test]
     fn unsupported_envelope_version_is_classified() {
         let root_secret = [42u8; 32];
-        let mut record = encrypt_backup(&root_secret, 1, &test_state());
+        let mut record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         record[4] = 2;
 
         assert_eq!(
-            decrypt_backup(&root_secret, &record, None),
+            decrypt_backup(&root_secret, TEST_PATH, &record, None),
             Err(BackupCryptoError::UnsupportedEnvelopeVersion(2))
         );
     }
@@ -552,11 +623,11 @@ mod tests {
     #[test]
     fn unsupported_algorithm_is_classified() {
         let root_secret = [42u8; 32];
-        let mut record = encrypt_backup(&root_secret, 1, &test_state());
+        let mut record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         record[5] = 9;
 
         assert_eq!(
-            decrypt_backup(&root_secret, &record, None),
+            decrypt_backup(&root_secret, TEST_PATH, &record, None),
             Err(BackupCryptoError::UnsupportedAlgorithm(9))
         );
     }
@@ -564,11 +635,11 @@ mod tests {
     #[test]
     fn exact_minus_one_length_is_rejected() {
         let root_secret = [42u8; 32];
-        let record = encrypt_backup(&root_secret, 1, &test_state());
+        let record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         let truncated = &record[..record.len() - 1];
 
         assert_eq!(
-            decrypt_backup(&root_secret, truncated, None),
+            decrypt_backup(&root_secret, TEST_PATH, truncated, None),
             Err(BackupCryptoError::InvalidLength {
                 expected: BACKUP_RECORD_LEN_V1,
                 actual: BACKUP_RECORD_LEN_V1 - 1,
@@ -579,12 +650,12 @@ mod tests {
     #[test]
     fn exact_plus_one_length_is_rejected() {
         let root_secret = [42u8; 32];
-        let mut record = encrypt_backup(&root_secret, 1, &test_state());
+        let mut record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         record.push(0);
         let actual = record.len();
 
         assert_eq!(
-            decrypt_backup(&root_secret, &record, None),
+            decrypt_backup(&root_secret, TEST_PATH, &record, None),
             Err(BackupCryptoError::InvalidLength {
                 expected: BACKUP_RECORD_LEN_V1,
                 actual,
@@ -595,12 +666,12 @@ mod tests {
     #[test]
     fn oversized_record_is_rejected() {
         let root_secret = [42u8; 32];
-        let mut record = encrypt_backup(&root_secret, 1, &test_state());
+        let mut record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         record.resize(MAX_BACKUP_RESPONSE_BYTES + 1, 0);
         let actual = record.len();
 
         assert_eq!(
-            decrypt_backup(&root_secret, &record, None),
+            decrypt_backup(&root_secret, TEST_PATH, &record, None),
             Err(BackupCryptoError::InvalidLength {
                 expected: BACKUP_RECORD_LEN_V1,
                 actual,
@@ -622,7 +693,7 @@ mod tests {
         let actual = record.len();
 
         assert_eq!(
-            decrypt_backup(&root_secret, &record, None),
+            decrypt_backup(&root_secret, TEST_PATH, &record, None),
             Err(BackupCryptoError::InvalidLength {
                 expected: BACKUP_RECORD_LEN_V1,
                 actual,
@@ -633,10 +704,10 @@ mod tests {
     #[test]
     fn rolled_back_generation_is_rejected() {
         let root_secret = [42u8; 32];
-        let record = encrypt_backup(&root_secret, 5, &test_state());
+        let record = encrypt_backup(&root_secret, TEST_PATH, 5, &test_state());
 
         assert_eq!(
-            decrypt_backup(&root_secret, &record, Some(6)),
+            decrypt_backup(&root_secret, TEST_PATH, &record, Some(6)),
             Err(BackupCryptoError::Rollback {
                 generation: 5,
                 min_generation: 6,
@@ -647,11 +718,11 @@ mod tests {
     #[test]
     fn current_and_newer_generations_are_accepted() {
         let root_secret = [42u8; 32];
-        let record = encrypt_backup(&root_secret, 5, &test_state());
+        let record = encrypt_backup(&root_secret, TEST_PATH, 5, &test_state());
 
-        assert!(decrypt_backup(&root_secret, &record, Some(5)).is_ok());
-        assert!(decrypt_backup(&root_secret, &record, Some(4)).is_ok());
-        assert!(decrypt_backup(&root_secret, &record, None).is_ok());
+        assert!(decrypt_backup(&root_secret, TEST_PATH, &record, Some(5)).is_ok());
+        assert!(decrypt_backup(&root_secret, TEST_PATH, &record, Some(4)).is_ok());
+        assert!(decrypt_backup(&root_secret, TEST_PATH, &record, None).is_ok());
     }
 
     #[test]
@@ -660,12 +731,12 @@ mod tests {
         // crashed before (or after) advancing its trusted local checkpoint.
         // A stale/malicious homeserver then replays the generation-1 record.
         let root_secret = [42u8; 32];
-        let replayed_gen_1 = encrypt_backup(&root_secret, 1, &test_state());
+        let replayed_gen_1 = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
 
         // Required order (checkpoint advanced to 2 before/with the upload):
         // the replayed generation-1 record is rejected.
         assert_eq!(
-            decrypt_backup(&root_secret, &replayed_gen_1, Some(2)),
+            decrypt_backup(&root_secret, TEST_PATH, &replayed_gen_1, Some(2)),
             Err(BackupCryptoError::Rollback {
                 generation: 1,
                 min_generation: 2,
@@ -676,7 +747,7 @@ mod tests {
         // the upload but before updating it): the replayed record is
         // silently accepted. This is why the checkpoint must be advanced
         // before (or atomically with) the upload.
-        assert!(decrypt_backup(&root_secret, &replayed_gen_1, Some(1)).is_ok());
+        assert!(decrypt_backup(&root_secret, TEST_PATH, &replayed_gen_1, Some(1)).is_ok());
     }
 
     #[test]
