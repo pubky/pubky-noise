@@ -1193,13 +1193,20 @@ impl PubkyNoiseEncryptor {
     /// The returned state can be passed to [`restore()`](Self::restore) to
     /// reconstruct the encryptor.
     ///
-    /// The response body is read with a hard size cap
-    /// ([`backup_crypto::MAX_BACKUP_RESPONSE_BYTES`]) and the record must
+    /// Successful (2xx) response bodies are read in chunks under a size cap
+    /// ([`backup_crypto::MAX_BACKUP_RESPONSE_BYTES`]), and the record must
     /// match the exact length of its envelope version. The backup path is
     /// probed with a `HEAD` request first: `HEAD` responses carry no body,
     /// so a malicious homeserver cannot use the probe itself to force a
     /// large allocation, and a confirmed-absent backup can be reported
     /// distinctly from a connectivity or server failure.
+    ///
+    /// Known limitation: the pubky SDK consumes *non-2xx* GET bodies in
+    /// full before this method regains control, so a malicious homeserver
+    /// can force an unbounded allocation through an oversized error body.
+    /// The `HEAD` probe rejects oversized `Content-Length` values up front,
+    /// but a server can lie on the probe and the subsequent GET. Closing
+    /// this gap needs a bounded raw/streaming GET in the pubky SDK.
     ///
     /// # Parameters:
     /// - `backup_key`: A 32-byte key used to decrypt the snapshot. Must match
@@ -1218,8 +1225,8 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::RestoreBackupNotFoundError`] if no backup
     ///   exists at the backup path.
     /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the backup
-    ///   cannot be fetched (connectivity or server failure) or the response
-    ///   exceeds the size cap.
+    ///   cannot be fetched (connectivity or server failure) or a 2xx
+    ///   response exceeds the size cap.
     /// - Returns [`PubkyNoiseError::RestoreBackupDecryptError`] if decryption
     ///   fails (wrong key or tampered/corrupted ciphertext).
     /// - Returns [`PubkyNoiseError::RestoreBackupRollbackError`] if the backup
