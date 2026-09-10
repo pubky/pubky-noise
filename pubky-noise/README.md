@@ -341,8 +341,10 @@ magic ("PNBK") || envelope_version || algorithm_id || nonce || ciphertext
 The 6-byte header is authenticated as AEAD associated data (AAD): it stays in cleartext so the
 decoder can dispatch on it, and any modification fails decryption. Only explicitly supported
 envelope versions are accepted, the record must match the exact length of its version, and the
-response body is read with a hard size cap -- malformed, truncated, trailing, and oversized
-records are all rejected.
+(2xx) response body is read in chunks under a size cap -- malformed, truncated, trailing, and
+oversized records are all rejected. Known limitation: the pubky SDK consumes non-2xx GET bodies
+in full before the cap can run, so an oversized *error* body can still force an unbounded
+allocation; closing that gap needs a bounded raw GET in the SDK.
 
 **Rollback protection.** AEAD authenticates the bytes but provides no freshness: a stale or
 malicious homeserver can return an older, still-valid backup after the session has advanced,
@@ -353,6 +355,17 @@ authenticated plaintext. Pass your trusted local checkpoint as `min_generation` 
 trusted checkpoint (`None`, e.g. a fresh device) rollback cannot be detected -- a signed or
 hash-chained sequence alone is not sufficient either, since the homeserver can simply withhold
 the newest element.
+
+**Losing the checkpoint.** The checkpoint is the only rollback anchor, so it should be backed
+up with the same care as the backup key. If the device holding it fails hard and the client is
+migrated to new hardware, a homeserver that detects the migration (e.g. via a changed client
+or OS fingerprint) can serve an older, still-valid backup: with no checkpoint, `load_snapshot()`
+must be called with `min_generation = None` and the rollback is accepted silently. The worst
+case is peer desynchronization -- the peer has already consumed plaintext from the advanced
+session, and the restored older state reuses nonces/slots the peer has seen. The mitigation is
+operational rather than cryptographic: persist the checkpoint redundantly (e.g. alongside the
+identity backup), and treat a checkpoint-less restore as a reason to start a fresh session
+with the peer rather than resuming the old one.
 
 **Checkpoint update order matters.** Advance the trusted local checkpoint to the new
 `generation` *before* (or atomically with) calling `persist_snapshot()`. If the checkpoint is
