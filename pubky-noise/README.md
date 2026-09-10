@@ -339,7 +339,10 @@ magic ("PNBK") || envelope_version || algorithm_id || nonce || ciphertext
 ```
 
 The 6-byte header is authenticated as AEAD associated data (AAD): it stays in cleartext so the
-decoder can dispatch on it, and any modification fails decryption. Only explicitly supported
+decoder can dispatch on it, and any modification fails decryption. The AAD also commits the
+intended backup path (`{write_path}/backup`), so a malicious homeserver cannot substitute a
+backup written for a different path under the same key -- the tag mismatch fails decryption
+before the rollback checkpoint or session state can be poisoned. Only explicitly supported
 envelope versions are accepted, the record must match the exact length of its version, and the
 response body is read with a hard size cap -- malformed, truncated, trailing, and oversized
 records are all rejected.

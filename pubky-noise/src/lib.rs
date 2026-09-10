@@ -1176,8 +1176,9 @@ impl PubkyNoiseEncryptor {
             return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
         }
         let state = self.snapshot()?;
-        let encrypted = backup_crypto::encrypt_backup_with_key(backup_key, generation, &state);
         let path = format!("{}/backup", self.config.write_path);
+        let encrypted =
+            backup_crypto::encrypt_backup_with_key(backup_key, &path, generation, &state);
         self.config
             .local_session
             .storage()
@@ -1221,7 +1222,10 @@ impl PubkyNoiseEncryptor {
     ///   cannot be fetched (connectivity or server failure) or the response
     ///   exceeds the size cap.
     /// - Returns [`PubkyNoiseError::RestoreBackupDecryptError`] if decryption
-    ///   fails (wrong key or tampered/corrupted ciphertext).
+    ///   fails (wrong key, tampered/corrupted ciphertext, or a record that
+    ///   was encrypted for a different backup path — the path is bound into
+    ///   the AEAD tag as associated data, defeating cross-path substitution
+    ///   by a malicious homeserver).
     /// - Returns [`PubkyNoiseError::RestoreBackupRollbackError`] if the backup
     ///   generation is older than `min_generation`.
     /// - Returns [`PubkyNoiseError::RestoreBackupDeserializeError`] if the record is
@@ -1289,7 +1293,7 @@ impl PubkyNoiseEncryptor {
         }
 
         let (generation, serialized) =
-            backup_crypto::decrypt_backup_with_key(backup_key, &body, min_generation)
+            backup_crypto::decrypt_backup_with_key(backup_key, &path, &body, min_generation)
                 .map_err(map_backup_error)?;
 
         let state = PubkyNoiseSessionState::deserialize(&serialized)

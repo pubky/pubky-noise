@@ -957,6 +957,38 @@ async fn snow_test_simple_backup() {
 }
 
 #[tokio::test]
+async fn snow_test_backup_cross_path_rejected() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors(&testnet, "XX").await;
+    complete_xx_handshake(&mut pair).await;
+
+    let backup_key =
+        backup_crypto::derive_backup_key(&pair.initiator_config.pubky_root_keypair.secret());
+
+    // Simulate a malicious homeserver substituting a backup that was
+    // encrypted for a *different* path under the same key: a well-formed
+    // record with a higher generation, bound to another path, is served at
+    // the real backup path.
+    let state = pair.initiator.snapshot().unwrap();
+    let foreign =
+        backup_crypto::encrypt_backup_with_key(&backup_key, "/pub/other/backup", 99, &state);
+    pair.initiator_config
+        .local_session
+        .storage()
+        .put("/pub/data/backup", foreign)
+        .await
+        .unwrap();
+
+    // The backup path is bound into the AEAD tag as associated data, so the
+    // substituted record fails decryption instead of advancing the trusted
+    // checkpoint or installing foreign session state.
+    let err = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err, PubkyNoiseError::RestoreBackupDecryptError);
+}
+
+#[tokio::test]
 async fn snow_test_backup_oversized_rejected() {
     let testnet = build_testnet().await;
     let pair = setup_encryptors(&testnet, "XX").await;
