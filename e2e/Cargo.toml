@@ -5,10 +5,13 @@ version = "0.1.0-rc1"
 publish = false
 
 [dependencies]
-pubky-testnet = { version = "0.11.0", features = ["docker-postgres"] }
+pubky-testnet = { git = "https://github.com/pubky/pubky-homeserver.git", rev = "acdd6188bbc7ce95cd31090e1ca3cfbd2131596f", features = ["docker-postgres"] }
 pubky-noise = { path = "../pubky-noise", features = ["test-utils"] }
 tokio = { version = "1.47.1", features = ["full", "test-util"] }
 tracing-subscriber = "0.3.20"
 bytes = "1.10.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+pkarr = "8.0.1"
+tokio-rustls = "0.26"

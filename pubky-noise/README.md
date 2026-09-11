@@ -341,8 +341,11 @@ magic ("PNBK") || envelope_version || algorithm_id || nonce || ciphertext
 The 6-byte header is authenticated as AEAD associated data (AAD): it stays in cleartext so the
 decoder can dispatch on it, and any modification fails decryption. Only explicitly supported
 envelope versions are accepted, the record must match the exact length of its version, and the
-response body is read with a hard size cap -- malformed, truncated, trailing, and oversized
-records are all rejected.
+successful GET body is read with a 4096-byte capture limit. Error statuses are classified
+before their bodies are read, and those bodies are discarded. No HEAD preflight is needed.
+Malformed, truncated, trailing, and oversized records are all rejected. This limits backup
+body accumulation; transport buffers and separate SDK credential-refresh responses have
+their own memory costs.
 
 **Rollback protection.** AEAD authenticates the bytes but provides no freshness: a stale or
 malicious homeserver can return an older, still-valid backup after the session has advanced,

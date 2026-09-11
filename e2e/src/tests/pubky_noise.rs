@@ -964,8 +964,7 @@ async fn snow_test_backup_oversized_rejected() {
     let backup_key =
         backup_crypto::derive_backup_key(&pair.initiator_config.pubky_root_keypair.secret());
 
-    // A record larger than the hard cap must be rejected up front by the
-    // HEAD Content-Length probe, before any body bytes are streamed.
+    // A record larger than the cap must be rejected from the GET response.
     let oversized = vec![0u8; backup_crypto::MAX_BACKUP_RESPONSE_BYTES + 1];
     pair.initiator_config
         .local_session

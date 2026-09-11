@@ -13,7 +13,8 @@ categories = ["cryptography"]
 test-utils = []
 
 [dependencies]
-pubky = "0.11.0"
+# Replace this SDK PR pin with its released version before publishing.
+pubky = { git = "https://github.com/pubky/pubky-homeserver.git", rev = "acdd6188bbc7ce95cd31090e1ca3cfbd2131596f" }
 chacha20poly1305 = "0.10.1"
 ed25519-dalek = "3.0.0"
 curve25519-dalek = "5.0.0"

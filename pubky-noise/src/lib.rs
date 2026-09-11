@@ -1193,13 +1193,11 @@ impl PubkyNoiseEncryptor {
     /// The returned state can be passed to [`restore()`](Self::restore) to
     /// reconstruct the encryptor.
     ///
-    /// The response body is read with a hard size cap
-    /// ([`backup_crypto::MAX_BACKUP_RESPONSE_BYTES`]) and the record must
-    /// match the exact length of its envelope version. The backup path is
-    /// probed with a `HEAD` request first: `HEAD` responses carry no body,
-    /// so a malicious homeserver cannot use the probe itself to force a
-    /// large allocation, and a confirmed-absent backup can be reported
-    /// distinctly from a connectivity or server failure.
+    /// Non-success GET bodies are discarded without reading. Successful GET
+    /// bodies are read with a byte cap ([`backup_crypto::MAX_BACKUP_RESPONSE_BYTES`])
+    /// and must match the exact length of their envelope version. A single GET
+    /// determines both absence and content; no HEAD preflight is needed.
+    /// This bounds the backup body, not separate SDK credential-refresh responses.
     ///
     /// # Parameters:
     /// - `backup_key`: A 32-byte key used to decrypt the snapshot. Must match
@@ -1235,42 +1233,23 @@ impl PubkyNoiseEncryptor {
         let path = format!("{}/backup", config.write_path);
         let storage = config.local_session.storage();
 
-        // Probe with HEAD first. Responses to HEAD carry no body
-        // (RFC 9110, Section 9.3.2), so this step cannot be tricked into an
-        // unbounded allocation the way a non-2xx GET body can — the pubky
-        // SDK's `get()` consumes error bodies in full (`Response::text()`)
-        // before returning, i.e. before the size cap below could run.
-        match storage.stats(&path).await {
-            // Reject an oversized backup before issuing the GET.
-            Ok(Some(stats)) => {
-                if let Some(len) = stats.content_length {
-                    if len > backup_crypto::MAX_BACKUP_RESPONSE_BYTES as u64 {
-                        return Err(PubkyNoiseError::HomeserverResponseError);
-                    }
-                }
+        // Inspect the GET status before consuming any body. Error bodies are
+        // discarded, so a server cannot bypass the backup cap with a large error.
+        let mut response = storage
+            .get_raw(&path)
+            .await
+            .map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
+        match response.status() {
+            StatusCode::NOT_FOUND | StatusCode::GONE => {
+                return Err(PubkyNoiseError::RestoreBackupNotFoundError);
             }
-            // 404/410: the backup path is confirmed empty.
-            Ok(None) => return Err(PubkyNoiseError::RestoreBackupNotFoundError),
-            Err(_) => return Err(PubkyNoiseError::HomeserverResponseError),
+            status if !status.is_success() => {
+                return Err(PubkyNoiseError::HomeserverResponseError);
+            }
+            _ => {}
         }
 
-        // NOTE: a non-2xx GET body is still consumed by the SDK before this
-        // code regains control; the HEAD probe above covers the common cases
-        // (absent backup, oversized Content-Length), and fully closing that
-        // gap needs a raw streaming API in the pubky SDK.
-        let mut response = storage.get(&path).await.map_err(|err| match err {
-            Error::Request(RequestError::Server { status, .. })
-                if status == StatusCode::NOT_FOUND || status == StatusCode::GONE =>
-            {
-                PubkyNoiseError::RestoreBackupNotFoundError
-            }
-            _ => PubkyNoiseError::HomeserverResponseError,
-        })?;
-
-        // Bounded body read: reject oversized responses before proportional
-        // allocation, regardless of what the Content-Length header claims
-        // (the HEAD probe above is only advisory — the GET response may
-        // differ from it).
+        // Content-Length is advisory. Count actual bytes before appending too.
         if let Some(len) = response.content_length() {
             if len > backup_crypto::MAX_BACKUP_RESPONSE_BYTES as u64 {
                 return Err(PubkyNoiseError::HomeserverResponseError);
@@ -1282,7 +1261,7 @@ impl PubkyNoiseEncryptor {
             .await
             .map_err(|_| PubkyNoiseError::HomeserverResponseError)?
         {
-            if body.len() + chunk.len() > backup_crypto::MAX_BACKUP_RESPONSE_BYTES {
+            if chunk.len() > backup_crypto::MAX_BACKUP_RESPONSE_BYTES - body.len() {
                 return Err(PubkyNoiseError::HomeserverResponseError);
             }
             body.extend_from_slice(&chunk);
