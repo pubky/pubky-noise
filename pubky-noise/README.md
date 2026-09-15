@@ -356,16 +356,23 @@ trusted checkpoint (`None`, e.g. a fresh device) rollback cannot be detected -- 
 hash-chained sequence alone is not sufficient either, since the homeserver can simply withhold
 the newest element.
 
-**Losing the checkpoint.** The checkpoint is the only rollback anchor, so it should be backed
-up with the same care as the backup key. If the device holding it fails hard and the client is
-migrated to new hardware, a homeserver that detects the migration (e.g. via a changed client
-or OS fingerprint) can serve an older, still-valid backup: with no checkpoint, `load_snapshot()`
-must be called with `min_generation = None` and the rollback is accepted silently. The worst
-case is peer desynchronization -- the peer has already consumed plaintext from the advanced
-session, and the restored older state reuses nonces/slots the peer has seen. The mitigation is
-operational rather than cryptographic: persist the checkpoint redundantly (e.g. alongside the
-identity backup), and treat a checkpoint-less restore as a reason to start a fresh session
-with the peer rather than resuming the old one.
+**Losing the checkpoint.** The checkpoint is the only rollback anchor, so it must be stored
+with at least as much care as the backup key, and independently of the replayable backup itself.
+If the checkpoint is stored only beside the backup, a malicious or compromised homeserver can
+roll back both together. It should therefore be kept in trusted, integrity-protected,
+rollback-resistant storage (e.g. a local secure element, a separately authenticated cloud
+account, or tamper-resistant local hardware), not fetched from the same homeserver path as the
+backup.
+
+If the device holding the checkpoint fails hard and the client is migrated to new hardware
+without a trusted checkpoint, `load_snapshot()` must be called with `min_generation = None`.
+A homeserver that detects the migration (e.g. via a changed client or OS fingerprint) can then
+serve an older, still-valid backup and the rollback is accepted silently. Restoring stale state
+reuses the same Noise key material and nonces that the peer has already seen in the advanced
+session: this breaks confidentiality and authentication for those packets and can lead to
+forgery or session desynchronization. When checkpoint freshness is unknown, the only safe
+choice is to discard the restored session state and start a fresh Noise session with the peer
+rather than resuming the old one.
 
 **Checkpoint update order matters.** Advance the trusted local checkpoint to the new
 `generation` *before* (or atomically with) calling `persist_snapshot()`. If the checkpoint is

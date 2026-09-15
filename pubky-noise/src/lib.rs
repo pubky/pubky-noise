@@ -1206,7 +1206,8 @@ impl PubkyNoiseEncryptor {
     /// can force an unbounded allocation through an oversized error body.
     /// The `HEAD` probe rejects oversized `Content-Length` values up front,
     /// but a server can lie on the probe and the subsequent GET. Closing
-    /// this gap needs a bounded raw/streaming GET in the pubky SDK.
+    /// this gap needs a bounded raw/streaming GET in the pubky SDK
+    /// (tracked in <https://github.com/pubky/pubky-noise/issues/36>).
     ///
     /// # Parameters:
     /// - `backup_key`: A 32-byte key used to decrypt the snapshot. Must match
