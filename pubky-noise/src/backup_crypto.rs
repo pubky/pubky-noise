@@ -85,10 +85,15 @@
 //! generation in *trusted local storage* and passes the latest observed value
 //! as `min_generation` to [`decrypt_backup_with_key`]; older records are
 //! rejected with
-//! [`BackupCryptoError::Rollback`]. Without a trusted checkpoint (fresh
-//! device, `min_generation = None`) rollback cannot be detected — a signed or
-//! hash-chained sequence alone is not sufficient either, since the homeserver
-//! can simply withhold the newest element.
+//! [`BackupCryptoError::Rollback`]. The `backup_path` bound into the AAD and
+//! the `generation` bound into the plaintext together also defeat an
+//! "in-place" replay, where the homeserver returns a record encrypted for the
+//! same path but with a different generation. Without a trusted checkpoint
+//! (fresh device, `min_generation = None`) rollback cannot be detected — a
+//! signed or hash-chained sequence alone is not sufficient either, since the
+//! homeserver can simply withhold the newest element. Compromise or rollback
+//! of the local trusted checkpoint itself is outside the security model: the
+//! checkpoint must be kept in trusted, integrity-protected storage.
 //!
 //! ### Checkpoint update order
 //!
@@ -198,7 +203,10 @@ pub fn derive_backup_key(root_secret: &[u8; 32]) -> [u8; 32] {
 /// `backup_path` is the homeserver path the record will be stored at; it is
 /// bound into the Poly1305 tag as associated data (together with the
 /// header), so the record cannot be replayed at — or accepted from — a
-/// different path.
+/// different path. Together with the monotonic `generation`, this also
+/// prevents an in-place replay of a same-path record with a different
+/// generation; compromise of the caller's trusted local checkpoint is
+/// outside the security model (see module-level "Rollback Protection").
 ///
 /// Returns `magic || version || algorithm || nonce || ciphertext`, with the
 /// header and backup path bound into the Poly1305 tag as associated data.
@@ -258,7 +266,10 @@ pub fn encrypt_backup(
 /// `backup_path` is the homeserver path the record was fetched from; it is
 /// bound into the Poly1305 tag as associated data (together with the
 /// header). A record encrypted for a different path fails decryption, which
-/// defeats cross-path substitution by a malicious homeserver.
+/// defeats cross-path substitution by a malicious homeserver. Together with
+/// `min_generation`, this also rejects an in-place replay of a same-path
+/// record carrying an older generation; a compromised local checkpoint is
+/// outside the security model (see module-level "Rollback Protection").
 ///
 /// Only explicitly supported envelope versions and algorithms are accepted,
 /// and the record must match the exact length of its envelope version.
