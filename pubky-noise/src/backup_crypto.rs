@@ -114,8 +114,9 @@ const BACKUP_KEY_DOMAIN: &[u8] = b"pubky-noise/session-backup/v0";
 
 /// Magic bytes identifying a pubky-noise session backup envelope.
 const ENVELOPE_MAGIC: &[u8; 4] = b"PNBK";
-/// Current backup envelope format version.
-const ENVELOPE_VERSION: u8 = 1;
+/// Backup envelope format version 1 (the first deployed version; future
+/// coexisting versions get their own `ENVELOPE_VERSION_V*` constants).
+const ENVELOPE_VERSION_V1: u8 = 1;
 /// Algorithm ID: XChaCha20Poly1305 with the domain-separated SHA-256 KDF.
 const ALG_XCHACHA20POLY1305: u8 = 1;
 
@@ -133,11 +134,13 @@ const PLAINTEXT_LEN_V1: usize = GENERATION_LEN + SESSION_STATE_V1_LEN;
 /// v1 record length: header (6) || nonce (24) || ciphertext (205 + tag 16).
 pub const BACKUP_RECORD_LEN_V1: usize = HEADER_LEN + NONCE_LEN + PLAINTEXT_LEN_V1 + TAG_LEN;
 
-/// Hard cap on the homeserver response body when fetching a backup.
+/// Size cap on the homeserver response body when fetching a backup.
 ///
 /// Bounds memory allocation against a malicious homeserver returning a huge
-/// body. The v1 record is 251 bytes; this leaves ample room for future
-/// envelope versions while keeping allocation strictly bounded.
+/// 2xx body (the pubky SDK consumes *error* bodies in full before callers
+/// regain control, so this cap cannot cover those). The v1 record is 251
+/// bytes; this leaves ample room for future envelope versions while keeping
+/// allocation strictly bounded.
 pub const MAX_BACKUP_RESPONSE_BYTES: usize = 4096;
 
 // The size cap must always fit the current record format.
@@ -270,7 +273,7 @@ pub fn decrypt_backup_with_key(
         return Err(BackupCryptoError::InvalidMagic(magic));
     }
     let version = record[4];
-    if version != ENVELOPE_VERSION {
+    if version != ENVELOPE_VERSION_V1 {
         return Err(BackupCryptoError::UnsupportedEnvelopeVersion(version));
     }
     let algorithm = record[5];
@@ -346,7 +349,7 @@ fn random_nonce() -> XNonce {
 fn envelope_header() -> [u8; HEADER_LEN] {
     let mut header = [0u8; HEADER_LEN];
     header[..4].copy_from_slice(ENVELOPE_MAGIC);
-    header[4] = ENVELOPE_VERSION;
+    header[4] = ENVELOPE_VERSION_V1;
     header[5] = ALG_XCHACHA20POLY1305;
     header
 }
@@ -420,7 +423,7 @@ mod tests {
 
         assert_eq!(record.len(), BACKUP_RECORD_LEN_V1);
         assert_eq!(&record[..4], ENVELOPE_MAGIC);
-        assert_eq!(record[4], ENVELOPE_VERSION);
+        assert_eq!(record[4], ENVELOPE_VERSION_V1);
         assert_eq!(record[5], ALG_XCHACHA20POLY1305);
     }
 

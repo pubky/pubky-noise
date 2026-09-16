@@ -341,8 +341,10 @@ magic ("PNBK") || envelope_version || algorithm_id || nonce || ciphertext
 The 6-byte header is authenticated as AEAD associated data (AAD): it stays in cleartext so the
 decoder can dispatch on it, and any modification fails decryption. Only explicitly supported
 envelope versions are accepted, the record must match the exact length of its version, and the
-response body is read with a hard size cap -- malformed, truncated, trailing, and oversized
-records are all rejected.
+(2xx) response body is read in chunks under a size cap -- malformed, truncated, trailing, and
+oversized records are all rejected. Known limitation: the pubky SDK consumes non-2xx GET bodies
+in full before the cap can run, so an oversized *error* body can still force an unbounded
+allocation; closing that gap needs a bounded raw GET in the SDK.
 
 **Rollback protection.** AEAD authenticates the bytes but provides no freshness: a stale or
 malicious homeserver can return an older, still-valid backup after the session has advanced,
@@ -353,6 +355,24 @@ authenticated plaintext. Pass your trusted local checkpoint as `min_generation` 
 trusted checkpoint (`None`, e.g. a fresh device) rollback cannot be detected -- a signed or
 hash-chained sequence alone is not sufficient either, since the homeserver can simply withhold
 the newest element.
+
+**Losing the checkpoint.** The checkpoint is the only rollback anchor, so it must be stored
+with at least as much care as the backup key, and independently of the replayable backup itself.
+If the checkpoint is stored only beside the backup, a malicious or compromised homeserver can
+roll back both together. It should therefore be kept in trusted, integrity-protected,
+rollback-resistant storage (e.g. a local secure element, a separately authenticated cloud
+account, or tamper-resistant local hardware), not fetched from the same homeserver path as the
+backup.
+
+If the device holding the checkpoint fails hard and the client is migrated to new hardware
+without a trusted checkpoint, `load_snapshot()` must be called with `min_generation = None`.
+A homeserver that detects the migration (e.g. via a changed client or OS fingerprint) can then
+serve an older, still-valid backup and the rollback is accepted silently. Restoring stale state
+reuses the same Noise key material and nonces that the peer has already seen in the advanced
+session: this breaks confidentiality and authentication for those packets and can lead to
+forgery or session desynchronization. When checkpoint freshness is unknown, the only safe
+choice is to discard the restored session state and start a fresh Noise session with the peer
+rather than resuming the old one.
 
 **Checkpoint update order matters.** Advance the trusted local checkpoint to the new
 `generation` *before* (or atomically with) calling `persist_snapshot()`. If the checkpoint is
