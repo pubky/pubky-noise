@@ -521,11 +521,12 @@ async fn handshake_recovery_explicit_write_errors(
     config: Arc<PubkyNoiseConfig>,
     endpoint_pubkey: PublicKey,
     backup_key: &[u8; 32],
+    backup_path: &str,
     generation: u64,
 ) -> Result<HandshakeResult, PubkyNoiseError> {
     let snapshot = encryptor.snapshot().unwrap();
     let encrypted =
-        backup_crypto::encrypt_backup_with_key(backup_key, generation, &snapshot);
+        backup_crypto::encrypt_backup_with_key(backup_key, backup_path, generation, &snapshot);
     save_to_disk(&encrypted); // your persistence logic
 
     handshake_with_recovery(encryptor, config, endpoint_pubkey).await
