@@ -339,7 +339,10 @@ magic ("PNBK") || envelope_version || algorithm_id || nonce || ciphertext
 ```
 
 The 6-byte header is authenticated as AEAD associated data (AAD): it stays in cleartext so the
-decoder can dispatch on it, and any modification fails decryption. Only explicitly supported
+decoder can dispatch on it, and any modification fails decryption. The AAD also commits the
+intended backup path (`{write_path}/backup`), so a malicious homeserver cannot substitute a
+backup written for a different path under the same key -- the tag mismatch fails decryption
+before the rollback checkpoint or session state can be poisoned. Only explicitly supported
 envelope versions are accepted, the record must match the exact length of its version, and the
 (2xx) response body is read in chunks under a size cap -- malformed, truncated, trailing, and
 oversized records are all rejected. Known limitation: the pubky SDK consumes non-2xx GET bodies
@@ -538,11 +541,12 @@ async fn handshake_recovery_explicit_write_errors(
     config: Arc<PubkyNoiseConfig>,
     endpoint_pubkey: PublicKey,
     backup_key: &[u8; 32],
+    backup_path: &str,
     generation: u64,
 ) -> Result<HandshakeResult, PubkyNoiseError> {
     let snapshot = encryptor.snapshot().unwrap();
     let encrypted =
-        backup_crypto::encrypt_backup_with_key(backup_key, generation, &snapshot);
+        backup_crypto::encrypt_backup_with_key(backup_key, backup_path, generation, &snapshot);
     save_to_disk(&encrypted); // your persistence logic
 
     handshake_with_recovery(encryptor, config, endpoint_pubkey).await
