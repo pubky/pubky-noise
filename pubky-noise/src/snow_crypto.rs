@@ -640,12 +640,12 @@ impl DataLinkContext {
         self.noise_phase == NoisePhase::Transport
     }
 
-    /// Return the peer's static key from the handshake or transport state.
+    /// Return the peer's static key only after the handshake completes.
     pub fn remote_static_public_key(&self) -> Option<&[u8]> {
-        if let Some(handshake) = &self.noise_handshake {
-            handshake.get_remote_static()
-        } else {
-            self.noise_transport.as_ref()?.get_remote_static()
+        match &self.noise_handshake {
+            Some(handshake) if handshake.is_handshake_finished() => handshake.get_remote_static(),
+            Some(_) => None,
+            None => self.noise_transport.as_ref()?.get_remote_static(),
         }
     }
 
@@ -986,13 +986,14 @@ mod tests {
             .read_handshake_message(&mut message, &mut payload, len)
             .unwrap();
         let responder_key = crate::derive_static_public_key(&responder_secret);
+        assert_eq!(initiator.remote_static_public_key(), None);
+        let len = initiator
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
         assert_eq!(
             initiator.remote_static_public_key(),
             Some(responder_key.as_slice())
         );
-        let len = initiator
-            .write_handshake_message(&[], &mut message)
-            .unwrap();
         responder
             .read_handshake_message(&mut message, &mut payload, len)
             .unwrap();
@@ -1015,6 +1016,54 @@ mod tests {
         let (initiator, responder) = transport_contexts();
         assert_eq!(initiator.remote_static_public_key(), None);
         assert_eq!(responder.remote_static_public_key(), None);
+    }
+
+    #[test]
+    fn test_remote_static_public_key_rejects_unauthenticated_handshake() {
+        for tamper_second_message in [true, false] {
+            let mut initiator = DataLinkContext::new(
+                HandshakePattern::PatternXX,
+                true,
+                Some([3; 32]),
+                Keypair::random().public_key(),
+            )
+            .unwrap();
+            let mut responder = DataLinkContext::new(
+                HandshakePattern::PatternXX,
+                false,
+                Some([4; 32]),
+                Keypair::random().public_key(),
+            )
+            .unwrap();
+            let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+            let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+            let len = initiator
+                .write_handshake_message(&[], &mut message)
+                .unwrap();
+            responder
+                .read_handshake_message(&mut message, &mut payload, len)
+                .unwrap();
+            let mut len = responder
+                .write_handshake_message(&[], &mut message)
+                .unwrap();
+            let receiver = if tamper_second_message {
+                &mut initiator
+            } else {
+                initiator
+                    .read_handshake_message(&mut message, &mut payload, len)
+                    .unwrap();
+                len = initiator
+                    .write_handshake_message(&[], &mut message)
+                    .unwrap();
+                &mut responder
+            };
+            message[len - 1] ^= 1;
+            assert!(receiver
+                .read_handshake_message(&mut message, &mut payload, len)
+                .is_err());
+            assert!(receiver.is_handshake());
+            assert_eq!(receiver.remote_static_public_key(), None);
+        }
     }
 
     #[test]
