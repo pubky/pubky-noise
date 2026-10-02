@@ -401,6 +401,48 @@ async fn snow_test_transport_allows_simultaneous_first_sends() {
 }
 
 #[tokio::test]
+async fn snow_test_xx_restores_remote_static_public_key() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
+    let initiator_key = pubky_noise::derive_static_public_key(
+        &pair.initiator.snapshot().unwrap().static_secret.unwrap(),
+    );
+    let responder_key = pubky_noise::derive_static_public_key(
+        &pair.responder.snapshot().unwrap().static_secret.unwrap(),
+    );
+    assert_eq!(pair.initiator.remote_static_public_key(), None);
+    assert_eq!(pair.responder.remote_static_public_key(), None);
+    complete_xx_handshake(&mut pair).await;
+
+    for (encryptor, config, peer, expected) in [
+        (
+            &pair.initiator,
+            pair.initiator_config.clone(),
+            pair.responder_public_key.clone(),
+            responder_key,
+        ),
+        (
+            &pair.responder,
+            pair.responder_config.clone(),
+            pair.initiator_public_key.clone(),
+            initiator_key,
+        ),
+    ] {
+        assert_eq!(
+            encryptor.remote_static_public_key(),
+            Some(expected.as_slice())
+        );
+        let restored = PubkyNoiseEncryptor::restore(config, encryptor.snapshot().unwrap(), peer)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.remote_static_public_key(),
+            Some(expected.as_slice())
+        );
+    }
+}
+
+#[tokio::test]
 async fn snow_test_xx_transport_allows_simultaneous_first_sends() {
     let testnet = build_testnet().await;
 

@@ -640,6 +640,15 @@ impl DataLinkContext {
         self.noise_phase == NoisePhase::Transport
     }
 
+    /// Return the peer's static key from the handshake or transport state.
+    pub fn remote_static_public_key(&self) -> Option<&[u8]> {
+        if let Some(handshake) = &self.noise_handshake {
+            handshake.get_remote_static()
+        } else {
+            self.noise_transport.as_ref()?.get_remote_static()
+        }
+    }
+
     pub fn get_handshake_hash(&self) -> Option<[u8; 32]> {
         if let Some(handshake_state) = &self.noise_handshake {
             let mut buf = [0; 32];
@@ -938,6 +947,74 @@ mod tests {
         initiator.transition_to_transport().unwrap();
         responder.transition_to_transport().unwrap();
         (initiator, responder)
+    }
+
+    #[test]
+    fn test_remote_static_public_key() {
+        let initiator_secret = [3; 32];
+        let responder_secret = [4; 32];
+        let mut initiator = DataLinkContext::new(
+            HandshakePattern::PatternXX,
+            true,
+            Some(initiator_secret),
+            Keypair::random().public_key(),
+        )
+        .unwrap();
+        let mut responder = DataLinkContext::new(
+            HandshakePattern::PatternXX,
+            false,
+            Some(responder_secret),
+            Keypair::random().public_key(),
+        )
+        .unwrap();
+        assert_eq!(initiator.remote_static_public_key(), None);
+        assert_eq!(responder.remote_static_public_key(), None);
+
+        let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+        let len = initiator
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        responder
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
+        assert_eq!(responder.remote_static_public_key(), None);
+        let len = responder
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        initiator
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
+        let responder_key = crate::derive_static_public_key(&responder_secret);
+        assert_eq!(
+            initiator.remote_static_public_key(),
+            Some(responder_key.as_slice())
+        );
+        let len = initiator
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        responder
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
+        let initiator_key = crate::derive_static_public_key(&initiator_secret);
+        assert_eq!(
+            responder.remote_static_public_key(),
+            Some(initiator_key.as_slice())
+        );
+
+        initiator.transition_to_transport().unwrap();
+        responder.transition_to_transport().unwrap();
+        assert_eq!(
+            initiator.remote_static_public_key(),
+            Some(responder_key.as_slice())
+        );
+        assert_eq!(
+            responder.remote_static_public_key(),
+            Some(initiator_key.as_slice())
+        );
+        let (initiator, responder) = transport_contexts();
+        assert_eq!(initiator.remote_static_public_key(), None);
+        assert_eq!(responder.remote_static_public_key(), None);
     }
 
     #[test]

@@ -9,7 +9,7 @@ Peers use their homeservers as outboxes: each party writes encrypted Noise messa
 ```toml
 # Cargo.toml
 [dependencies]
-pubky-noise = "0.1.0-rc11"
+pubky-noise = "0.1.0-rc12"
 ```
 
 ### Actual dependencies (for reference)
@@ -122,6 +122,12 @@ NoiseAEAD([body_len_hi, body_len_lo, body..., zero padding...])
 - Total stored packet size: 1018 bytes, independent of the body length
 
 ### Crypto Primitives
+
+For peer authentication, compare `remote_static_public_key()` with an independently
+authenticated X25519 key before using a completed or restored session. Noise XX
+proves possession of the presented key, not its association with a Pubky identity.
+`derive_static_public_key()` derives the public key from the static secret passed
+to `PubkyNoiseEncryptor::new`; it is distinct from the Ed25519 keys used for routing.
 
 The Noise protocol name is:
 

@@ -27,6 +27,12 @@ use snow_crypto::{
 #[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 pub struct LinkId(pub [u8; 32]);
 
+/// Derive the X25519 public key for the static secret passed to
+/// [`PubkyNoiseEncryptor::new`]. This is not an Ed25519 public-key conversion.
+pub fn derive_static_public_key(secret_key: &[u8; 32]) -> [u8; 32] {
+    curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(*secret_key).to_bytes()
+}
+
 /// Decode a length-prefixed packet into a message buffer and its length.
 ///
 /// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
@@ -502,6 +508,16 @@ impl PubkyNoiseEncryptor {
     /// Returns `true` if the Noise handshake has completed.
     pub fn is_handshake_complete(&self) -> bool {
         !self.context.is_handshake()
+    }
+
+    /// Return the remote X25519 static key learned from the Noise handshake.
+    ///
+    /// Returns `None` until the peer's static key has been received, or when the
+    /// pattern has no remote static key. Available in transport and after restore.
+    /// Callers must compare this with their independently authenticated expected
+    /// key before trusting the completed link or exchanging application messages.
+    pub fn remote_static_public_key(&self) -> Option<&[u8]> {
+        self.context.remote_static_public_key()
     }
 
     /// Handle the forwarding and processing of Noise handshake messages.
