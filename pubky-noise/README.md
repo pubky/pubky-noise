@@ -268,17 +268,13 @@ Use `PubkyNoiseConfig::new_with_paths()` to supply separate write/read paths.
 
 Sessions can be snapshotted, serialized, and restored to recover from crashes or write failures.
 
-Version 2 snapshots restore without network I/O: they retain the incoming handshake
+Snapshots restore without network I/O: they retain the incoming handshake
 messages and regenerate local writes from the saved ephemeral seed. Replay still
 verifies message authentication and the saved transcript hash or LinkId. Snapshots
 must remain encrypted, authenticated, and current; this is not a cache of live
 transport counters. Peer authorization and cross-process coordination remain the
 caller's responsibility. Remote deletion or replacement of old handshake files
 does not invalidate a saved transcript or revoke a session.
-
-Version 1 snapshots are still readable. Their first restore downloads the incoming
-handshake messages; the next snapshot uses version 2. Older library versions cannot
-read version 2 snapshots, so applications sharing snapshots must update together.
 
 `snapshot.next_handshake_read_slot()` inspects the saved cursor without restoring
 the Noise state or performing network I/O. `Some(slot)` lets a caller probe
@@ -289,13 +285,9 @@ version and cursor consistency, not snapshot authenticity or transcript validity
 Existence is advisory only; all authorization, restore, recovery, and advancement
 checks must still run under the existing leases.
 
-If a version 1 `restore()` returns `HomeserverResponseError`, retain the original snapshot and
-retry after the cause is resolved. Restore uses this error for transport, routing,
-server-response, and response-body download failures, except HTTP 404/410. This
-does not bypass TLS checks, retry internally, or write remote state. Missing
-transcripts (404/410), invalid request/configuration errors, and cryptographic
-replay failures remain `RestoreBackupReplayError`. Malformed packet lengths remain
-`BadLengthCiphertext`; transcript hash mismatches remain `RestoreBackupHashMismatch`.
+Invalid snapshot structure returns `RestoreBackupDeserializeError`, cryptographic
+replay failures return `RestoreBackupReplayError`, and transcript hash mismatches
+return `RestoreBackupHashMismatch`. Restore neither downloads nor writes remote state.
 
 ### Snapshot Format
 
@@ -322,12 +314,13 @@ replay failures remain `RestoreBackupReplayError`. Malformed packet lengths rema
 | 157-160 | 4 | write counter (u32 big-endian) |
 | 161-164 | 4 | read counter (u32 big-endian) |
 | 165-196 | 32 | endpoint public key |
-| 197 | 1 | incoming handshake message count (version 2 only) |
+| 197 | 1 | incoming handshake message count |
 | 198+ | variable | each incoming message: u16 big-endian length, then unpadded bytes |
 
-Version 1 ends at byte 197. Version 2 stores at most two incoming messages, each
-bounded by `PUBKY_NOISE_CIPHERTEXT_LEN`; its maximum is `MAX_SESSION_STATE_LEN`
-(2234 bytes). With the library's empty handshake payloads, completed NN snapshots
+The format version is 1. Snapshots store at most two incoming messages, each
+bounded by `PUBKY_NOISE_CIPHERTEXT_LEN`; the size ranges from `MIN_SESSION_STATE_LEN`
+(198 bytes) to `MAX_SESSION_STATE_LEN` (2234 bytes).
+With the library's empty handshake payloads, completed NN snapshots
 are 248/232 bytes and XX snapshots are 296/298 bytes (initiator/responder).
 
 ### Encrypted Homeserver Backup
@@ -489,8 +482,7 @@ During handshake, if a homeserver write fails:
 4. Persist it and pass to `restore()` to rebuild the session from the correct position.
 
 The restore mechanism replays saved incoming messages and regenerates local writes
-through a fresh Noise state built with the same ephemeral key material. Version 1
-snapshots fetch the incoming messages from the homeserver first.
+through a fresh Noise state built with the same ephemeral key material.
 
 ### Handshake Recovery with `last_good_snapshot`
 
@@ -640,7 +632,7 @@ does not detect or republish lost data.
 | `UnacknowledgedPreparedTransport` | A prepared operation has not been durably acknowledged | Persist and acknowledge its handle, or restore the previous durable state if persistence failed |
 | `NoPreparedTransport` | An acknowledgement was attempted with no pending operation | Check the caller's operation lifecycle |
 | `PreparedTransportMismatch` | A prepared handle belongs to another encryptor or operation | Use the handle returned by the current encryptor |
-| `RestoreBackupReplayError` | Handshake replay failed during restore | Check snapshot integrity; version 1 also needs intact remote messages |
+| `RestoreBackupReplayError` | Handshake replay failed during restore | Check snapshot integrity |
 | `RestoreBackupHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
 | `RestoreBackupDeserializeError` | Backup envelope or snapshot deserialization failed | Check data integrity |
 | `RestoreBackupDecryptError` | Persisted snapshot decryption failed | Wrong backup key, or tampered/corrupted backup |

@@ -26,7 +26,7 @@
 //!
 //! ```text
 //! [0..4]    magic: "PNBK"
-//! [4]       envelope format version (1 or 2)
+//! [4]       envelope format version (1)
 //! [5]       algorithm ID (1 = XChaCha20Poly1305 with the KDF below)
 //! [6..30]   nonce (192-bit, random per write)
 //! [30..]    ciphertext || Poly1305 tag
@@ -41,8 +41,7 @@
 //! key), because the AAD mismatch fails decryption before the checkpoint or
 //! the session state can be poisoned. The authenticated plaintext is
 //! therefore just `generation (8, big-endian) || session state`.
-//! Envelope 1 contains a fixed 197-byte state. Envelope 2 allows the bounded,
-//! variable-length state with saved handshake messages.
+//! The session state has bounded variable length and includes saved handshake messages.
 //! Envelope versioning is intentionally separate from the session-state
 //! serialization version inside the plaintext.
 //!
@@ -119,17 +118,15 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use sha2::{Digest, Sha256};
 
-use crate::serializer::{PubkyNoiseSessionState, MAX_SESSION_STATE_LEN, SESSION_STATE_V1_LEN};
+use crate::serializer::{PubkyNoiseSessionState, MAX_SESSION_STATE_LEN, MIN_SESSION_STATE_LEN};
 
 /// Domain separation tag for backup key derivation.
 const BACKUP_KEY_DOMAIN: &[u8] = b"pubky-noise/session-backup/v0";
 
 /// Magic bytes identifying a pubky-noise session backup envelope.
 const ENVELOPE_MAGIC: &[u8; 4] = b"PNBK";
-/// Backup envelope format version 1 (the first deployed version; future
-/// coexisting versions get their own `ENVELOPE_VERSION_V*` constants).
-const ENVELOPE_VERSION_V1: u8 = 1;
-const ENVELOPE_VERSION_V2: u8 = 2;
+/// Current backup envelope format version.
+const ENVELOPE_VERSION: u8 = 1;
 /// Algorithm ID: XChaCha20Poly1305 with the domain-separated SHA-256 KDF.
 const ALG_XCHACHA20POLY1305: u8 = 1;
 
@@ -142,30 +139,28 @@ const TAG_LEN: usize = 16;
 /// Monotonic generation counter length (big-endian u64).
 const GENERATION_LEN: usize = 8;
 
-/// v1 authenticated plaintext length: generation (8) || session state (197).
-const PLAINTEXT_LEN_V1: usize = GENERATION_LEN + SESSION_STATE_V1_LEN;
-/// v1 record length: header (6) || nonce (24) || ciphertext (205 + tag 16).
-pub const BACKUP_RECORD_LEN_V1: usize = HEADER_LEN + NONCE_LEN + PLAINTEXT_LEN_V1 + TAG_LEN;
-const MIN_BACKUP_RECORD_LEN_V2: usize = BACKUP_RECORD_LEN_V1 + 1;
-const MAX_BACKUP_RECORD_LEN_V2: usize =
+/// Minimum encrypted backup length, including the header, nonce, generation, and tag.
+pub const MIN_BACKUP_RECORD_LEN: usize =
+    HEADER_LEN + NONCE_LEN + GENERATION_LEN + MIN_SESSION_STATE_LEN + TAG_LEN;
+/// Maximum encrypted backup length, including the complete handshake transcript.
+pub const MAX_BACKUP_RECORD_LEN: usize =
     HEADER_LEN + NONCE_LEN + GENERATION_LEN + MAX_SESSION_STATE_LEN + TAG_LEN;
 
 /// Size cap on the homeserver response body when fetching a backup.
 ///
 /// Bounds memory allocation against a malicious homeserver returning a huge
 /// 2xx body (the pubky SDK consumes *error* bodies in full before callers
-/// regain control, so this cap cannot cover those). The v1 record is 251
-/// bytes; this leaves ample room for future envelope versions while keeping
-/// allocation strictly bounded.
+/// regain control, so this cap cannot cover those). This accommodates the
+/// largest supported record while keeping allocation strictly bounded.
 pub const MAX_BACKUP_RESPONSE_BYTES: usize = 4096;
 
 // The size cap must always fit the largest supported record.
-const _: () = assert!(MAX_BACKUP_RECORD_LEN_V2 <= MAX_BACKUP_RESPONSE_BYTES);
+const _: () = assert!(MAX_BACKUP_RECORD_LEN <= MAX_BACKUP_RESPONSE_BYTES);
 
 /// Errors produced when parsing or decrypting a backup envelope.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BackupCryptoError {
-    /// Record does not start with the backup magic bytes (e.g. a legacy
+    /// Record does not start with the backup magic bytes (e.g. a
     /// plaintext snapshot or unrelated data). Carries the first four bytes
     /// of the record (zero-padded if shorter).
     InvalidMagic([u8; 4]),
@@ -225,11 +220,7 @@ pub fn encrypt_backup_with_key(
     generation: u64,
     state: &PubkyNoiseSessionState,
 ) -> Vec<u8> {
-    let header = envelope_header(if state.version == 1 {
-        ENVELOPE_VERSION_V1
-    } else {
-        ENVELOPE_VERSION_V2
-    });
+    let header = envelope_header();
     let aad = build_aad(&header, backup_path);
 
     let serialized = state.serialize();
@@ -310,18 +301,18 @@ pub fn decrypt_backup_with_key(
         return Err(BackupCryptoError::InvalidMagic(magic));
     }
     let version = record[4];
-    let (min_length, max_length) = match version {
-        ENVELOPE_VERSION_V1 => (BACKUP_RECORD_LEN_V1, BACKUP_RECORD_LEN_V1),
-        ENVELOPE_VERSION_V2 => (MIN_BACKUP_RECORD_LEN_V2, MAX_BACKUP_RECORD_LEN_V2),
-        _ => return Err(BackupCryptoError::UnsupportedEnvelopeVersion(version)),
-    };
+    if version != ENVELOPE_VERSION {
+        return Err(BackupCryptoError::UnsupportedEnvelopeVersion(version));
+    }
     let algorithm = record[5];
     if algorithm != ALG_XCHACHA20POLY1305 {
         return Err(BackupCryptoError::UnsupportedAlgorithm(algorithm));
     }
-    if record.len() < min_length || record.len() > max_length {
+    if !(MIN_BACKUP_RECORD_LEN..=MAX_BACKUP_RECORD_LEN).contains(&record.len()) {
         return Err(BackupCryptoError::InvalidLength {
-            expected: record.len().clamp(min_length, max_length),
+            expected: record
+                .len()
+                .clamp(MIN_BACKUP_RECORD_LEN, MAX_BACKUP_RECORD_LEN),
             actual: record.len(),
         });
     }
@@ -383,10 +374,10 @@ fn random_nonce() -> XNonce {
 }
 
 /// Builds the 6-byte envelope header, authenticated as AEAD associated data.
-fn envelope_header(version: u8) -> [u8; HEADER_LEN] {
+fn envelope_header() -> [u8; HEADER_LEN] {
     let mut header = [0u8; HEADER_LEN];
     header[..4].copy_from_slice(ENVELOPE_MAGIC);
-    header[4] = version;
+    header[4] = ENVELOPE_VERSION;
     header[5] = ALG_XCHACHA20POLY1305;
     header
 }
@@ -408,7 +399,7 @@ mod tests {
 
     fn test_state() -> PubkyNoiseSessionState {
         PubkyNoiseSessionState {
-            version: 1,
+            version: crate::serializer::SESSION_STATE_VERSION,
             phase: NoisePhase::Transport,
             pattern: HandshakePattern::PatternNN,
             initiator: true,
@@ -424,7 +415,7 @@ mod tests {
             write_counter: 9,
             read_counter: 7,
             endpoint_pubkey: [4; 32],
-            handshake_messages: Vec::new(),
+            handshake_messages: vec![vec![5; 48]],
         }
     }
 
@@ -434,15 +425,14 @@ mod tests {
     #[test]
     fn transcript_backup_roundtrip_and_authentication() {
         let mut state = test_state();
-        state.version = crate::serializer::SESSION_STATE_VERSION;
         state.pattern = HandshakePattern::PatternXX;
         state.initiator = false;
         state.counter = 3;
         for length in [32, crate::snow_crypto::PUBKY_NOISE_CIPHERTEXT_LEN] {
             state.handshake_messages = vec![vec![5; length], vec![6; length]];
             let record = encrypt_backup_with_key(&[42; 32], TEST_PATH, 7, &state);
-            assert!(record.len() <= MAX_BACKUP_RECORD_LEN_V2);
-            assert_eq!(record[4], ENVELOPE_VERSION_V2);
+            assert!(record.len() <= MAX_BACKUP_RECORD_LEN);
+            assert_eq!(record[4], ENVELOPE_VERSION);
             let (generation, bytes) =
                 decrypt_backup_with_key(&[42; 32], TEST_PATH, &record, Some(7)).unwrap();
             assert_eq!(generation, 7);
@@ -468,8 +458,8 @@ mod tests {
             );
         }
         let record = encrypt_backup_with_key(&[42; 32], TEST_PATH, 7, &state);
-        assert_eq!(record.len(), MAX_BACKUP_RECORD_LEN_V2);
-        for length in [MIN_BACKUP_RECORD_LEN_V2 - 1, MAX_BACKUP_RECORD_LEN_V2 + 1] {
+        assert_eq!(record.len(), MAX_BACKUP_RECORD_LEN);
+        for length in [MIN_BACKUP_RECORD_LEN - 1, MAX_BACKUP_RECORD_LEN + 1] {
             let mut invalid = record.clone();
             invalid.resize(length, 0);
             assert!(matches!(
@@ -489,7 +479,7 @@ mod tests {
     /// Like [`craft_record`], but binds the record to an arbitrary path.
     fn craft_record_for_path(root_secret: &[u8; 32], path: &str, plaintext: &[u8]) -> Vec<u8> {
         let key = derive_backup_key(root_secret);
-        let header = envelope_header(ENVELOPE_VERSION_V1);
+        let header = envelope_header();
         let aad = build_aad(&header, path);
         let cipher = XChaCha20Poly1305::new((&key).into());
         let nonce = random_nonce();
@@ -523,14 +513,36 @@ mod tests {
     }
 
     #[test]
-    fn record_has_exact_envelope_length() {
+    fn record_length_includes_snapshot_and_envelope() {
         let root_secret = [42u8; 32];
         let record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
 
-        assert_eq!(record.len(), BACKUP_RECORD_LEN_V1);
+        assert_eq!(
+            record.len(),
+            HEADER_LEN + NONCE_LEN + GENERATION_LEN + test_state().serialize().len() + TAG_LEN
+        );
         assert_eq!(&record[..4], ENVELOPE_MAGIC);
-        assert_eq!(record[4], ENVELOPE_VERSION_V1);
+        assert_eq!(record[4], ENVELOPE_VERSION);
         assert_eq!(record[5], ALG_XCHACHA20POLY1305);
+
+        let initial = PubkyNoiseSessionState {
+            phase: NoisePhase::HandShake,
+            counter: 0,
+            noise_step: NoiseStep::StepOne,
+            sending_nonce: 0,
+            receiving_nonce: 0,
+            write_counter: 0,
+            read_counter: 0,
+            handshake_hash: None,
+            link_id: None,
+            handshake_messages: Vec::new(),
+            ..test_state()
+        };
+        let record = encrypt_backup(&root_secret, TEST_PATH, 1, &initial);
+        assert_eq!(record.len(), MIN_BACKUP_RECORD_LEN);
+        let (_, bytes) = decrypt_backup(&root_secret, TEST_PATH, &record, None).unwrap();
+        assert_eq!(bytes.len(), MIN_SESSION_STATE_LEN);
+        assert!(PubkyNoiseSessionState::deserialize(&bytes).is_ok());
     }
 
     #[test]
@@ -541,7 +553,7 @@ mod tests {
         let record = encrypt_backup(&root_secret, TEST_PATH, 1, &state);
 
         assert!(!record
-            .windows(SESSION_STATE_V1_LEN)
+            .windows(state.serialize().len())
             .any(|w| w == state.serialize().as_slice()));
     }
 
@@ -601,7 +613,7 @@ mod tests {
         let key = derive_backup_key(&root_secret);
 
         // Same nonce and ciphertext, but decrypt against a modified header.
-        let mut other_header = envelope_header(ENVELOPE_VERSION_V1);
+        let mut other_header = envelope_header();
         other_header[5] = 2;
         let other_aad = build_aad(&other_header, TEST_PATH);
         let cipher = XChaCha20Poly1305::new((&key).into());
@@ -640,7 +652,7 @@ mod tests {
         let mut plaintext = 9u64.to_be_bytes().to_vec();
         plaintext.extend_from_slice(&test_state().serialize());
         let foreign = craft_record_for_path(&root_secret, "/pub/other/backup", &plaintext);
-        assert_eq!(foreign.len(), BACKUP_RECORD_LEN_V1);
+        assert_eq!(foreign.len(), record.len());
         assert_eq!(
             decrypt_backup(&root_secret, TEST_PATH, &foreign, None),
             Err(BackupCryptoError::DecryptError)
@@ -648,12 +660,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_plaintext_snapshot_is_classified() {
+    fn plaintext_snapshot_is_rejected() {
         let root_secret = [42u8; 32];
-        let legacy = test_state().serialize();
+        let plaintext = test_state().serialize();
 
         assert_eq!(
-            decrypt_backup(&root_secret, TEST_PATH, &legacy, None),
+            decrypt_backup(&root_secret, TEST_PATH, &plaintext, None),
             Err(BackupCryptoError::InvalidMagic([1, 1, 1, 1]))
         );
     }
@@ -679,11 +691,11 @@ mod tests {
     fn unsupported_envelope_version_is_classified() {
         let root_secret = [42u8; 32];
         let mut record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
-        record[4] = 3;
+        record[4] = 2;
 
         assert_eq!(
             decrypt_backup(&root_secret, TEST_PATH, &record, None),
-            Err(BackupCryptoError::UnsupportedEnvelopeVersion(3))
+            Err(BackupCryptoError::UnsupportedEnvelopeVersion(2))
         );
     }
 
@@ -700,33 +712,26 @@ mod tests {
     }
 
     #[test]
-    fn exact_minus_one_length_is_rejected() {
+    fn truncated_record_fails_authentication() {
         let root_secret = [42u8; 32];
         let record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         let truncated = &record[..record.len() - 1];
 
         assert_eq!(
             decrypt_backup(&root_secret, TEST_PATH, truncated, None),
-            Err(BackupCryptoError::InvalidLength {
-                expected: BACKUP_RECORD_LEN_V1,
-                actual: BACKUP_RECORD_LEN_V1 - 1,
-            })
+            Err(BackupCryptoError::DecryptError)
         );
     }
 
     #[test]
-    fn exact_plus_one_length_is_rejected() {
+    fn appended_record_fails_authentication() {
         let root_secret = [42u8; 32];
         let mut record = encrypt_backup(&root_secret, TEST_PATH, 1, &test_state());
         record.push(0);
-        let actual = record.len();
 
         assert_eq!(
             decrypt_backup(&root_secret, TEST_PATH, &record, None),
-            Err(BackupCryptoError::InvalidLength {
-                expected: BACKUP_RECORD_LEN_V1,
-                actual,
-            })
+            Err(BackupCryptoError::DecryptError)
         );
     }
 
@@ -740,7 +745,7 @@ mod tests {
         assert_eq!(
             decrypt_backup(&root_secret, TEST_PATH, &record, None),
             Err(BackupCryptoError::InvalidLength {
-                expected: BACKUP_RECORD_LEN_V1,
+                expected: MAX_BACKUP_RECORD_LEN,
                 actual,
             })
         );
@@ -748,23 +753,18 @@ mod tests {
 
     #[test]
     fn trailing_plaintext_is_rejected() {
-        // A valid 197-byte state plus trailing bytes inside the authenticated
-        // plaintext must not be accepted: the record length no longer matches
-        // the exact v1 contract.
+        // The envelope authenticates bytes; the state parser rejects trailing data.
         let root_secret = [42u8; 32];
         let state = test_state();
         let mut plaintext = 1u64.to_be_bytes().to_vec();
         plaintext.extend_from_slice(&state.serialize());
         plaintext.push(0);
         let record = craft_record(&root_secret, &plaintext);
-        let actual = record.len();
+        let (_, bytes) = decrypt_backup(&root_secret, TEST_PATH, &record, None).unwrap();
 
         assert_eq!(
-            decrypt_backup(&root_secret, TEST_PATH, &record, None),
-            Err(BackupCryptoError::InvalidLength {
-                expected: BACKUP_RECORD_LEN_V1,
-                actual,
-            })
+            PubkyNoiseSessionState::deserialize(&bytes).unwrap_err(),
+            crate::serializer::SerializerError::TrailingBytes
         );
     }
 

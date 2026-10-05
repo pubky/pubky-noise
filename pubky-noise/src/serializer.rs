@@ -10,12 +10,12 @@ use crate::snow_crypto::{
 };
 
 /// Current serialization format version.
-pub const SESSION_STATE_VERSION: u8 = 2;
-/// Exact length in bytes of a serialized v1 session state.
-pub const SESSION_STATE_V1_LEN: usize = 197;
+pub const SESSION_STATE_VERSION: u8 = 1;
+/// Minimum serialized state size, before any incoming handshake messages.
+pub const MIN_SESSION_STATE_LEN: usize = 198;
 /// Maximum serialized state size, including the two incoming XX handshake messages.
 pub const MAX_SESSION_STATE_LEN: usize =
-    SESSION_STATE_V1_LEN + 1 + 2 * (2 + PUBKY_NOISE_CIPHERTEXT_LEN);
+    MIN_SESSION_STATE_LEN + 2 * (2 + PUBKY_NOISE_CIPHERTEXT_LEN);
 /// Exhausted nonce cursor sentinel.
 const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
 
@@ -67,8 +67,7 @@ pub struct PubkyNoiseSessionState {
     /// The remote peer's public key (endpoint).
     pub endpoint_pubkey: [u8; 32],
     /// Incoming handshake messages, in read order, without packet framing or padding.
-    /// Version 2 retains every completed read so restoration needs no downloads.
-    /// Version 1 snapshots have an empty list and fetch their transcript on restore.
+    /// Retains every completed read so restoration needs no downloads.
     pub handshake_messages: Vec<Vec<u8>>,
 }
 
@@ -122,7 +121,7 @@ impl PubkyNoiseSessionState {
     /// Returns [`SerializerError`] for an unsupported version or handshake pattern,
     /// an out-of-range sub-step, or inconsistent counters.
     pub fn next_handshake_read_slot(&self) -> Result<Option<u32>, SerializerError> {
-        if !matches!(self.version, 1 | SESSION_STATE_VERSION) {
+        if self.version != SESSION_STATE_VERSION {
             return Err(SerializerError::UnsupportedVersion(self.version));
         }
         validate_counters(
@@ -175,15 +174,11 @@ impl PubkyNoiseSessionState {
 
     pub(crate) fn validate(&self) -> Result<(), SerializerError> {
         self.next_handshake_read_slot()?;
-        let expected = if self.version == 1 {
-            0
-        } else {
-            full_handshake_actions(self.pattern, self.initiator)
-                .into_iter()
-                .take(self.counter as usize)
-                .filter(|action| *action == HandshakeAction::Read)
-                .count()
-        };
+        let expected = full_handshake_actions(self.pattern, self.initiator)
+            .into_iter()
+            .take(self.counter as usize)
+            .filter(|action| *action == HandshakeAction::Read)
+            .count();
         if self.handshake_messages.len() != expected
             || self
                 .handshake_messages
@@ -218,22 +213,17 @@ impl PubkyNoiseSessionState {
     /// [157..161] write_counter (u32 big-endian)
     /// [161..165] read_counter (u32 big-endian)
     /// [165..197] endpoint_pubkey (32 bytes)
-    /// [197]     incoming handshake message count (u8, version 2 only)
+    /// [197]     incoming handshake message count (u8)
     /// [198..]   repeated: message length (u16 big-endian), message bytes
     /// ```
-    /// Version 1 is exactly 197 bytes. Version 2 appends the completed incoming
-    /// handshake messages, bounded by [`MAX_SESSION_STATE_LEN`].
+    /// The size is bounded by [`MIN_SESSION_STATE_LEN`] and [`MAX_SESSION_STATE_LEN`].
     pub fn serialize(&self) -> Vec<u8> {
-        let transcript_len = if self.version == SESSION_STATE_VERSION {
-            1 + self
-                .handshake_messages
-                .iter()
-                .map(|message| 2 + message.len())
-                .sum::<usize>()
-        } else {
-            0
-        };
-        let mut buf = Vec::with_capacity(SESSION_STATE_V1_LEN + transcript_len);
+        let transcript_len = self
+            .handshake_messages
+            .iter()
+            .map(|message| 2 + message.len())
+            .sum::<usize>();
+        let mut buf = Vec::with_capacity(MIN_SESSION_STATE_LEN + transcript_len);
 
         // [0] version
         buf.push(self.version);
@@ -304,33 +294,28 @@ impl PubkyNoiseSessionState {
         // [165..197] endpoint_pubkey
         buf.extend_from_slice(&self.endpoint_pubkey);
 
-        debug_assert_eq!(buf.len(), SESSION_STATE_V1_LEN);
-        if self.version == SESSION_STATE_VERSION {
-            buf.push(self.handshake_messages.len() as u8);
-            for message in &self.handshake_messages {
-                buf.extend_from_slice(&(message.len() as u16).to_be_bytes());
-                buf.extend_from_slice(message);
-            }
+        buf.push(self.handshake_messages.len() as u8);
+        debug_assert_eq!(buf.len(), MIN_SESSION_STATE_LEN);
+        for message in &self.handshake_messages {
+            buf.extend_from_slice(&(message.len() as u16).to_be_bytes());
+            buf.extend_from_slice(message);
         }
         buf
     }
 
     /// Deserialize from the compact binary format.
     ///
-    /// Accepts versions 1 and 2, rejecting truncated, oversized, or trailing data.
+    /// Rejects unsupported versions and truncated, oversized, or trailing data.
     pub fn deserialize(data: &[u8]) -> Result<Self, SerializerError> {
-        if data.len() < SESSION_STATE_V1_LEN {
+        if data.len() < MIN_SESSION_STATE_LEN {
             return Err(SerializerError::TooShort);
         }
 
         let version = data[0];
-        if !matches!(version, 1 | SESSION_STATE_VERSION) {
+        if version != SESSION_STATE_VERSION {
             return Err(SerializerError::UnsupportedVersion(version));
         }
 
-        if version == 1 && data.len() != SESSION_STATE_V1_LEN {
-            return Err(SerializerError::TrailingBytes);
-        }
         if data.len() > MAX_SESSION_STATE_LEN {
             return Err(SerializerError::InvalidTranscript);
         }
@@ -403,29 +388,25 @@ impl PubkyNoiseSessionState {
         endpoint_pubkey.copy_from_slice(&data[165..197]);
 
         let mut handshake_messages = Vec::new();
-        if version == SESSION_STATE_VERSION {
-            let count = *data
-                .get(SESSION_STATE_V1_LEN)
-                .ok_or(SerializerError::TooShort)?;
-            if count > 2 {
+        let count = data[MIN_SESSION_STATE_LEN - 1];
+        if count > 2 {
+            return Err(SerializerError::InvalidTranscript);
+        }
+        let mut remaining = &data[MIN_SESSION_STATE_LEN..];
+        for _ in 0..count {
+            let length = remaining.get(..2).ok_or(SerializerError::TooShort)?;
+            let length = u16::from_be_bytes([length[0], length[1]]) as usize;
+            if length == 0 || length > PUBKY_NOISE_CIPHERTEXT_LEN {
                 return Err(SerializerError::InvalidTranscript);
             }
-            let mut remaining = &data[SESSION_STATE_V1_LEN + 1..];
-            for _ in 0..count {
-                let length = remaining.get(..2).ok_or(SerializerError::TooShort)?;
-                let length = u16::from_be_bytes([length[0], length[1]]) as usize;
-                if length == 0 || length > PUBKY_NOISE_CIPHERTEXT_LEN {
-                    return Err(SerializerError::InvalidTranscript);
-                }
-                let message = remaining
-                    .get(2..2 + length)
-                    .ok_or(SerializerError::TooShort)?;
-                handshake_messages.push(message.to_vec());
-                remaining = &remaining[2 + length..];
-            }
-            if !remaining.is_empty() {
-                return Err(SerializerError::TrailingBytes);
-            }
+            let message = remaining
+                .get(2..2 + length)
+                .ok_or(SerializerError::TooShort)?;
+            handshake_messages.push(message.to_vec());
+            remaining = &remaining[2 + length..];
+        }
+        if !remaining.is_empty() {
+            return Err(SerializerError::TrailingBytes);
         }
 
         let state = PubkyNoiseSessionState {
@@ -652,7 +633,7 @@ mod tests {
         let state = transport_state();
         let bytes = state.serialize();
 
-        assert_eq!(bytes.len(), SESSION_STATE_V1_LEN + 1 + 2 + 48);
+        assert_eq!(bytes.len(), MIN_SESSION_STATE_LEN + 2 + 48);
 
         let restored = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
         assert_eq!(restored.version, SESSION_STATE_VERSION);
@@ -679,12 +660,12 @@ mod tests {
     fn transcript_serialization_rejects_invalid_lengths_and_counts() {
         let state = transport_state();
         let bytes = state.serialize();
-        for end in SESSION_STATE_V1_LEN..bytes.len() {
+        for end in 0..bytes.len() {
             assert!(PubkyNoiseSessionState::deserialize(&bytes[..end]).is_err());
         }
         for count in [0, 2, u8::MAX] {
             let mut malformed = bytes.clone();
-            malformed[SESSION_STATE_V1_LEN] = count;
+            malformed[MIN_SESSION_STATE_LEN - 1] = count;
             assert!(PubkyNoiseSessionState::deserialize(&malformed).is_err());
         }
         for length in [0u16, PUBKY_NOISE_CIPHERTEXT_LEN as u16 + 1, u16::MAX] {
@@ -704,17 +685,15 @@ mod tests {
     }
 
     #[test]
-    fn v1_roundtrip_preserves_format_without_transcript() {
-        let mut state = transport_state();
-        state.version = 1;
-        state.handshake_messages.clear();
-        let bytes = state.serialize();
-        assert_eq!(bytes.len(), SESSION_STATE_V1_LEN);
-        assert_eq!(bytes[0], 1);
-        let restored = PubkyNoiseSessionState::deserialize(&bytes).unwrap();
-        assert_eq!(restored.serialize(), bytes);
-        assert!(restored.handshake_messages.is_empty());
-        assert_eq!(restored.next_handshake_read_slot(), Ok(None));
+    fn serialization_rejects_unsupported_versions() {
+        for version in [0, 2, u8::MAX] {
+            let mut state = transport_state();
+            state.version = version;
+            assert_eq!(
+                PubkyNoiseSessionState::deserialize(&state.serialize()).unwrap_err(),
+                SerializerError::UnsupportedVersion(version)
+            );
+        }
     }
 
     #[test]
