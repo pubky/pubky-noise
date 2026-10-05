@@ -53,7 +53,7 @@ let mut initiator = PubkyNoiseEncryptor::new(
 
 // 3. Run the handshake (polling-safe, call repeatedly)
 loop {
-    match initiator.handle_handshake().await.unwrap() {
+    match initiator.handle_handshake().await? {
         HandshakeResult::Pending => { /* poll again later */ },
         HandshakeResult::Terminal => break,
     }
@@ -78,6 +78,11 @@ let messages = initiator.receive_message().await?;
 // 6. Clean up
 initiator.close();
 ```
+
+When polling a peer packet, only HTTP 404/410 is treated as absent (`Pending`).
+Other GET or response-body failures return `HomeserverResponseError`; retry the same encryptor
+after the read failure is resolved. The quick start propagates errors to the
+caller; write failures require the [snapshot recovery](#code-example) described below.
 
 ## Architecture
 
@@ -622,7 +627,7 @@ does not detect or republish lost data.
 | `UnknownNoisePattern` | Invalid pattern string | Use a supported pattern: "NN", "XX" |
 | `SnowNoiseBuildError` | Noise stack failed to initialize | Check key material and pattern compatibility |
 | `BadLengthCiphertext` | Received packet or authenticated transport frame is malformed | Discard message, check sender |
-| `HomeserverResponseError` | Failed to parse homeserver response | Retry |
+| `HomeserverResponseError` | Homeserver GET or response-body read failed | Retry the handshake read without restoring; check connectivity, authorization, and server status |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
 | `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
