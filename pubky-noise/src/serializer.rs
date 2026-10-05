@@ -4,7 +4,9 @@
 //! `PubkyNoiseEncryptor` session, whether it was interrupted during the handshake
 //! or is already in transport mode.
 
-use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
+use crate::snow_crypto::{
+    resolve_pattern, HandshakeAction, HandshakePattern, NoisePhase, NoiseStep,
+};
 
 /// Current serialization format version.
 pub const SESSION_STATE_VERSION: u8 = 1;
@@ -93,6 +95,71 @@ impl std::fmt::Debug for PubkyNoiseSessionState {
 }
 
 impl PubkyNoiseSessionState {
+    /// Return the next handshake read slot, without restoring or advancing the session.
+    ///
+    /// `Some(slot)` identifies the remote resource at
+    /// `{endpoint_pubkey}/{read_path}/{slot}`, using the peer's encoded public key
+    /// and the same read path as the session configuration. `None` means the next
+    /// action is a write, control action, step completion, or transport operation:
+    /// callers must continue normal advancement, not treat the session as idle.
+    ///
+    /// This is an advisory scheduling probe with no network I/O. It checks snapshot
+    /// version and cursor consistency, not authenticity or transcript validity.
+    /// Message existence does not authorize advancement. Restore, authentication,
+    /// recovery, and advancement must still run under the caller's existing leases.
+    ///
+    /// # Errors
+    /// Returns [`SerializerError`] for an unsupported version or handshake pattern,
+    /// an out-of-range sub-step, or inconsistent counters.
+    pub fn next_handshake_read_slot(&self) -> Result<Option<u32>, SerializerError> {
+        if self.version != SESSION_STATE_VERSION {
+            return Err(SerializerError::UnsupportedVersion(self.version));
+        }
+        validate_counters(
+            self.phase,
+            self.counter,
+            self.write_counter,
+            self.read_counter,
+            self.sending_nonce,
+            self.receiving_nonce,
+        )?;
+        if self.phase == NoisePhase::Transport {
+            return Ok(None);
+        }
+        if !matches!(
+            self.pattern,
+            HandshakePattern::PatternNN | HandshakePattern::PatternXX
+        ) {
+            return Err(SerializerError::InvalidField(
+                "pattern",
+                self.pattern.to_u8(),
+            ));
+        }
+
+        let actions = resolve_pattern(self.pattern, self.noise_step, self.initiator);
+        let sub_step = usize::from(self.sub_step_index);
+        if sub_step > actions.len() {
+            return Err(SerializerError::InvalidField(
+                "sub_step_index",
+                self.sub_step_index,
+            ));
+        }
+        let next_is_read = actions.get(sub_step) == Some(&HandshakeAction::Read);
+        let preceding_actions = [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final]
+            .into_iter()
+            .take_while(|step| *step != self.noise_step)
+            .flat_map(|step| resolve_pattern(self.pattern, step, self.initiator));
+        let completed_messages = preceding_actions
+            .chain(actions.into_iter().take(sub_step))
+            .filter(|action| matches!(action, HandshakeAction::Read | HandshakeAction::Write))
+            .count();
+        if self.counter as usize != completed_messages {
+            return Err(SerializerError::InvalidCounter);
+        }
+
+        Ok(next_is_read.then_some(self.counter))
+    }
+
     /// Serialize to a compact binary format.
     ///
     /// Layout:
@@ -384,6 +451,88 @@ mod tests {
             write_counter: 9,
             read_counter: 7,
             endpoint_pubkey: [4; 32],
+        }
+    }
+
+    fn handshake_state() -> PubkyNoiseSessionState {
+        PubkyNoiseSessionState {
+            phase: NoisePhase::HandShake,
+            initiator: false,
+            counter: 0,
+            noise_step: NoiseStep::StepOne,
+            sending_nonce: 0,
+            receiving_nonce: 0,
+            write_counter: 0,
+            read_counter: 0,
+            handshake_hash: None,
+            link_id: None,
+            ..transport_state()
+        }
+    }
+
+    #[test]
+    fn handshake_read_slot_does_not_skip_control_or_completed_steps() {
+        for pattern in [HandshakePattern::PatternNN, HandshakePattern::PatternXX] {
+            for (initiator, step, sub_step, counter) in [
+                (true, NoiseStep::StepOne, 1, 1),
+                (true, NoiseStep::StepOne, 2, 1),
+                (false, NoiseStep::StepOne, 1, 1),
+                (false, NoiseStep::StepOne, 2, 2),
+            ] {
+                let mut state = handshake_state();
+                state.pattern = pattern;
+                state.initiator = initiator;
+                state.noise_step = step;
+                state.sub_step_index = sub_step;
+                state.counter = counter;
+                assert_eq!(state.next_handshake_read_slot(), Ok(None));
+            }
+        }
+    }
+
+    #[test]
+    fn handshake_read_slot_rejects_malformed_cursors_and_unsupported_patterns() {
+        for (mutate, expected) in [
+            (
+                (|s: &mut PubkyNoiseSessionState| s.version = 0) as fn(&mut PubkyNoiseSessionState),
+                SerializerError::UnsupportedVersion(0),
+            ),
+            (
+                |s| s.sub_step_index = u8::MAX,
+                SerializerError::InvalidField("sub_step_index", u8::MAX),
+            ),
+            (|s| s.counter = 1, SerializerError::InvalidCounter),
+            (|s| s.counter = u32::MAX, SerializerError::CounterOverflow),
+            (
+                |s| s.counter = u32::MAX - 1,
+                SerializerError::InvalidCounter,
+            ),
+            (
+                |s| s.noise_step = NoiseStep::StepTwo,
+                SerializerError::InvalidCounter,
+            ),
+            (|s| s.sending_nonce = 1, SerializerError::InvalidCounter),
+            (|s| s.receiving_nonce = 1, SerializerError::InvalidCounter),
+            (|s| s.write_counter = 1, SerializerError::InvalidCounter),
+            (|s| s.read_counter = 1, SerializerError::InvalidCounter),
+        ] {
+            let mut state = handshake_state();
+            mutate(&mut state);
+            assert_eq!(state.next_handshake_read_slot(), Err(expected));
+        }
+        for pattern in [
+            HandshakePattern::PatternN,
+            HandshakePattern::PatternIK,
+            HandshakePattern::PatternNK,
+            #[cfg(feature = "test-utils")]
+            HandshakePattern::TestOnlyPatternAA,
+        ] {
+            let mut state = handshake_state();
+            state.pattern = pattern;
+            assert_eq!(
+                state.next_handshake_read_slot(),
+                Err(SerializerError::InvalidField("pattern", pattern.to_u8()))
+            );
         }
     }
 

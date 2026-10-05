@@ -252,6 +252,76 @@ async fn setup_encryptors_with_tampering(
     pair
 }
 
+fn assert_handshake_read_slot(encryptor: &PubkyNoiseEncryptor, expected: Option<u32>) {
+    let snapshot = encryptor.snapshot().unwrap();
+    let before = snapshot.serialize();
+    assert_eq!(snapshot.next_handshake_read_slot(), Ok(expected));
+    assert_eq!(snapshot.next_handshake_read_slot(), Ok(expected));
+    assert_eq!(snapshot.serialize(), before);
+    let saved = PubkyNoiseSessionState::deserialize(&before).unwrap();
+    assert_eq!(saved.next_handshake_read_slot(), Ok(expected));
+}
+
+#[tokio::test]
+async fn snow_test_handshake_read_slot_from_snapshots() {
+    let testnet = build_testnet().await;
+    for pattern in ["NN", "XX"] {
+        let mut pair = setup_encryptors(&testnet, pattern).await;
+        assert_handshake_read_slot(&pair.initiator, None);
+        assert_handshake_read_slot(&pair.responder, Some(0));
+
+        pair.responder.handle_handshake().await.unwrap();
+        assert_handshake_read_slot(&pair.responder, Some(0));
+        pair.initiator.handle_handshake().await.unwrap();
+        assert_handshake_read_slot(&pair.initiator, Some(1));
+
+        // A read followed by a failed write leaves a partial step, not an idle read.
+        pair.responder.test_enable_write_failure();
+        assert_eq!(
+            pair.responder.handle_handshake().await,
+            Err(PubkyNoiseError::HomeserverWriteError)
+        );
+        assert_handshake_read_slot(&pair.responder, None);
+        pair.responder = PubkyNoiseEncryptor::restore(
+            pair.responder_config.clone(),
+            pair.responder.last_good_snapshot().unwrap().clone(),
+            pair.initiator_public_key.clone(),
+        )
+        .await
+        .unwrap();
+        assert_handshake_read_slot(&pair.responder, Some(0));
+        pair.responder.handle_handshake().await.unwrap();
+        assert_handshake_read_slot(&pair.responder, (pattern == "XX").then_some(2));
+
+        if pattern == "XX" {
+            pair.initiator.test_enable_write_failure();
+            assert_eq!(
+                pair.initiator.handle_handshake().await,
+                Err(PubkyNoiseError::HomeserverWriteError)
+            );
+            assert_handshake_read_slot(&pair.initiator, None);
+            pair.initiator = PubkyNoiseEncryptor::restore(
+                pair.initiator_config.clone(),
+                pair.initiator.last_good_snapshot().unwrap().clone(),
+                pair.responder_public_key.clone(),
+            )
+            .await
+            .unwrap();
+            assert_handshake_read_slot(&pair.initiator, Some(1));
+        }
+        pair.initiator.handle_handshake().await.unwrap();
+        assert_handshake_read_slot(&pair.initiator, None);
+        pair.responder.handle_handshake().await.unwrap();
+        assert_handshake_read_slot(&pair.responder, None);
+
+        for encryptor in [&mut pair.initiator, &mut pair.responder] {
+            assert!(encryptor.is_handshake_complete());
+            encryptor.transition_transport().unwrap();
+            assert_handshake_read_slot(encryptor, None);
+        }
+    }
+}
+
 /// Complete an NN handshake and transition both sides to transport.
 async fn complete_nn_handshake(pair: &mut EncryptorPair) {
     let _ = pair.initiator.handle_handshake().await;
