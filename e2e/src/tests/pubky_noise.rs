@@ -719,6 +719,201 @@ async fn snow_test_restore_with_unavailable_homeserver() {
 }
 
 #[tokio::test]
+async fn snow_test_prepared_handshake_matches_http_steps() {
+    let testnet = build_testnet().await;
+    for pattern in ["NN", "XX"] {
+        let mut pair = setup_encryptors(&testnet, pattern).await;
+        for step in 0..3 {
+            for (initiator, encryptor, config, peer) in [
+                (
+                    true,
+                    &mut pair.initiator,
+                    &pair.initiator_config,
+                    &pair.responder_public_key,
+                ),
+                (
+                    false,
+                    &mut pair.responder,
+                    &pair.responder_config,
+                    &pair.initiator_public_key,
+                ),
+            ] {
+                let before = encryptor.snapshot().unwrap();
+                let incoming = if let Some(slot) = before.next_handshake_read_slot().unwrap() {
+                    Some(
+                        config
+                            .outbox_client
+                            .public_storage()
+                            .get(format!("{peer}/{}/{slot}", config.read_path))
+                            .await
+                            .unwrap()
+                            .bytes()
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let restored = PubkyNoiseEncryptor::restore(config.clone(), before, peer.clone())
+                    .await
+                    .unwrap();
+                let prepared = restored
+                    .prepare_handshake_step(incoming.as_deref())
+                    .unwrap();
+                encryptor.handle_handshake().await.unwrap();
+
+                let expected_counter = match (pattern, initiator, step) {
+                    (_, true, 0) => 1,
+                    ("XX", _, 1 | 2) => 3,
+                    _ => 2,
+                };
+                assert_eq!(prepared.resulting_session_state().counter, expected_counter);
+                assert_eq!(
+                    prepared.resulting_session_state().serialize(),
+                    encryptor.snapshot().unwrap().serialize()
+                );
+                assert_eq!(
+                    prepared.is_handshake_complete(),
+                    encryptor.is_handshake_complete()
+                );
+                assert_eq!(
+                    prepared.remote_static_public_key(),
+                    encryptor.remote_static_public_key()
+                );
+                assert_eq!(
+                    prepared.resulting_session_state().phase,
+                    NoisePhase::HandShake
+                );
+
+                let has_output = step == 0 || (pattern == "XX" && initiator && step == 1);
+                assert_eq!(prepared.packet().is_some(), has_output);
+                assert_eq!(prepared.destination_path().is_some(), has_output);
+                if let (Some(path), Some(packet)) = (prepared.destination_path(), prepared.packet())
+                {
+                    assert_eq!(
+                        path,
+                        format!("{}/{}", config.write_path, expected_counter - 1)
+                    );
+                    assert_eq!(packet.len(), PUBKY_NOISE_CIPHERTEXT_LEN + 2);
+                    let published = config
+                        .local_session
+                        .storage()
+                        .get(path)
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap();
+                    assert_eq!(packet, published.as_ref());
+                    if pattern == "XX" && initiator && step == 1 {
+                        assert!(prepared.is_handshake_complete());
+                    }
+                }
+
+                let mut resumed = PubkyNoiseEncryptor::restore(
+                    config.clone(),
+                    prepared.resulting_session_state().clone(),
+                    peer.clone(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    resumed.snapshot().unwrap().serialize(),
+                    prepared.resulting_session_state().serialize()
+                );
+                if prepared.is_handshake_complete() {
+                    let mut ordinary = PubkyNoiseEncryptor::restore(
+                        config.clone(),
+                        encryptor.snapshot().unwrap(),
+                        peer.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        resumed.transition_transport().unwrap(),
+                        ordinary.transition_transport().unwrap()
+                    );
+                    assert_eq!(
+                        resumed.prepare_handshake_step(None).unwrap_err(),
+                        PubkyNoiseError::OtherError
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn snow_test_prepared_handshake_rejects_invalid_input() {
+    let testnet = build_testnet().await;
+    for pattern in ["NN", "XX"] {
+        let mut pair = setup_encryptors(&testnet, pattern).await;
+        let initial = PubkyNoiseEncryptor::restore(
+            pair.initiator_config.clone(),
+            pair.initiator.snapshot().unwrap(),
+            pair.responder_public_key.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            initial.prepare_handshake_step(Some(&[])).unwrap_err(),
+            PubkyNoiseError::BadLengthCiphertext
+        );
+
+        pair.initiator.handle_handshake().await.unwrap();
+        pair.responder.handle_handshake().await.unwrap();
+        let snapshot = pair.initiator.snapshot().unwrap();
+        let mut tampered = pair
+            .initiator_config
+            .outbox_client
+            .public_storage()
+            .get(format!(
+                "{}/{}/1",
+                pair.responder_public_key, pair.initiator_config.read_path
+            ))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec();
+        let message_len = u16::from_be_bytes([tampered[0], tampered[1]]) as usize;
+        tampered[message_len + 1] ^= 1;
+
+        for (input, error) in [
+            (None, PubkyNoiseError::BadLengthCiphertext),
+            (Some(vec![0]), PubkyNoiseError::BadLengthCiphertext),
+            (Some(vec![0, 2, 42]), PubkyNoiseError::BadLengthCiphertext),
+            (
+                Some(vec![0; PUBKY_NOISE_CIPHERTEXT_LEN + 3]),
+                PubkyNoiseError::BadLengthCiphertext,
+            ),
+            (Some(tampered), PubkyNoiseError::DecryptionError),
+        ] {
+            let restored = PubkyNoiseEncryptor::restore(
+                pair.initiator_config.clone(),
+                snapshot.clone(),
+                pair.responder_public_key.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                restored
+                    .prepare_handshake_step(input.as_deref())
+                    .unwrap_err(),
+                error
+            );
+        }
+        assert_eq!(
+            pair.initiator.snapshot().unwrap().serialize(),
+            snapshot.serialize()
+        );
+        pair.initiator.handle_handshake().await.unwrap();
+        assert!(pair.initiator.is_handshake_complete());
+    }
+}
+
+#[tokio::test]
 async fn snow_test_cached_handshake_restore() {
     let testnet = build_testnet().await;
     for pattern in ["NN", "XX"] {
