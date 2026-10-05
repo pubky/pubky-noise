@@ -5,7 +5,8 @@
 //! or is already in transport mode.
 
 use crate::snow_crypto::{
-    resolve_pattern, HandshakeAction, HandshakePattern, NoisePhase, NoiseStep,
+    full_handshake_actions, resolve_pattern, HandshakeAction, HandshakePattern, NoisePhase,
+    NoiseStep,
 };
 
 /// Current serialization format version.
@@ -123,9 +124,6 @@ impl PubkyNoiseSessionState {
             self.sending_nonce,
             self.receiving_nonce,
         )?;
-        if self.phase == NoisePhase::Transport {
-            return Ok(None);
-        }
         if !matches!(
             self.pattern,
             HandshakePattern::PatternNN | HandshakePattern::PatternXX
@@ -134,6 +132,12 @@ impl PubkyNoiseSessionState {
                 "pattern",
                 self.pattern.to_u8(),
             ));
+        }
+        if self.phase == NoisePhase::Transport {
+            if self.counter as usize != full_handshake_actions(self.pattern, self.initiator).len() {
+                return Err(SerializerError::InvalidCounter);
+            }
+            return Ok(None);
         }
 
         let actions = resolve_pattern(self.pattern, self.noise_step, self.initiator);
@@ -527,12 +531,43 @@ mod tests {
             #[cfg(feature = "test-utils")]
             HandshakePattern::TestOnlyPatternAA,
         ] {
-            let mut state = handshake_state();
-            state.pattern = pattern;
-            assert_eq!(
-                state.next_handshake_read_slot(),
-                Err(SerializerError::InvalidField("pattern", pattern.to_u8()))
-            );
+            for mut state in [handshake_state(), transport_state()] {
+                state.pattern = pattern;
+                assert_eq!(
+                    state.next_handshake_read_slot(),
+                    Err(SerializerError::InvalidField("pattern", pattern.to_u8()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn handshake_read_slot_validates_transport_base() {
+        for (pattern, completed_messages) in [
+            (HandshakePattern::PatternNN, 2),
+            (HandshakePattern::PatternXX, 3),
+        ] {
+            for initiator in [true, false] {
+                for counter in [
+                    0,
+                    completed_messages - 1,
+                    completed_messages,
+                    completed_messages + 1,
+                ] {
+                    let state = PubkyNoiseSessionState {
+                        pattern,
+                        initiator,
+                        counter,
+                        ..transport_state()
+                    };
+                    let expected = if counter == completed_messages {
+                        Ok(None)
+                    } else {
+                        Err(SerializerError::InvalidCounter)
+                    };
+                    assert_eq!(state.next_handshake_read_slot(), expected);
+                }
+            }
         }
     }
 
