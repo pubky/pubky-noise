@@ -268,6 +268,14 @@ Use `PubkyNoiseConfig::new_with_paths()` to supply separate write/read paths.
 
 Sessions can be snapshotted, serialized, and restored to recover from crashes or write failures.
 
+If `restore()` returns `HomeserverResponseError`, retain the original snapshot and
+retry after the cause is resolved. Restore uses this error for transport, routing,
+server-response, and response-body download failures, except HTTP 404/410. This
+does not bypass TLS checks, retry internally, or write remote state. Missing
+transcripts (404/410), invalid request/configuration errors, and cryptographic
+replay failures remain `RestoreBackupReplayError`. Malformed packet lengths remain
+`BadLengthCiphertext`; transcript hash mismatches remain `RestoreBackupHashMismatch`.
+
 ### Snapshot Format
 
 `PubkyNoiseSessionState` serializes to a compact 197-byte binary format:

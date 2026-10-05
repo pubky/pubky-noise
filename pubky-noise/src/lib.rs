@@ -103,6 +103,21 @@ fn map_context_overflow(err: ContextError) -> PubkyNoiseError {
     }
 }
 
+fn map_restore_download_error(error: Error) -> PubkyNoiseError {
+    match error {
+        Error::Request(RequestError::Server { status, .. })
+            if status == pubky::StatusCode::NOT_FOUND || status == pubky::StatusCode::GONE =>
+        {
+            PubkyNoiseError::RestoreBackupReplayError
+        }
+        Error::Request(RequestError::Validation { .. })
+        | Error::Parse(_)
+        | Error::Build(_)
+        | Error::Authentication(_) => PubkyNoiseError::RestoreBackupReplayError,
+        Error::Request(_) | Error::Pkarr(_) => PubkyNoiseError::HomeserverResponseError,
+    }
+}
+
 fn map_backup_error(err: backup_crypto::BackupCryptoError) -> PubkyNoiseError {
     match err {
         backup_crypto::BackupCryptoError::Rollback { .. } => {
@@ -1392,7 +1407,14 @@ impl PubkyNoiseEncryptor {
     ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
-    /// - Returns [`PubkyNoiseError::RestoreBackupReplayError`] if handshake replay fails.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] for transport, routing,
+    ///   server-response, or response-body download failures, except HTTP 404/410.
+    ///   Retain the original snapshot and retry after the cause is resolved; this
+    ///   method does not retry internally or write remote state.
+    /// - Returns [`PubkyNoiseError::RestoreBackupReplayError`] for missing transcripts
+    ///   (HTTP 404/410), invalid request/configuration errors, or failed cryptographic
+    ///   replay.
+    /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] for malformed packet lengths.
     /// - Returns [`PubkyNoiseError::RestoreBackupHashMismatch`] if the replayed handshake
     ///   produces a different hash than the saved handshake hash or LinkId, or
     ///   neither is present in a transport snapshot.
@@ -1476,16 +1498,13 @@ impl PubkyNoiseEncryptor {
                         .public_storage()
                         .get(formatted_path)
                         .await
-                        .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
+                        .map_err(map_restore_download_error)?;
 
-                    if !response.status().is_success() {
-                        return Err(PubkyNoiseError::RestoreBackupReplayError);
-                    }
-
+                    // Body transfer failure is distinct from a complete but invalid packet.
                     let ciphertext = response
                         .bytes()
                         .await
-                        .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
+                        .map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
 
                     let (mut message, len) = decode_handshake_packet(&ciphertext)?;
                     let mut payload = [0; PUBKY_NOISE_MSG_LEN];
@@ -1627,6 +1646,62 @@ impl std::fmt::Debug for PubkyNoiseConfig {
 mod tests {
     use super::*;
     use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
+
+    #[test]
+    fn restore_download_errors_distinguish_missing_transcripts() {
+        for (status, download_failure) in [
+            (400, true),
+            (401, true),
+            (403, true),
+            (404, false),
+            (408, true),
+            (410, false),
+            (429, true),
+            (500, true),
+            (501, true),
+            (502, true),
+            (503, true),
+            (504, true),
+            (505, true),
+        ] {
+            let error = Error::Request(RequestError::Server {
+                status: pubky::StatusCode::from_u16(status).unwrap(),
+                message: String::new(),
+            });
+            assert_eq!(
+                map_restore_download_error(error),
+                if download_failure {
+                    PubkyNoiseError::HomeserverResponseError
+                } else {
+                    PubkyNoiseError::RestoreBackupReplayError
+                },
+                "HTTP {status}"
+            );
+        }
+        assert_eq!(
+            map_restore_download_error(Error::Request(RequestError::Validation {
+                message: "invalid path".into(),
+            })),
+            PubkyNoiseError::RestoreBackupReplayError
+        );
+    }
+
+    #[test]
+    fn restore_download_errors_preserve_routing_and_response_failures() {
+        for error in [
+            Error::Pkarr(pubky::errors::PkarrError::InvalidRecord(
+                "missing route".into(),
+            )),
+            Error::Request(RequestError::DecodeJson {
+                message: "invalid server response".into(),
+            }),
+        ] {
+            assert_eq!(
+                map_restore_download_error(error),
+                PubkyNoiseError::HomeserverResponseError
+            );
+        }
+    }
 
     fn state_with_secrets() -> PubkyNoiseSessionState {
         PubkyNoiseSessionState {

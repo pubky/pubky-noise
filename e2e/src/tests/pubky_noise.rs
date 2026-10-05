@@ -588,6 +588,88 @@ async fn snow_test_restore_requires_matching_transport_hash() {
 }
 
 #[tokio::test]
+async fn snow_test_restore_download_failure() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors(&testnet, "XX").await;
+    complete_xx_handshake(&mut pair).await;
+    let snapshot = pair.initiator.snapshot().unwrap();
+    PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        snapshot.clone(),
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+
+    let server = testnet.homeserver_app().client_server();
+    let address = server.pubky_tls_ip_url_ring();
+    let address = address.strip_prefix("https://").unwrap();
+    server.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while tokio::net::TcpStream::connect(address).await.is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let result =
+        PubkyNoiseEncryptor::restore(pair.initiator_config, snapshot, pair.responder_public_key)
+            .await;
+    assert!(matches!(
+        result,
+        Err(PubkyNoiseError::HomeserverResponseError)
+    ));
+}
+
+#[tokio::test]
+async fn snow_test_restore_rejects_missing_or_corrupt_transcript() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors(&testnet, "XX").await;
+    complete_xx_handshake(&mut pair).await;
+    let snapshot = pair.initiator.snapshot().unwrap();
+    let storage = pair.responder_config.local_session.storage();
+    let path = format!("{}/1", pair.responder_config.write_path);
+    let packet = storage.get(&path).await.unwrap().bytes().await.unwrap();
+    let mut tampered = packet.to_vec();
+    let len = u16::from_be_bytes([packet[0], packet[1]]) as usize;
+    tampered[len + 1] ^= 1;
+
+    for (data, expected) in [
+        (vec![0], PubkyNoiseError::BadLengthCiphertext),
+        (tampered, PubkyNoiseError::RestoreBackupReplayError),
+    ] {
+        storage.put(&path, data).await.unwrap();
+        let result = PubkyNoiseEncryptor::restore(
+            pair.initiator_config.clone(),
+            snapshot.clone(),
+            pair.responder_public_key.clone(),
+        )
+        .await;
+        assert_eq!(result.err(), Some(expected));
+    }
+
+    storage.delete(&path).await.unwrap();
+    let result = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        snapshot.clone(),
+        pair.responder_public_key.clone(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(PubkyNoiseError::RestoreBackupReplayError)
+    ));
+
+    storage.put(&path, packet.to_vec()).await.unwrap();
+    let restored =
+        PubkyNoiseEncryptor::restore(pair.initiator_config, snapshot, pair.responder_public_key)
+            .await
+            .unwrap();
+    assert_eq!(restored.get_link_id(), pair.initiator.get_link_id());
+}
+
+#[tokio::test]
 async fn snow_test_xx_transport_allows_simultaneous_first_sends() {
     let testnet = build_testnet().await;
 
