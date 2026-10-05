@@ -5,6 +5,7 @@ use snow::Builder;
 use snow::{HandshakeState, StatelessTransportState};
 
 use crate::snow_crypto_resolver::ReplayResolver;
+use crate::PubkyNoiseError;
 
 pub const PUBKY_NOISE_MSG_LEN: usize = 1000;
 /// Length of the authenticated transport plaintext: body length, body, and padding.
@@ -305,18 +306,17 @@ pub fn resolve_pattern_xx(noise_step: NoiseStep, initiator: bool) -> Vec<Handsha
 
 /// Resolve the handshake actions for a given pattern, step, and role.
 ///
-/// Only NN and XX patterns are currently implemented. IK and NK will
-/// panic with "not yet implemented" if called.
+/// Only NN and XX patterns are supported.
 pub(crate) fn resolve_pattern(
     pattern: HandshakePattern,
     noise_step: NoiseStep,
     initiator: bool,
-) -> Vec<HandshakeAction> {
+) -> Result<Vec<HandshakeAction>, PubkyNoiseError> {
     match pattern {
-        HandshakePattern::PatternNN => resolve_pattern_nn(noise_step, initiator),
-        HandshakePattern::PatternXX => resolve_pattern_xx(noise_step, initiator),
+        HandshakePattern::PatternNN => Ok(resolve_pattern_nn(noise_step, initiator)),
+        HandshakePattern::PatternXX => Ok(resolve_pattern_xx(noise_step, initiator)),
         HandshakePattern::PatternN | HandshakePattern::PatternIK | HandshakePattern::PatternNK => {
-            unimplemented!("handshake pattern {:?} is not yet implemented", pattern)
+            Err(PubkyNoiseError::UnknownNoisePattern)
         }
         #[cfg(feature = "test-utils")]
         HandshakePattern::TestOnlyPatternAA => {
@@ -331,11 +331,17 @@ pub(crate) fn resolve_pattern(
 /// # Parameters:
 /// - `pattern`: a handshake pattern
 /// - `initiator`: boolean parameter which indicates who is initiator and who is responder
-pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec<HandshakeAction> {
+///
+/// # Errors
+/// Returns [`PubkyNoiseError::UnknownNoisePattern`] for unsupported patterns.
+pub fn full_handshake_actions(
+    pattern: HandshakePattern,
+    initiator: bool,
+) -> Result<Vec<HandshakeAction>, PubkyNoiseError> {
     let mut actions = Vec::new();
     let steps = [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final];
     for step in &steps {
-        let step_actions = resolve_pattern(pattern, *step, initiator);
+        let step_actions = resolve_pattern(pattern, *step, initiator)?;
         for action in step_actions {
             match action {
                 HandshakeAction::Write | HandshakeAction::Read => actions.push(action),
@@ -345,7 +351,7 @@ pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec
             }
         }
     }
-    actions
+    Ok(actions)
 }
 
 /// Internal Noise state-machine errors.
@@ -689,9 +695,9 @@ impl DataLinkContext {
     /// Returns the remaining actions for the current step, starting from sub_step_index.
     /// Uses the stored `initiator` flag -- callers no longer need to pass it.
     /// Does NOT advance noise_step -- call `complete_step()` for that.
-    pub fn remaining_handshake_actions(&self) -> Vec<HandshakeAction> {
-        let all_actions = resolve_pattern(self.message_patterns, self.noise_step, self.initiator);
-        all_actions.into_iter().skip(self.sub_step_index).collect()
+    pub fn remaining_handshake_actions(&self) -> Result<Vec<HandshakeAction>, PubkyNoiseError> {
+        let all_actions = resolve_pattern(self.message_patterns, self.noise_step, self.initiator)?;
+        Ok(all_actions.into_iter().skip(self.sub_step_index).collect())
     }
 
     /// Mark one sub-step action as completed, advancing the sub-step index.
@@ -877,6 +883,42 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    #[test]
+    fn test_handshake_actions_reject_unsupported_patterns() {
+        for pattern in [
+            HandshakePattern::PatternN,
+            HandshakePattern::PatternIK,
+            HandshakePattern::PatternNK,
+        ] {
+            for initiator in [true, false] {
+                assert!(matches!(
+                    full_handshake_actions(pattern, initiator),
+                    Err(PubkyNoiseError::UnknownNoisePattern)
+                ));
+                for step in [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final] {
+                    assert!(matches!(
+                        resolve_pattern(pattern, step, initiator),
+                        Err(PubkyNoiseError::UnknownNoisePattern)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_full_handshake_actions_preserve_message_order() {
+        use HandshakeAction::{Read, Write};
+
+        for (pattern, initiator, expected) in [
+            (HandshakePattern::PatternNN, true, vec![Write, Read]),
+            (HandshakePattern::PatternNN, false, vec![Read, Write]),
+            (HandshakePattern::PatternXX, true, vec![Write, Read, Write]),
+            (HandshakePattern::PatternXX, false, vec![Read, Write, Read]),
+        ] {
+            assert!(full_handshake_actions(pattern, initiator).unwrap() == expected);
+        }
+    }
 
     #[test]
     fn debug_redacts_secrets() {

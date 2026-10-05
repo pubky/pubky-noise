@@ -142,13 +142,16 @@ impl PubkyNoiseSessionState {
             ));
         }
         if self.phase == NoisePhase::Transport {
-            if self.counter as usize != full_handshake_actions(self.pattern, self.initiator).len() {
+            let actions = full_handshake_actions(self.pattern, self.initiator)
+                .map_err(|_| SerializerError::InvalidField("pattern", self.pattern.to_u8()))?;
+            if self.counter as usize != actions.len() {
                 return Err(SerializerError::InvalidCounter);
             }
             return Ok(None);
         }
 
-        let actions = resolve_pattern(self.pattern, self.noise_step, self.initiator);
+        let actions = resolve_pattern(self.pattern, self.noise_step, self.initiator)
+            .map_err(|_| SerializerError::InvalidField("pattern", self.pattern.to_u8()))?;
         let sub_step = usize::from(self.sub_step_index);
         if sub_step > actions.len() {
             return Err(SerializerError::InvalidField(
@@ -157,14 +160,21 @@ impl PubkyNoiseSessionState {
             ));
         }
         let next_is_read = actions.get(sub_step) == Some(&HandshakeAction::Read);
-        let preceding_actions = [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final]
+        let mut completed_messages = actions
             .into_iter()
-            .take_while(|step| *step != self.noise_step)
-            .flat_map(|step| resolve_pattern(self.pattern, step, self.initiator));
-        let completed_messages = preceding_actions
-            .chain(actions.into_iter().take(sub_step))
+            .take(sub_step)
             .filter(|action| matches!(action, HandshakeAction::Read | HandshakeAction::Write))
             .count();
+        for step in [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final]
+            .into_iter()
+            .take_while(|step| *step != self.noise_step)
+        {
+            completed_messages += resolve_pattern(self.pattern, step, self.initiator)
+                .map_err(|_| SerializerError::InvalidField("pattern", self.pattern.to_u8()))?
+                .into_iter()
+                .filter(|action| matches!(action, HandshakeAction::Read | HandshakeAction::Write))
+                .count();
+        }
         if self.counter as usize != completed_messages {
             return Err(SerializerError::InvalidCounter);
         }
@@ -175,6 +185,7 @@ impl PubkyNoiseSessionState {
     pub(crate) fn validate(&self) -> Result<(), SerializerError> {
         self.next_handshake_read_slot()?;
         let expected = full_handshake_actions(self.pattern, self.initiator)
+            .map_err(|_| SerializerError::InvalidField("pattern", self.pattern.to_u8()))?
             .into_iter()
             .take(self.counter as usize)
             .filter(|action| *action == HandshakeAction::Read)

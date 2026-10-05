@@ -744,6 +744,7 @@ async fn snow_test_cached_handshake_restore() {
                     snapshot.pattern,
                     snapshot.initiator,
                 )
+                .unwrap()
                 .into_iter()
                 .take(snapshot.counter as usize)
                 .enumerate()

@@ -607,6 +607,7 @@ impl PubkyNoiseEncryptor {
     ///   method.
     ///
     /// # Errors:
+    /// - Returns [`PubkyNoiseError::UnknownNoisePattern`] for unsupported patterns.
     /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] on malformed messages.
     /// - Returns [`PubkyNoiseError::DecryptionError`] if a handshake message fails
     ///   authentication. The failed read does not advance the message counter or
@@ -625,7 +626,7 @@ impl PubkyNoiseEncryptor {
         // Capture pre-mutation snapshot so callers can recover from write failures.
         self.last_good_snapshot = Some(self.snapshot_unchecked());
 
-        let remaining_actions = self.context.remaining_handshake_actions();
+        let remaining_actions = self.context.remaining_handshake_actions()?;
         for action in remaining_actions {
             match action {
                 HandshakeAction::Read => {
@@ -1466,6 +1467,7 @@ impl PubkyNoiseEncryptor {
         let mut saved_messages = state.handshake_messages.iter();
         // The validated counter counts completed reads and writes, not control actions.
         for action in full_handshake_actions(state.pattern, state.initiator)
+            .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?
             .into_iter()
             .take(state.counter as usize)
         {
