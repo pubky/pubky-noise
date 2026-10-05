@@ -3737,8 +3737,10 @@ dependencies = [
  "hex",
  "pubky",
  "rand 0.9.4",
+ "reqwest",
  "sha2 0.11.0",
  "snow",
+ "tokio",
 ]
 
 [[package]]
