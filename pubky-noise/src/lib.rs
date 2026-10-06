@@ -230,7 +230,7 @@ pub enum PubkyNoiseError {
     /// signals a connectivity or server problem rather than the confirmed
     /// absence of a backup.
     RestoreBackupNotFoundError,
-    /// Transport-phase encryption failed.
+    /// Handshake or transport message encryption failed.
     EncryptionError,
     /// Handshake or transport message authentication/decryption failed.
     DecryptionError,
@@ -251,6 +251,62 @@ pub enum PubkyNoiseError {
 pub enum HandshakeResult {
     Pending,
     Terminal,
+}
+
+/// A handshake step prepared for durable storage and later publication.
+///
+/// Persist the resulting state and optional exact packet/path together before
+/// publishing. Keep the packet pending across uncertain writes and retry those
+/// same bytes. While a packet is pending, do not restore and advance the state
+/// or promote it to transport. The caller must durably acknowledge publication
+/// under its ownership and peer-authorization checks. Completion here is
+/// cryptographic only.
+#[must_use = "persist the state and exact pending packet before publication"]
+pub struct PreparedHandshakeStep {
+    resulting_session_state: PubkyNoiseSessionState,
+    outgoing: Option<(String, [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2])>,
+    handshake_complete: bool,
+    remote_static_public_key: Option<Vec<u8>>,
+}
+
+impl PreparedHandshakeStep {
+    /// Return the post-step state, which remains in handshake phase.
+    pub fn resulting_session_state(&self) -> &PubkyNoiseSessionState {
+        &self.resulting_session_state
+    }
+
+    /// Return the publication path, present exactly when [`Self::packet`] is.
+    pub fn destination_path(&self) -> Option<&str> {
+        self.outgoing.as_ref().map(|(path, _)| path.as_str())
+    }
+
+    /// Return the exact length-prefixed, padded wire packet to publish or retry.
+    pub fn packet(&self) -> Option<&[u8]> {
+        self.outgoing.as_ref().map(|(_, packet)| packet.as_slice())
+    }
+
+    /// Return cryptographic completion, not publication or application readiness.
+    /// A completed step can still contain an outgoing packet.
+    pub fn is_handshake_complete(&self) -> bool {
+        self.handshake_complete
+    }
+
+    /// Return the learned static key after cryptographic completion, if any.
+    /// Compare it with the independently authenticated expected peer key.
+    pub fn remote_static_public_key(&self) -> Option<&[u8]> {
+        self.remote_static_public_key.as_deref()
+    }
+}
+
+impl std::fmt::Debug for PreparedHandshakeStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedHandshakeStep")
+            .field("resulting_session_state", &"<redacted>")
+            .field("outgoing", &"<redacted>")
+            .field("handshake_complete", &self.handshake_complete)
+            .field("remote_static_public_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A transport message staged for persistent handoff and later publication.
@@ -561,6 +617,105 @@ impl PubkyNoiseEncryptor {
         self.context.remote_static_public_key()
     }
 
+    /// Consume this encryptor to prepare one handshake step without network I/O.
+    ///
+    /// Supply the complete incoming wire packet exactly when the current step
+    /// requires a read. Use the saved state's
+    /// [`PubkyNoiseSessionState::next_handshake_read_slot`] to plan that read,
+    /// and validate the source checkpoint and peer authorization before applying
+    /// the result. Absence is a polling outcome, not an input that skips a read.
+    ///
+    /// On failure, discard the consumed state and restore the previous durable
+    /// checkpoint. On success, persist the returned state and pending output
+    /// atomically before any PUT. The final XX output must be published and
+    /// durably acknowledged before promoting the handshake to transport.
+    ///
+    /// # Errors
+    /// Returns [`PubkyNoiseError::BadLengthCiphertext`] for missing, unexpected or
+    /// malformed input, [`PubkyNoiseError::DecryptionError`] for authentication
+    /// failure, [`PubkyNoiseError::EncryptionError`] for a failed Noise write,
+    /// [`PubkyNoiseError::CounterOverflow`] for exhausted message slots, or
+    /// [`PubkyNoiseError::OtherError`] if already in transport phase.
+    /// Unsupported patterns return [`PubkyNoiseError::UnknownNoisePattern`].
+    pub fn prepare_handshake_step(
+        mut self,
+        incoming_packet: Option<&[u8]>,
+    ) -> Result<PreparedHandshakeStep, PubkyNoiseError> {
+        if self.context.is_transport() {
+            return Err(PubkyNoiseError::OtherError);
+        }
+        let actions = self.context.remaining_handshake_actions()?;
+        if actions.contains(&HandshakeAction::Read) != incoming_packet.is_some() {
+            return Err(PubkyNoiseError::BadLengthCiphertext);
+        }
+        let mut incoming = incoming_packet.map(decode_handshake_packet).transpose()?;
+        let mut outgoing = None;
+        for action in actions {
+            match action {
+                HandshakeAction::Read => {
+                    let (message, len) = incoming
+                        .take()
+                        .ok_or(PubkyNoiseError::BadLengthCiphertext)?;
+                    self.apply_handshake_read(message, len)?;
+                }
+                HandshakeAction::Write => {
+                    self.context
+                        .ensure_can_increment_counter()
+                        .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+                    outgoing = Some(self.prepare_handshake_packet()?);
+                    self.advance_handshake_message()?;
+                }
+                HandshakeAction::Pending => {
+                    self.context.advance_sub_step();
+                    break;
+                }
+                HandshakeAction::Terminal => break,
+            }
+        }
+        self.context.complete_step();
+        Ok(PreparedHandshakeStep {
+            resulting_session_state: self.snapshot_unchecked(),
+            outgoing,
+            handshake_complete: self.is_handshake_complete(),
+            remote_static_public_key: self.remote_static_public_key().map(<[u8]>::to_vec),
+        })
+    }
+
+    fn apply_handshake_read(
+        &mut self,
+        mut message: [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
+        len: usize,
+    ) -> Result<(), PubkyNoiseError> {
+        self.context
+            .ensure_can_increment_counter()
+            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+        self.context
+            .read_handshake_message(&mut message, &mut payload, len)
+            .map_err(|_| PubkyNoiseError::DecryptionError)?;
+        self.advance_handshake_message()
+    }
+
+    fn prepare_handshake_packet(
+        &mut self,
+    ) -> Result<(String, [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]), PubkyNoiseError> {
+        let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let len = self
+            .context
+            .write_handshake_message(&[], &mut message)
+            .map_err(|_| PubkyNoiseError::EncryptionError)?;
+        let path = format!("{}/{}", self.config.write_path, self.context.get_counter());
+        Ok((path, encode_handshake_packet(&message, len)))
+    }
+
+    fn advance_handshake_message(&mut self) -> Result<(), PubkyNoiseError> {
+        self.context
+            .increment_counter()
+            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+        self.context.advance_sub_step();
+        Ok(())
+    }
+
     /// Handle the forwarding and processing of Noise handshake messages.
     ///
     /// This method is **polling-safe**: it can be called repeatedly by either
@@ -644,28 +799,16 @@ impl PubkyNoiseEncryptor {
                         .public_storage()
                         .get(formatted_path)
                         .await;
-                    let Some((mut message, len)) = read_handshake_packet(response).await? else {
+                    let Some((message, len)) = read_handshake_packet(response).await? else {
                         return Ok(HandshakeResult::Pending);
                     };
-                    let mut payload = [0; PUBKY_NOISE_MSG_LEN];
-                    self.context
-                        .read_handshake_message(&mut message, &mut payload, len)
-                        .map_err(|_| PubkyNoiseError::DecryptionError)?;
-                    self.context
-                        .increment_counter()
-                        .map_err(|_| PubkyNoiseError::CounterOverflow)?;
-                    self.context.advance_sub_step();
+                    self.apply_handshake_read(message, len)?;
                 }
                 HandshakeAction::Write => {
                     self.context
                         .ensure_can_increment_counter()
                         .map_err(|_| PubkyNoiseError::CounterOverflow)?;
-                    let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
-                    if let Ok(len) = self.context.write_handshake_message(&[], &mut message) {
-                        let path = self.config.write_path.as_str();
-                        let counter = self.context.get_counter();
-                        let formatted_path = format!("{path}/{counter}");
-                        let packet = encode_handshake_packet(&message, len);
+                    if let Ok((formatted_path, packet)) = self.prepare_handshake_packet() {
                         // Check for simulated write failure (test-only) or
                         // actual homeserver write failure.
                         #[cfg(feature = "test-utils")]
@@ -693,10 +836,7 @@ impl PubkyNoiseEncryptor {
                             // last_good_snapshot() + restore().
                             return Err(PubkyNoiseError::HomeserverWriteError);
                         }
-                        self.context
-                            .increment_counter()
-                            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
-                        self.context.advance_sub_step();
+                        self.advance_handshake_message()?;
                     }
                 }
                 HandshakeAction::Pending => {
@@ -1795,6 +1935,30 @@ mod tests {
             "static secret leaked in Debug: {rendered}"
         );
         assert!(rendered.contains("generation"));
+    }
+
+    #[test]
+    fn prepared_handshake_debug_redacts_state_and_packet() {
+        let prepared = PreparedHandshakeStep {
+            resulting_session_state: state_with_secrets(),
+            outgoing: Some((
+                "/pub/private-handshake/2".into(),
+                [42; PUBKY_NOISE_CIPHERTEXT_LEN + 2],
+            )),
+            handshake_complete: true,
+            remote_static_public_key: Some(vec![99; 32]),
+        };
+        let rendered = format!("{prepared:?}");
+        for sensitive in [
+            prepared.destination_path().unwrap().to_string(),
+            format!("{:?}", prepared.packet().unwrap()),
+            format!("{:?}", [0xAA; 32]),
+            format!("{:?}", [0xBB; 32]),
+            format!("{:?}", [99; 32]),
+        ] {
+            assert!(!rendered.contains(&sensitive));
+        }
+        assert!(rendered.contains("handshake_complete: true"));
     }
 
     #[test]
