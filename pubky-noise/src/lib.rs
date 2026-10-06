@@ -62,6 +62,47 @@ fn encode_handshake_packet(data: &[u8], len: usize) -> [u8; PUBKY_NOISE_CIPHERTE
     packet
 }
 
+async fn read_handshake_packet(
+    response: pubky::Result<reqwest::Response>,
+) -> Result<Option<([u8; PUBKY_NOISE_CIPHERTEXT_LEN], usize)>, PubkyNoiseError> {
+    let response = match response {
+        Ok(response) => response,
+        Err(Error::Request(RequestError::Server { status, .. }))
+            if status == StatusCode::NOT_FOUND || status == StatusCode::GONE =>
+        {
+            return Ok(None);
+        }
+        Err(_) => return Err(PubkyNoiseError::HomeserverResponseError),
+    };
+    let ciphertext = read_bounded_packet(response, PUBKY_NOISE_CIPHERTEXT_LEN + 2).await?;
+    decode_handshake_packet(&ciphertext).map(Some)
+}
+
+async fn read_bounded_packet(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, PubkyNoiseError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max_bytes as u64)
+    {
+        return Err(PubkyNoiseError::BadLengthCiphertext);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| PubkyNoiseError::HomeserverResponseError)?
+    {
+        // Check before extending; Content-Length may be absent or untrustworthy.
+        if chunk.len() > max_bytes - body.len() {
+            return Err(PubkyNoiseError::BadLengthCiphertext);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Build the fixed-size plaintext frame protected by Noise transport AEAD.
 ///
 /// Format: `[body_len_hi, body_len_lo, body, zero padding]`.
@@ -524,16 +565,17 @@ impl PubkyNoiseEncryptor {
     ///
     /// This method is **polling-safe**: it can be called repeatedly by either
     /// the initiator or responder in any order. If the peer's message is not
-    /// yet available, returns `HandshakeResult::Pending` without advancing state.
+    /// yet available, returns `HandshakeResult::Pending` without advancing that read.
     ///
     /// # Outbox reliability and recovery
     ///
     /// In the outbox model, two kinds of interruption can occur:
     ///
-    /// - **Read failure** (Responder fails to read from Initiator's outbox):
-    ///   The method returns `Pending` without advancing `step`, `sub_step`, or
-    ///   `counter`. Subsequent calls will retry the same read and succeed once
-    ///   the message appears. No special recovery is needed.
+    /// - **Absent message** (HTTP 404/410 from the peer's outbox):
+    ///   The method returns `Pending` without advancing the pending read.
+    ///   Other GET or body-read failures return
+    ///   [`PubkyNoiseError::HomeserverResponseError`]. Subsequent calls retry
+    ///   the same read; earlier successful actions in this call remain applied.
     ///
     /// - **Write failure** (Initiator fails to write to her outbox):
     ///   If the homeserver `put()` call fails, this method returns
@@ -570,11 +612,15 @@ impl PubkyNoiseEncryptor {
     ///   authentication. The failed read does not advance the message counter or
     ///   handshake step. Restore from [`last_good_snapshot()`](Self::last_good_snapshot)
     ///   before reusing the encryptor.
-    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on response parse failure.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on GET failures other
+    ///   than HTTP 404/410, or if the response body cannot be read.
     /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
     ///   write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
     ///   and [`restore()`](Self::restore) is required.
     /// - Returns [`PubkyNoiseError::CounterOverflow`] if message slot space is exhausted.
+    ///
+    /// Successful response bodies are size-bounded before packet validation.
+    /// Non-2xx bodies are handled by the Pubky SDK's configured error-body limit.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyNoiseError> {
         // Capture pre-mutation snapshot so callers can recover from write failures.
         self.last_good_snapshot = Some(self.snapshot_unchecked());
@@ -591,33 +637,23 @@ impl PubkyNoiseEncryptor {
                     let public_key = &self.endpoint_pubkey;
                     let formatted_path = format!("{public_key}/{path}/{counter}");
 
-                    if let Ok(response) = self
+                    let response = self
                         .config
                         .outbox_client
                         .public_storage()
                         .get(formatted_path)
-                        .await
-                    {
-                        if response.status().is_success() {
-                            if let Ok(ciphertext) = response.bytes().await {
-                                let (mut message, len) = decode_handshake_packet(&ciphertext)?;
-                                let mut payload = [0; PUBKY_NOISE_MSG_LEN];
-                                self.context
-                                    .read_handshake_message(&mut message, &mut payload, len)
-                                    .map_err(|_| PubkyNoiseError::DecryptionError)?;
-                            } else {
-                                return Err(PubkyNoiseError::HomeserverResponseError);
-                            }
-                            self.context
-                                .increment_counter()
-                                .map_err(|_| PubkyNoiseError::CounterOverflow)?;
-                            self.context.advance_sub_step();
-                        } else {
-                            return Ok(HandshakeResult::Pending);
-                        }
-                    } else {
+                        .await;
+                    let Some((mut message, len)) = read_handshake_packet(response).await? else {
                         return Ok(HandshakeResult::Pending);
-                    }
+                    };
+                    let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+                    self.context
+                        .read_handshake_message(&mut message, &mut payload, len)
+                        .map_err(|_| PubkyNoiseError::DecryptionError)?;
+                    self.context
+                        .increment_counter()
+                        .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+                    self.context.advance_sub_step();
                 }
                 HandshakeAction::Write => {
                     self.context
@@ -1089,6 +1125,8 @@ impl PubkyNoiseEncryptor {
     ///
     /// Returns `Ok` with an empty vector when no message is available yet
     /// (normal polling behaviour).
+    /// Successful response bodies are size-bounded before packet validation.
+    /// Non-2xx bodies are handled by the Pubky SDK's configured error-body limit.
     ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] if a staged
@@ -1115,10 +1153,8 @@ impl PubkyNoiseEncryptor {
         {
             Ok(response) => {
                 // pubky's get() only returns Ok for 2xx responses.
-                let ciphertext = response
-                    .bytes()
-                    .await
-                    .map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
+                let ciphertext =
+                    read_bounded_packet(response, PUBKY_NOISE_TRANSPORT_PACKET_LEN).await?;
                 let prepared = self.build_prepared_receive(&ciphertext)?;
                 self.apply_prepared_receive(&prepared);
                 results.push(prepared.plaintext().to_vec());
@@ -1591,6 +1627,131 @@ impl std::fmt::Debug for PubkyNoiseConfig {
 mod tests {
     use super::*;
     use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    async fn response_for_test(wire: Vec<u8>) -> pubky::Result<reqwest::Response> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream.write_all(&wire).unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .map_err(Error::from);
+        server.join().unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn handshake_read_distinguishes_absence_from_errors() {
+        for status in [404, 410, 401, 403, 429, 500, 503] {
+            let response = Err(Error::Request(RequestError::Server {
+                status: StatusCode::from_u16(status).unwrap(),
+                message: String::new(),
+            }));
+            let result = read_handshake_packet(response).await;
+            if status == 404 || status == 410 {
+                assert_eq!(result, Ok(None), "status {status}");
+            } else {
+                assert_eq!(
+                    result,
+                    Err(PubkyNoiseError::HomeserverResponseError),
+                    "status {status}"
+                );
+            }
+        }
+        let error = Error::Request(RequestError::Validation {
+            message: "invalid resource".into(),
+        });
+        assert_eq!(
+            read_handshake_packet(Err(error)).await,
+            Err(PubkyNoiseError::HomeserverResponseError)
+        );
+        let response = response_for_test(Vec::new()).await;
+        assert!(matches!(
+            response,
+            Err(Error::Request(RequestError::Transport(_)))
+        ));
+        assert_eq!(
+            read_handshake_packet(response).await,
+            Err(PubkyNoiseError::HomeserverResponseError)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_packet_read_enforces_limit() {
+        let cases = [
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd",
+                Ok(b"abcd".to_vec()),
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n",
+                Ok(b"abcd".to_vec()),
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+                Err(PubkyNoiseError::BadLengthCiphertext),
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+                Err(PubkyNoiseError::BadLengthCiphertext),
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nab",
+                Err(PubkyNoiseError::HomeserverResponseError),
+            ),
+        ];
+        for (wire, expected) in cases {
+            let response = response_for_test(wire.as_bytes().to_vec()).await.unwrap();
+            assert_eq!(read_bounded_packet(response, 4).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_read_validates_packet_framing() {
+        let cases = [
+            (
+                encode_handshake_packet(b"abc", 3).to_vec(),
+                Some(&b"abc"[..]),
+            ),
+            (vec![0, 1, 42], Some(&[42][..])),
+            (vec![], None),
+            (vec![0], None),
+            (vec![0, 2, 42], None),
+            (vec![0xff, 0xff], None),
+            (vec![0; PUBKY_NOISE_CIPHERTEXT_LEN + 3], None),
+        ];
+        for (body, expected) in cases {
+            let mut wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            wire.extend_from_slice(&body);
+            let result = read_handshake_packet(response_for_test(wire).await).await;
+            if let Some(expected) = expected {
+                let (message, len) = result.unwrap().unwrap();
+                assert_eq!(&message[..len], expected);
+            } else {
+                assert_eq!(result, Err(PubkyNoiseError::BadLengthCiphertext));
+            }
+        }
+    }
 
     fn state_with_secrets() -> PubkyNoiseSessionState {
         PubkyNoiseSessionState {

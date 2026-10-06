@@ -109,12 +109,23 @@ struct EncryptorPair {
 
 /// Create a pair of encryptors on the same homeserver.
 async fn setup_encryptors(testnet: &EphemeralTestnet, pattern: &str) -> EncryptorPair {
-    let server = testnet.homeserver_app();
-    let initiator_pubky = testnet.sdk().unwrap();
+    setup_encryptors_on_server(
+        testnet.sdk().unwrap(),
+        testnet.homeserver_app().public_key(),
+        pattern,
+    )
+    .await
+}
+
+async fn setup_encryptors_on_server(
+    initiator_pubky: Pubky,
+    homeserver: PublicKey,
+    pattern: &str,
+) -> EncryptorPair {
     let responder_pubky = initiator_pubky.clone();
 
-    let initiator_session = create_grant_session(&initiator_pubky, &server.public_key()).await;
-    let responder_session = create_grant_session(&responder_pubky, &server.public_key()).await;
+    let initiator_session = create_grant_session(&initiator_pubky, &homeserver).await;
+    let responder_session = create_grant_session(&responder_pubky, &homeserver).await;
 
     let server_path_string = "/pub/data".to_string();
 
@@ -2314,6 +2325,67 @@ async fn snow_test_restore_link_id_matches() {
 //        See: snow_test_NN_initiator_write_failure_and_replay_recovery
 //             snow_test_XX_initiator_write_failure_and_replay_recovery
 // =============================================================================
+
+#[tokio::test]
+async fn snow_test_handshake_read_error_preserves_state_for_retry() {
+    use pubky_testnet::pubky_homeserver::{AppContext, ConfigToml, HomeserverApp, MockDataDir};
+    use std::{net::TcpListener, time::Duration};
+
+    let testnet = build_testnet().await;
+    let http = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tls = TcpListener::bind("127.0.0.1:0").unwrap();
+    let sockets = [http.local_addr().unwrap(), tls.local_addr().unwrap()];
+    let mut config = ConfigToml::minimal_test_config();
+    config.drive.icann_listen_socket = sockets[0];
+    config.drive.pubky_listen_socket = sockets[1];
+    config.pkdns.dht_bootstrap_nodes = Some(testnet.testnet.testnet.dht_bootstrap_nodes());
+    let context = AppContext::read_from(MockDataDir::new(config, None).unwrap())
+        .await
+        .unwrap();
+    drop((http, tls));
+    let server = HomeserverApp::start(context.clone()).await.unwrap();
+    let client = Pubky::with_client(
+        testnet
+            .client_builder()
+            .request_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap(),
+    );
+    let mut pair = setup_encryptors_on_server(client, server.public_key(), "NN").await;
+    pair.initiator.handle_handshake().await.unwrap();
+    let before = pair.responder.snapshot().unwrap().serialize();
+
+    // Keep the server's storage and keys, but stop serving the pending packet.
+    drop(server);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for socket in sockets {
+            while tokio::net::TcpStream::connect(socket).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        pair.responder.handle_handshake().await.unwrap_err(),
+        PubkyNoiseError::HomeserverResponseError
+    );
+    assert_eq!(pair.responder.snapshot().unwrap().serialize(), before);
+    assert_eq!(
+        pair.responder.last_good_snapshot().unwrap().serialize(),
+        before
+    );
+
+    let _server = HomeserverApp::start(context).await.unwrap();
+    pair.responder.handle_handshake().await.unwrap();
+    pair.initiator.handle_handshake().await.unwrap();
+    assert!(pair.responder.is_handshake_complete());
+    assert!(pair.initiator.is_handshake_complete());
+    assert_eq!(
+        pair.initiator.transition_transport().unwrap(),
+        pair.responder.transition_transport().unwrap()
+    );
+}
 
 /// NN pattern: Responder fails to read from Initiator's outbox.
 ///
