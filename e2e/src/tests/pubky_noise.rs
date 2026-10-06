@@ -609,9 +609,23 @@ async fn snow_test_xx_restore_rejects_substituted_peer() {
         Some(pubky_noise::derive_static_public_key(&attacker_secret).as_slice())
     );
 
-    let result =
-        PubkyNoiseEncryptor::restore(pair.initiator_config, snapshot, pair.responder_public_key)
-            .await;
+    // Cached replay remains bound to the original transcript despite remote replacement.
+    let restored = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        snapshot.clone(),
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.get_link_id(), Some(original_link));
+    let mut substituted = snapshot;
+    substituted.handshake_messages = replacement.snapshot().unwrap().handshake_messages;
+    let result = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        substituted,
+        pair.responder_public_key.clone(),
+    )
+    .await;
     assert!(matches!(
         result,
         Err(PubkyNoiseError::RestoreBackupHashMismatch)
@@ -658,7 +672,7 @@ async fn snow_test_restore_requires_matching_transport_hash() {
 }
 
 #[tokio::test]
-async fn snow_test_restore_download_failure() {
+async fn snow_test_restore_with_unavailable_homeserver() {
     let testnet = build_testnet().await;
     let mut pair = setup_encryptors(&testnet, "XX").await;
     complete_xx_handshake(&mut pair).await;
@@ -683,60 +697,150 @@ async fn snow_test_restore_download_failure() {
     .await
     .unwrap();
 
-    let result =
-        PubkyNoiseEncryptor::restore(pair.initiator_config, snapshot, pair.responder_public_key)
-            .await;
-    assert!(matches!(
-        result,
-        Err(PubkyNoiseError::HomeserverResponseError)
-    ));
+    let restored = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        snapshot,
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.get_link_id(), pair.initiator.get_link_id());
 }
 
 #[tokio::test]
-async fn snow_test_restore_rejects_missing_or_corrupt_transcript() {
+async fn snow_test_cached_handshake_restore() {
     let testnet = build_testnet().await;
-    let mut pair = setup_encryptors(&testnet, "XX").await;
-    complete_xx_handshake(&mut pair).await;
-    let snapshot = pair.initiator.snapshot().unwrap();
-    let storage = pair.responder_config.local_session.storage();
-    let path = format!("{}/1", pair.responder_config.write_path);
-    let packet = storage.get(&path).await.unwrap().bytes().await.unwrap();
-    let mut tampered = packet.to_vec();
-    let len = u16::from_be_bytes([packet[0], packet[1]]) as usize;
-    tampered[len + 1] ^= 1;
-
-    for (data, expected) in [
-        (vec![0], PubkyNoiseError::BadLengthCiphertext),
-        (tampered, PubkyNoiseError::RestoreBackupReplayError),
-    ] {
-        storage.put(&path, data).await.unwrap();
-        let result = PubkyNoiseEncryptor::restore(
-            pair.initiator_config.clone(),
-            snapshot.clone(),
-            pair.responder_public_key.clone(),
+    for pattern in ["NN", "XX"] {
+        let mut pair = setup_encryptors(&testnet, pattern).await;
+        for _ in 0..2 {
+            for (encryptor, config, peer_config, peer) in [
+                (
+                    &mut pair.initiator,
+                    &pair.initiator_config,
+                    &pair.responder_config,
+                    &pair.responder_public_key,
+                ),
+                (
+                    &mut pair.responder,
+                    &pair.responder_config,
+                    &pair.initiator_config,
+                    &pair.initiator_public_key,
+                ),
+            ] {
+                encryptor.handle_handshake().await.unwrap();
+                let snapshot = encryptor.snapshot().unwrap();
+                for (slot, action) in pubky_noise::snow_crypto::full_handshake_actions(
+                    snapshot.pattern,
+                    snapshot.initiator,
+                )
+                .into_iter()
+                .take(snapshot.counter as usize)
+                .enumerate()
+                {
+                    if action == pubky_noise::snow_crypto::HandshakeAction::Read {
+                        peer_config
+                            .local_session
+                            .storage()
+                            .put(format!("{}/{slot}", peer_config.write_path), vec![0])
+                            .await
+                            .unwrap();
+                    }
+                }
+                let bytes = snapshot.serialize();
+                *encryptor = PubkyNoiseEncryptor::restore(
+                    config.clone(),
+                    PubkyNoiseSessionState::deserialize(&bytes).unwrap(),
+                    peer.clone(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(encryptor.snapshot().unwrap().serialize(), bytes);
+            }
+        }
+        pair.initiator.transition_transport().unwrap();
+        pair.responder.transition_transport().unwrap();
+        send_and_verify(
+            &mut pair.initiator,
+            &mut pair.responder,
+            "restored initiator",
         )
         .await;
-        assert_eq!(result.err(), Some(expected));
+        send_and_verify(
+            &mut pair.responder,
+            &mut pair.initiator,
+            "restored responder",
+        )
+        .await;
     }
+}
 
-    storage.delete(&path).await.unwrap();
-    let result = PubkyNoiseEncryptor::restore(
-        pair.initiator_config.clone(),
-        snapshot.clone(),
-        pair.responder_public_key.clone(),
-    )
-    .await;
-    assert!(matches!(
-        result,
-        Err(PubkyNoiseError::RestoreBackupReplayError)
-    ));
-
-    storage.put(&path, packet.to_vec()).await.unwrap();
-    let restored =
-        PubkyNoiseEncryptor::restore(pair.initiator_config, snapshot, pair.responder_public_key)
-            .await
-            .unwrap();
-    assert_eq!(restored.get_link_id(), pair.initiator.get_link_id());
+#[tokio::test]
+async fn snow_test_cached_restore_rejects_invalid_transcript() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors(&testnet, "XX").await;
+    pair.initiator.handle_handshake().await.unwrap();
+    pair.responder.handle_handshake().await.unwrap();
+    let partial = pair.responder.snapshot().unwrap();
+    pair.initiator.handle_handshake().await.unwrap();
+    pair.responder.handle_handshake().await.unwrap();
+    pair.responder.transition_transport().unwrap();
+    let complete = pair.responder.snapshot().unwrap();
+    for state in [partial, complete] {
+        let mut missing = state.clone();
+        missing.handshake_messages.pop();
+        let mut reordered = state.clone();
+        reordered.handshake_messages.reverse();
+        let mut corrupted = state.clone();
+        corrupted.handshake_messages[0][0] ^= 1;
+        let mut wrong_peer = state.clone();
+        wrong_peer.endpoint_pubkey = pair.responder_public_key.to_bytes();
+        let mut missing_hash = state.clone();
+        missing_hash.handshake_hash = None;
+        missing_hash.link_id = None;
+        let mut wrong_hash = state.clone();
+        wrong_hash.handshake_hash = Some([0; 32]);
+        let mut wrong_counter = state.clone();
+        wrong_counter.counter = 0;
+        let corrupt_error = if state.phase == pubky_noise::snow_crypto::NoisePhase::HandShake {
+            PubkyNoiseError::RestoreBackupHashMismatch
+        } else {
+            PubkyNoiseError::RestoreBackupReplayError
+        };
+        for (invalid, expected) in [
+            (missing, PubkyNoiseError::RestoreBackupDeserializeError),
+            (corrupted, corrupt_error),
+            (wrong_peer, PubkyNoiseError::RestoreBackupDeserializeError),
+            (missing_hash, PubkyNoiseError::RestoreBackupHashMismatch),
+            (wrong_hash, PubkyNoiseError::RestoreBackupHashMismatch),
+            (
+                wrong_counter,
+                PubkyNoiseError::RestoreBackupDeserializeError,
+            ),
+        ] {
+            assert_eq!(
+                PubkyNoiseEncryptor::restore(
+                    pair.responder_config.clone(),
+                    invalid,
+                    pair.initiator_public_key.clone()
+                )
+                .await
+                .err(),
+                Some(expected)
+            );
+        }
+        if reordered.handshake_messages.len() > 1 {
+            assert_eq!(
+                PubkyNoiseEncryptor::restore(
+                    pair.responder_config.clone(),
+                    reordered,
+                    pair.initiator_public_key.clone()
+                )
+                .await
+                .err(),
+                Some(PubkyNoiseError::RestoreBackupReplayError)
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1631,8 +1735,8 @@ async fn snow_test_restore() {
     // Serialize and deserialize (round-trip test)
     let initiator_bytes = initiator_snapshot.serialize();
     let responder_bytes = responder_snapshot.serialize();
-    assert_eq!(initiator_bytes.len(), 197);
-    assert_eq!(responder_bytes.len(), 197);
+    assert_eq!(initiator_bytes.len(), 248);
+    assert_eq!(responder_bytes.len(), 232);
 
     let initiator_state = PubkyNoiseSessionState::deserialize(&initiator_bytes).unwrap();
     let responder_state = PubkyNoiseSessionState::deserialize(&responder_bytes).unwrap();

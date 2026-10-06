@@ -395,6 +395,8 @@ pub(crate) struct DataLinkContext {
 
     noise_handshake: Option<HandshakeState>,
     noise_transport: Option<StatelessTransportState>,
+    /// Successfully processed incoming handshake messages for local replay.
+    handshake_messages: Vec<Vec<u8>>,
 
     /// Explicit nonce for outbound transport messages.
     sending_nonce: u64,
@@ -562,6 +564,7 @@ impl DataLinkContext {
 
             noise_handshake: Some(handshake_state),
             noise_transport: None,
+            handshake_messages: Vec::new(),
 
             sending_nonce: 0,
             receiving_nonce: 0,
@@ -766,11 +769,16 @@ impl DataLinkContext {
             .as_mut()
             .ok_or(ContextError::InvalidPhase)?
             .read_message(&message[..index], payload)
-            .map(|_| ())
-            .map_err(|_| ContextError::InternalSnowReadErr)
+            .map_err(|_| ContextError::InternalSnowReadErr)?;
+        self.handshake_messages.push(message[..index].to_vec());
+        Ok(())
     }
 
     // --- Snapshot / restore accessors ---
+
+    pub(crate) fn handshake_messages(&self) -> &[Vec<u8>] {
+        &self.handshake_messages
+    }
 
     /// Get the current noise phase.
     pub fn get_phase(&self) -> NoisePhase {

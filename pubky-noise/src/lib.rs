@@ -103,21 +103,6 @@ fn map_context_overflow(err: ContextError) -> PubkyNoiseError {
     }
 }
 
-fn map_restore_download_error(error: Error) -> PubkyNoiseError {
-    match error {
-        Error::Request(RequestError::Server { status, .. })
-            if status == pubky::StatusCode::NOT_FOUND || status == pubky::StatusCode::GONE =>
-        {
-            PubkyNoiseError::RestoreBackupReplayError
-        }
-        Error::Request(RequestError::Validation { .. })
-        | Error::Parse(_)
-        | Error::Build(_)
-        | Error::Authentication(_) => PubkyNoiseError::RestoreBackupReplayError,
-        Error::Request(_) | Error::Pkarr(_) => PubkyNoiseError::HomeserverResponseError,
-    }
-}
-
 fn map_backup_error(err: backup_crypto::BackupCryptoError) -> PubkyNoiseError {
     match err {
         backup_crypto::BackupCryptoError::Rollback { .. } => {
@@ -562,9 +547,8 @@ impl PubkyNoiseEncryptor {
     ///   a pre-mutation snapshot accessible via
     ///   [`last_good_snapshot()`](Self::last_good_snapshot). For in-process
     ///   recovery, pass that snapshot directly to [`restore()`](Self::restore);
-    ///   the replay mechanism will rebuild the Noise state from what is
-    ///   actually on the homeservers, correcting the state and allowing the
-    ///   handshake to resume from the right position.
+    ///   the replay mechanism rebuilds the Noise state at that checkpoint,
+    ///   allowing the handshake to resume from the right position.
     ///
     ///   Callers that need crash recovery must durably persist the
     ///   pre-mutation snapshot themselves: encrypt it with
@@ -1214,6 +1198,7 @@ impl PubkyNoiseEncryptor {
             write_counter: self.context.get_write_counter(),
             read_counter: self.context.get_read_counter(),
             endpoint_pubkey: self.endpoint_pubkey.to_bytes(),
+            handshake_messages: self.context.handshake_messages().to_vec(),
         }
     }
 
@@ -1278,7 +1263,7 @@ impl PubkyNoiseEncryptor {
     ///
     /// Successful (2xx) response bodies are read in chunks under a size cap
     /// ([`backup_crypto::MAX_BACKUP_RESPONSE_BYTES`]), and the record must
-    /// match the exact length of its envelope version. The backup path is
+    /// match the size bounds of its envelope version. The backup path is
     /// probed with a `HEAD` request first: `HEAD` responses carry no body,
     /// so a malicious homeserver cannot use the probe itself to force a
     /// large allocation, and a confirmed-absent backup can be reported
@@ -1396,10 +1381,15 @@ impl PubkyNoiseEncryptor {
     ///
     /// This method:
     /// 1. Builds a fresh `DataLinkContext` with the saved ephemeral key
-    /// 2. Reads all handshake messages from the homeservers
+    /// 2. Uses saved incoming handshake messages
     /// 3. Replays them through the fresh `HandshakeState` to re-derive state
     /// 4. For transport restore: transitions to transport and sets nonces/counters
     /// 5. For handshake restore: stops at the saved step position
+    ///
+    /// Restoration performs no network I/O. It verifies the saved
+    /// transcript by replaying it, not by trusting cached transport keys. Missing
+    /// or changed remote handshake files do not invalidate that snapshot. Callers
+    /// must still validate current peer authorization and coordinate fresh state.
     ///
     /// # Parameters:
     /// - `config`: Shared configuration (must match the original session).
@@ -1407,14 +1397,10 @@ impl PubkyNoiseEncryptor {
     ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
-    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] for transport, routing,
-    ///   server-response, or response-body download failures, except HTTP 404/410.
-    ///   Retain the original snapshot and retry after the cause is resolved; this
-    ///   method does not retry internally or write remote state.
-    /// - Returns [`PubkyNoiseError::RestoreBackupReplayError`] for missing transcripts
-    ///   (HTTP 404/410), invalid request/configuration errors, or failed cryptographic
+    /// - Returns [`PubkyNoiseError::RestoreBackupDeserializeError`] for invalid
+    ///   snapshot cursors, message counts, sizes, or a mismatched endpoint.
+    /// - Returns [`PubkyNoiseError::RestoreBackupReplayError`] for failed cryptographic
     ///   replay.
-    /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] for malformed packet lengths.
     /// - Returns [`PubkyNoiseError::RestoreBackupHashMismatch`] if the replayed handshake
     ///   produces a different hash than the saved handshake hash or LinkId, or
     ///   neither is present in a transport snapshot.
@@ -1423,6 +1409,9 @@ impl PubkyNoiseEncryptor {
         state: PubkyNoiseSessionState,
         endpoint_pubkey: PublicKey,
     ) -> Result<Self, PubkyNoiseError> {
+        state
+            .validate()
+            .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?;
         // Verify the caller-provided pubkey matches the snapshot (consistency check)
         if endpoint_pubkey.to_bytes() != state.endpoint_pubkey {
             return Err(PubkyNoiseError::RestoreBackupDeserializeError);
@@ -1438,86 +1427,42 @@ impl PubkyNoiseEncryptor {
         )
         .map_err(|_| PubkyNoiseError::SnowNoiseBuildError)?;
 
-        // Determine the full sequence of handshake Write/Read actions
-        let all_actions = full_handshake_actions(state.pattern, state.initiator);
-
-        // Determine how many actions to replay:
-        // - For transport restore: replay ALL handshake actions
-        // - For handshake restore: replay up to the saved position
-        let replay_all = state.phase == NoisePhase::Transport;
-
-        // We need to figure out which homeserver slots correspond to which actions.
-        // The counter tracks slot indices. During the original handshake:
-        // - Write actions write to local homeserver at write_path/counter, then increment
-        // - Read actions read from remote homeserver at read_path/counter, then increment
-        //
-        // For replay, we need to re-read ALL messages (both our own writes and
-        // the peer's writes) from the homeservers and feed them through Snow.
-
-        let mut replay_counter: u32 = 0;
-
-        // How many actions were completed in the original session?
-        // For transport: all of them. For handshake: we need to count.
-        let actions_to_replay = if replay_all {
-            all_actions.len()
-        } else {
-            // Count completed actions based on saved counter.
-            // Each Write or Read increments the counter by 1.
-            // The saved counter tells us how many Write/Read actions completed.
-            state.counter as usize
-        };
-
-        for (i, action) in all_actions.iter().enumerate() {
-            if i >= actions_to_replay {
-                break;
-            }
-
+        let mut saved_messages = state.handshake_messages.iter();
+        // The validated counter counts completed reads and writes, not control actions.
+        for action in full_handshake_actions(state.pattern, state.initiator)
+            .into_iter()
+            .take(state.counter as usize)
+        {
             match action {
                 HandshakeAction::Write => {
-                    // During replay, we need to re-read our own written message
-                    // from the homeserver and feed it through Snow's write_message.
-                    //
-                    // However, Snow's write_message generates the message -- it doesn't
-                    // consume an existing one. So for Write actions during replay,
-                    // we just call write_message with empty payload (same as original)
-                    // and discard the output. The important thing is that Snow's
-                    // internal state advances correctly.
+                    // Local writes are deterministic from the saved ephemeral seed.
                     let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
                     context
                         .write_handshake_message(&[], &mut message)
                         .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
-                    replay_counter += 1;
                 }
                 HandshakeAction::Read => {
-                    // Read the peer's message from their homeserver
-                    let read_path = config.read_path.as_str();
-                    let formatted_path = format!("{endpoint_pubkey}/{read_path}/{replay_counter}");
-
-                    let response = config
-                        .outbox_client
-                        .public_storage()
-                        .get(formatted_path)
-                        .await
-                        .map_err(map_restore_download_error)?;
-
-                    // Body transfer failure is distinct from a complete but invalid packet.
-                    let ciphertext = response
-                        .bytes()
-                        .await
-                        .map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
-
-                    let (mut message, len) = decode_handshake_packet(&ciphertext)?;
+                    let saved = saved_messages
+                        .next()
+                        .ok_or(PubkyNoiseError::RestoreBackupDeserializeError)?;
+                    let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+                    message[..saved.len()].copy_from_slice(saved);
                     let mut payload = [0; PUBKY_NOISE_MSG_LEN];
 
                     context
-                        .read_handshake_message(&mut message, &mut payload, len)
+                        .read_handshake_message(&mut message, &mut payload, saved.len())
                         .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
-                    replay_counter += 1;
                 }
                 HandshakeAction::Pending | HandshakeAction::Terminal => {
                     // These don't correspond to actual messages
                 }
             }
+        }
+
+        if state.phase == NoisePhase::HandShake
+            && state.handshake_hash != context.get_handshake_hash()
+        {
+            return Err(PubkyNoiseError::RestoreBackupHashMismatch);
         }
 
         // Now set the context state to match the saved snapshot
@@ -1647,62 +1592,6 @@ mod tests {
     use super::*;
     use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
 
-    #[test]
-    fn restore_download_errors_distinguish_missing_transcripts() {
-        for (status, download_failure) in [
-            (400, true),
-            (401, true),
-            (403, true),
-            (404, false),
-            (408, true),
-            (410, false),
-            (429, true),
-            (500, true),
-            (501, true),
-            (502, true),
-            (503, true),
-            (504, true),
-            (505, true),
-        ] {
-            let error = Error::Request(RequestError::Server {
-                status: pubky::StatusCode::from_u16(status).unwrap(),
-                message: String::new(),
-            });
-            assert_eq!(
-                map_restore_download_error(error),
-                if download_failure {
-                    PubkyNoiseError::HomeserverResponseError
-                } else {
-                    PubkyNoiseError::RestoreBackupReplayError
-                },
-                "HTTP {status}"
-            );
-        }
-        assert_eq!(
-            map_restore_download_error(Error::Request(RequestError::Validation {
-                message: "invalid path".into(),
-            })),
-            PubkyNoiseError::RestoreBackupReplayError
-        );
-    }
-
-    #[test]
-    fn restore_download_errors_preserve_routing_and_response_failures() {
-        for error in [
-            Error::Pkarr(pubky::errors::PkarrError::InvalidRecord(
-                "missing route".into(),
-            )),
-            Error::Request(RequestError::DecodeJson {
-                message: "invalid server response".into(),
-            }),
-        ] {
-            assert_eq!(
-                map_restore_download_error(error),
-                PubkyNoiseError::HomeserverResponseError
-            );
-        }
-    }
-
     fn state_with_secrets() -> PubkyNoiseSessionState {
         PubkyNoiseSessionState {
             version: SESSION_STATE_VERSION,
@@ -1721,6 +1610,7 @@ mod tests {
             write_counter: 9,
             read_counter: 7,
             endpoint_pubkey: [4; 32],
+            handshake_messages: vec![vec![5; 48]],
         }
     }
 

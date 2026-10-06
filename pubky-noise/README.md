@@ -154,7 +154,7 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 
 - **`LinkId`** -- A 32-byte identifier derived from the Noise handshake transcript hash. Changes after every handshake when ephemeral keys are used. Available after calling `transition_transport()`.
 
-- **`PubkyNoiseSessionState`** -- Serializable snapshot of a session (197 bytes). Contains everything needed to restore a session by replaying persisted handshake messages through a fresh Noise state. Because it includes the session's secret keys, it is encrypted before homeserver storage (see [Session Backup & Restore](#session-backup--restore)).
+- **`PubkyNoiseSessionState`** -- Serializable snapshot of a session, including incoming handshake messages for local replay through a fresh Noise state. Because it includes the session's secret keys, it is encrypted before homeserver storage (see [Session Backup & Restore](#session-backup--restore)).
 
 - **`PreparedSend` / `PreparedReceive`** -- Staged transport results containing the exact message data and resulting session state. Use these when message publication or processing must be committed atomically with session state.
 
@@ -268,6 +268,14 @@ Use `PubkyNoiseConfig::new_with_paths()` to supply separate write/read paths.
 
 Sessions can be snapshotted, serialized, and restored to recover from crashes or write failures.
 
+Snapshots restore without network I/O: they retain the incoming handshake
+messages and regenerate local writes from the saved ephemeral seed. Replay still
+verifies message authentication and the saved transcript hash or LinkId. Snapshots
+must remain encrypted, authenticated, and current; this is not a cache of live
+transport counters. Peer authorization and cross-process coordination remain the
+caller's responsibility. Remote deletion or replacement of old handshake files
+does not invalidate a saved transcript or revoke a session.
+
 `snapshot.next_handshake_read_slot()` inspects the saved cursor without restoring
 the Noise state or performing network I/O. `Some(slot)` lets a caller probe
 `{peer_public_key}/{read_path}/{slot}` before taking a lease. `None` means normal
@@ -277,17 +285,13 @@ version and cursor consistency, not snapshot authenticity or transcript validity
 Existence is advisory only; all authorization, restore, recovery, and advancement
 checks must still run under the existing leases.
 
-If `restore()` returns `HomeserverResponseError`, retain the original snapshot and
-retry after the cause is resolved. Restore uses this error for transport, routing,
-server-response, and response-body download failures, except HTTP 404/410. This
-does not bypass TLS checks, retry internally, or write remote state. Missing
-transcripts (404/410), invalid request/configuration errors, and cryptographic
-replay failures remain `RestoreBackupReplayError`. Malformed packet lengths remain
-`BadLengthCiphertext`; transcript hash mismatches remain `RestoreBackupHashMismatch`.
+Invalid snapshot structure returns `RestoreBackupDeserializeError`, cryptographic
+replay failures return `RestoreBackupReplayError`, and transcript hash mismatches
+return `RestoreBackupHashMismatch`. Restore neither downloads nor writes remote state.
 
 ### Snapshot Format
 
-`PubkyNoiseSessionState` serializes to a compact 197-byte binary format:
+`PubkyNoiseSessionState` uses the following binary format:
 
 | Offset | Size | Field |
 |---|---|---|
@@ -310,6 +314,14 @@ replay failures remain `RestoreBackupReplayError`. Malformed packet lengths rema
 | 157-160 | 4 | write counter (u32 big-endian) |
 | 161-164 | 4 | read counter (u32 big-endian) |
 | 165-196 | 32 | endpoint public key |
+| 197 | 1 | incoming handshake message count |
+| 198+ | variable | each incoming message: u16 big-endian length, then unpadded bytes |
+
+The format version is 1. Snapshots store at most two incoming messages, each
+bounded by `PUBKY_NOISE_CIPHERTEXT_LEN`; the size ranges from `MIN_SESSION_STATE_LEN`
+(198 bytes) to `MAX_SESSION_STATE_LEN` (2234 bytes).
+With the library's empty handshake payloads, completed NN snapshots
+are 248/232 bytes and XX snapshots are 296/298 bytes (initiator/responder).
 
 ### Encrypted Homeserver Backup
 
@@ -364,8 +376,8 @@ it only needs to be unique per write, and decryption requires it). `persist_snap
 helper derives it from the Pubky root secret with a domain-separated KDF --
 `SHA-256("pubky-noise/session-backup/v0" || root_secret)` -- so the raw root secret is never
 used directly; callers that do not hold the root secret supply their own key instead.
-The snapshot is not compressed: it is a fixed
-197 bytes of mostly high-entropy key material, which does not compress.
+The snapshot is not compressed: key material and handshake ciphertexts do not
+compress usefully. Network packet padding is omitted.
 
 The stored record is a closed, versioned envelope:
 
@@ -378,7 +390,7 @@ decoder can dispatch on it, and any modification fails decryption. The AAD also 
 intended backup path (`{write_path}/backup`), so a malicious homeserver cannot substitute a
 backup written for a different path under the same key -- the tag mismatch fails decryption
 before the rollback checkpoint or session state can be poisoned. Only explicitly supported
-envelope versions are accepted, the record must match the exact length of its version, and the
+envelope versions are accepted, the record must fit the size bounds of its version, and the
 (2xx) response body is read in chunks under a size cap -- malformed, truncated, trailing, and
 oversized records are all rejected. Known limitation: the pubky SDK consumes non-2xx GET bodies
 in full before the cap can run, so an oversized *error* body can still force an unbounded
@@ -469,7 +481,8 @@ During handshake, if a homeserver write fails:
 3. Retrieve the pre-mutation snapshot via `last_good_snapshot()`.
 4. Persist it and pass to `restore()` to rebuild the session from the correct position.
 
-The restore mechanism replays all handshake messages from the homeservers through a fresh Noise state built with the same ephemeral key material.
+The restore mechanism replays saved incoming messages and regenerates local writes
+through a fresh Noise state built with the same ephemeral key material.
 
 ### Handshake Recovery with `last_good_snapshot`
 
@@ -508,11 +521,10 @@ Snow's `HandshakeState` is a one-way ratchet: once `write_message()` is called, 
    - builds fresh Snow  |                            |                          |
      with same          |                            |                          |
      ephemeral key      |                            |                          |
-   - replays all        |<------ reads existing ---->|                          |
-     handshake messages |       messages from        |                          |
-     from homeservers   |       homeservers          |                          |
-   - state now matches  |                            |                          |
-     what is on disk]   |                            |                          |
+   - replays saved      |                            |                          |
+     handshake messages |                            |                          |
+   - state matches the  |                            |                          |
+     saved checkpoint]  |                            |                          |
                         |                            |                          |
   [restored encryptor]  |--- handle_handshake() ---->| (write succeeds)         |
                         |                            |--- message available --->|
@@ -592,7 +604,9 @@ async fn handshake_recovery_explicit_write_errors(
 
 If `put()` succeeds but the data is subsequently lost (e.g., homeserver crash after acknowledgment), `handle_handshake()` returns `Ok(Pending)` -- the loss is undetectable at the protocol level. The handshake gets stuck: the responder keeps polling but finds nothing to read, and the initiator waits for a reply that will never come.
 
-Recovery follows the same path: load the last persisted snapshot (from before the lost write), call `restore()`, and re-run the handshake. Because `restore()` replays only the messages that are actually present on the homeservers, it rebuilds the correct state and the re-issued write fills the missing slot.
+Recovery requires a persisted snapshot from **before** the lost write: restore it
+and re-run the handshake to reproduce the write. Restoring a post-write snapshot
+does not detect or republish lost data.
 
 #### Key invariants
 
@@ -618,7 +632,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 | `UnacknowledgedPreparedTransport` | A prepared operation has not been durably acknowledged | Persist and acknowledge its handle, or restore the previous durable state if persistence failed |
 | `NoPreparedTransport` | An acknowledgement was attempted with no pending operation | Check the caller's operation lifecycle |
 | `PreparedTransportMismatch` | A prepared handle belongs to another encryptor or operation | Use the handle returned by the current encryptor |
-| `RestoreBackupReplayError` | Handshake replay failed during restore | Check that homeserver messages are intact |
+| `RestoreBackupReplayError` | Handshake replay failed during restore | Check snapshot integrity |
 | `RestoreBackupHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
 | `RestoreBackupDeserializeError` | Backup envelope or snapshot deserialization failed | Check data integrity |
 | `RestoreBackupDecryptError` | Persisted snapshot decryption failed | Wrong backup key, or tampered/corrupted backup |
