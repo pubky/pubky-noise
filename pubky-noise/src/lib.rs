@@ -27,6 +27,12 @@ use snow_crypto::{
 #[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 pub struct LinkId(pub [u8; 32]);
 
+/// Derive the X25519 public key for the static secret passed to
+/// [`PubkyNoiseEncryptor::new`]. This is not an Ed25519 public-key conversion.
+pub fn derive_static_public_key(secret_key: &[u8; 32]) -> [u8; 32] {
+    curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(*secret_key).to_bytes()
+}
+
 /// Decode a length-prefixed packet into a message buffer and its length.
 ///
 /// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
@@ -185,7 +191,7 @@ pub enum PubkyNoiseError {
     RestoreBackupNotFoundError,
     /// Transport-phase encryption failed.
     EncryptionError,
-    /// Transport-phase decryption failed.
+    /// Handshake or transport message authentication/decryption failed.
     DecryptionError,
     /// Message slot counter space is exhausted.
     CounterOverflow,
@@ -504,6 +510,16 @@ impl PubkyNoiseEncryptor {
         !self.context.is_handshake()
     }
 
+    /// Return the remote X25519 static key learned from the Noise handshake.
+    ///
+    /// Returns `None` until the handshake completes, or when the
+    /// pattern has no remote static key. Available in transport and after restore.
+    /// Callers must compare this with their independently authenticated expected
+    /// key before trusting the completed link or exchanging application messages.
+    pub fn remote_static_public_key(&self) -> Option<&[u8]> {
+        self.context.remote_static_public_key()
+    }
+
     /// Handle the forwarding and processing of Noise handshake messages.
     ///
     /// This method is **polling-safe**: it can be called repeatedly by either
@@ -551,6 +567,10 @@ impl PubkyNoiseEncryptor {
     ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] on malformed messages.
+    /// - Returns [`PubkyNoiseError::DecryptionError`] if a handshake message fails
+    ///   authentication. The failed read does not advance the message counter or
+    ///   handshake step. Restore from [`last_good_snapshot()`](Self::last_good_snapshot)
+    ///   before reusing the encryptor.
     /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on response parse failure.
     /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
     ///   write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
@@ -583,11 +603,9 @@ impl PubkyNoiseEncryptor {
                             if let Ok(ciphertext) = response.bytes().await {
                                 let (mut message, len) = decode_handshake_packet(&ciphertext)?;
                                 let mut payload = [0; PUBKY_NOISE_MSG_LEN];
-                                let _ = self.context.read_handshake_message(
-                                    &mut message,
-                                    &mut payload,
-                                    len,
-                                );
+                                self.context
+                                    .read_handshake_message(&mut message, &mut payload, len)
+                                    .map_err(|_| PubkyNoiseError::DecryptionError)?;
                             } else {
                                 return Err(PubkyNoiseError::HomeserverResponseError);
                             }
@@ -1376,7 +1394,8 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
     /// - Returns [`PubkyNoiseError::RestoreBackupReplayError`] if handshake replay fails.
     /// - Returns [`PubkyNoiseError::RestoreBackupHashMismatch`] if the replayed handshake
-    ///   produces a different hash than the saved one.
+    ///   produces a different hash than the saved handshake hash or LinkId, or
+    ///   neither is present in a transport snapshot.
     pub async fn restore(
         config: Arc<PubkyNoiseConfig>,
         state: PubkyNoiseSessionState,
@@ -1489,17 +1508,19 @@ impl PubkyNoiseEncryptor {
                 return Err(PubkyNoiseError::RestoreBackupReplayError);
             }
 
-            // Verify handshake hash matches (integrity check)
-            if let Some(saved_hash) = state.handshake_hash {
-                if let Some(replayed_hash) = context.get_handshake_hash() {
-                    if saved_hash != replayed_hash {
-                        return Err(PubkyNoiseError::RestoreBackupHashMismatch);
-                    }
-                }
+            // Transport snapshots retain the transcript hash in their LinkId.
+            let hash = context
+                .get_handshake_hash()
+                .ok_or(PubkyNoiseError::RestoreBackupReplayError)?;
+            let saved_hash = state
+                .handshake_hash
+                .or(state.link_id)
+                .ok_or(PubkyNoiseError::RestoreBackupHashMismatch)?;
+            if saved_hash != hash || state.link_id.is_some_and(|id| id != hash) {
+                return Err(PubkyNoiseError::RestoreBackupHashMismatch);
             }
 
             // Transition to transport
-            let hash = context.get_handshake_hash().unwrap();
             context
                 .transition_to_transport()
                 .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
@@ -1514,7 +1535,7 @@ impl PubkyNoiseEncryptor {
             context.set_write_counter(state.write_counter);
             context.set_read_counter(state.read_counter);
 
-            Some(LinkId(state.link_id.unwrap_or(hash)))
+            Some(LinkId(hash))
         } else {
             // Handshake restore: set step/sub_step/counter
             context.set_noise_step(state.noise_step);

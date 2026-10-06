@@ -401,6 +401,193 @@ async fn snow_test_transport_allows_simultaneous_first_sends() {
 }
 
 #[tokio::test]
+async fn snow_test_xx_restores_remote_static_public_key() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors_dual_server(&testnet, "XX").await;
+    let initiator_key = pubky_noise::derive_static_public_key(
+        &pair.initiator.snapshot().unwrap().static_secret.unwrap(),
+    );
+    let responder_key = pubky_noise::derive_static_public_key(
+        &pair.responder.snapshot().unwrap().static_secret.unwrap(),
+    );
+    assert_eq!(pair.initiator.remote_static_public_key(), None);
+    assert_eq!(pair.responder.remote_static_public_key(), None);
+    complete_xx_handshake(&mut pair).await;
+
+    for (encryptor, config, peer, expected) in [
+        (
+            &pair.initiator,
+            pair.initiator_config.clone(),
+            pair.responder_public_key.clone(),
+            responder_key,
+        ),
+        (
+            &pair.responder,
+            pair.responder_config.clone(),
+            pair.initiator_public_key.clone(),
+            initiator_key,
+        ),
+    ] {
+        assert_eq!(
+            encryptor.remote_static_public_key(),
+            Some(expected.as_slice())
+        );
+        let restored = PubkyNoiseEncryptor::restore(config, encryptor.snapshot().unwrap(), peer)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.remote_static_public_key(),
+            Some(expected.as_slice())
+        );
+    }
+}
+
+#[tokio::test]
+async fn snow_test_xx_rejects_tampered_handshake() {
+    let testnet = build_testnet().await;
+    for tamper_second_message in [true, false] {
+        let mut pair = setup_encryptors(&testnet, "XX").await;
+        pair.initiator.handle_handshake().await.unwrap();
+        pair.responder.handle_handshake().await.unwrap();
+        let (receiver, receiver_config, sender_config, peer, slot) = if tamper_second_message {
+            (
+                &mut pair.initiator,
+                &pair.initiator_config,
+                &pair.responder_config,
+                &pair.responder_public_key,
+                1,
+            )
+        } else {
+            pair.initiator.handle_handshake().await.unwrap();
+            (
+                &mut pair.responder,
+                &pair.responder_config,
+                &pair.initiator_config,
+                &pair.initiator_public_key,
+                2,
+            )
+        };
+        let snapshot = receiver.snapshot().unwrap();
+        let storage = sender_config.local_session.storage();
+        let path = format!("{}/{slot}", sender_config.write_path);
+        let packet = storage.get(&path).await.unwrap().bytes().await.unwrap();
+        let mut tampered = packet.to_vec();
+        let len = u16::from_be_bytes([packet[0], packet[1]]) as usize;
+        tampered[len + 1] ^= 1;
+        storage.put(&path, tampered).await.unwrap();
+
+        assert_eq!(
+            receiver.handle_handshake().await.unwrap_err(),
+            PubkyNoiseError::DecryptionError
+        );
+        assert!(!receiver.is_handshake_complete());
+        assert_eq!(receiver.remote_static_public_key(), None);
+        assert_eq!(
+            receiver.snapshot().unwrap().serialize(),
+            snapshot.serialize()
+        );
+
+        storage.put(&path, packet.to_vec()).await.unwrap();
+        let mut restored = PubkyNoiseEncryptor::restore(
+            receiver_config.clone(),
+            receiver.last_good_snapshot().unwrap().clone(),
+            peer.clone(),
+        )
+        .await
+        .unwrap();
+        restored.handle_handshake().await.unwrap();
+        assert!(restored.is_handshake_complete());
+        assert!(restored.remote_static_public_key().is_some());
+    }
+}
+
+#[tokio::test]
+async fn snow_test_xx_restore_rejects_substituted_peer() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors(&testnet, "XX").await;
+    pair.initiator.handle_handshake().await.unwrap();
+    let handshake_snapshot = pair.initiator.snapshot().unwrap();
+    pair.responder.handle_handshake().await.unwrap();
+    pair.initiator.handle_handshake().await.unwrap();
+    pair.responder.handle_handshake().await.unwrap();
+    let original_link = pair.initiator.transition_transport().unwrap();
+    let snapshot = pair.initiator.snapshot().unwrap();
+    assert_eq!(snapshot.handshake_hash, None);
+    assert_eq!(snapshot.link_id, Some(original_link.0));
+
+    // A storage writer can replace msg2 with a valid response from another key.
+    let attacker_secret = Keypair::random().secret_key();
+    let mut attacker = PubkyNoiseEncryptor::new(
+        pair.responder_config.clone(),
+        attacker_secret,
+        false,
+        pair.initiator_public_key.clone(),
+    )
+    .unwrap();
+    attacker.handle_handshake().await.unwrap();
+    let mut replacement = PubkyNoiseEncryptor::restore(
+        pair.initiator_config.clone(),
+        handshake_snapshot,
+        pair.responder_public_key.clone(),
+    )
+    .await
+    .unwrap();
+    replacement.handle_handshake().await.unwrap();
+    assert_ne!(replacement.transition_transport().unwrap(), original_link);
+    assert_eq!(
+        replacement.remote_static_public_key(),
+        Some(pubky_noise::derive_static_public_key(&attacker_secret).as_slice())
+    );
+
+    let result =
+        PubkyNoiseEncryptor::restore(pair.initiator_config, snapshot, pair.responder_public_key)
+            .await;
+    assert!(matches!(
+        result,
+        Err(PubkyNoiseError::RestoreBackupHashMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn snow_test_restore_requires_matching_transport_hash() {
+    let testnet = build_testnet().await;
+    let mut pair = setup_encryptors(&testnet, "NN").await;
+    complete_nn_handshake(&mut pair).await;
+    let snapshot = pair.initiator.snapshot().unwrap();
+    let hash = snapshot.link_id.unwrap();
+    let mut wrong_hash = hash;
+    wrong_hash[0] ^= 1;
+    for (handshake_hash, link_id, valid) in [
+        (Some(hash), None, true),
+        (Some(hash), Some(hash), true),
+        (None, None, false),
+        (Some(wrong_hash), Some(hash), false),
+        (Some(hash), Some(wrong_hash), false),
+    ] {
+        let mut saved = snapshot.clone();
+        saved.handshake_hash = handshake_hash;
+        saved.link_id = link_id;
+        let result = PubkyNoiseEncryptor::restore(
+            pair.initiator_config.clone(),
+            saved,
+            pair.responder_public_key.clone(),
+        )
+        .await;
+        if valid {
+            assert_eq!(
+                result.unwrap().get_link_id(),
+                Some(pubky_noise::LinkId(hash))
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(PubkyNoiseError::RestoreBackupHashMismatch)
+            ));
+        }
+    }
+}
+
+#[tokio::test]
 async fn snow_test_xx_transport_allows_simultaneous_first_sends() {
     let testnet = build_testnet().await;
 

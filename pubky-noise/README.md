@@ -9,7 +9,7 @@ Peers use their homeservers as outboxes: each party writes encrypted Noise messa
 ```toml
 # Cargo.toml
 [dependencies]
-pubky-noise = "0.1.0-rc11"
+pubky-noise = "0.1.0-rc12"
 ```
 
 ### Actual dependencies (for reference)
@@ -122,6 +122,14 @@ NoiseAEAD([body_len_hi, body_len_lo, body..., zero padding...])
 - Total stored packet size: 1018 bytes, independent of the body length
 
 ### Crypto Primitives
+
+For peer authentication, compare `remote_static_public_key()` with an independently
+authenticated X25519 key before using a completed or restored session. The getter
+returns `None` until the handshake completes, or for patterns without a remote
+static key. Noise XX proves possession of the presented key, not its association
+with a Pubky identity.
+`derive_static_public_key()` derives the public key from the static secret passed
+to `PubkyNoiseEncryptor::new`; it is distinct from the Ed25519 keys used for routing.
 
 The Noise protocol name is:
 
@@ -574,7 +582,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 - `last_good_snapshot()` returns `None` before the first `handle_handshake()` call.
 - Each `handle_handshake()` call overwrites the previous snapshot with the state from the start of *that* call.
 - The snapshot contains the ephemeral secret key, which is the critical piece that allows `restore()` to re-derive the same transport keys via replay. Any persisted snapshot must be encrypted (as `persist_snapshot()` does).
-- `restore()` verifies the handshake hash matches the saved one (for transport-phase restores), returning `RestoreBackupHashMismatch` on mismatch.
+- `restore()` checks the replayed transcript against the saved handshake hash or LinkId for transport-phase restores. Missing or mismatched hashes return `RestoreBackupHashMismatch`.
 
 ## Error Handling
 
@@ -587,7 +595,7 @@ Recovery follows the same path: load the last persisted snapshot (from before th
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
 | `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
-| `DecryptionError` | Noise decryption failed during `receive_message()` | Message may be tampered or nonces desynchronized |
+| `DecryptionError` | Handshake or transport message authentication/decryption failed | Message may be tampered or nonces desynchronized |
 | `CounterOverflow` | Message slot counter space is exhausted | Start a new Noise session |
 | `NonceOverflow` | Transport nonce space is exhausted | Start a new Noise session |
 | `UnacknowledgedPreparedTransport` | A prepared operation has not been durably acknowledged | Persist and acknowledge its handle, or restore the previous durable state if persistence failed |
