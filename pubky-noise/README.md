@@ -215,7 +215,7 @@ Decrypted plaintext is sensitive application data. Avoid logging it, minimize co
 | `IK` | Declared | Mutual | Initiator knows responder's static key upfront |
 | `NK` | Declared | One-way | Initiator authenticates to known responder |
 
-Patterns marked "Declared" are defined in the enum but will panic if used (not yet implemented).
+Patterns marked "Declared" are defined in the enum but are not supported. Resolving their handshake actions returns `UnknownNoisePattern`.
 
 ### Handshake Flow (XX Pattern)
 
@@ -624,7 +624,7 @@ does not detect or republish lost data.
 
 | Error | Cause | Recovery |
 |---|---|---|
-| `UnknownNoisePattern` | Invalid pattern string | Use a supported pattern: "NN", "XX" |
+| `UnknownNoisePattern` | Invalid pattern string or unsupported handshake actions | Use a supported pattern: "NN", "XX" |
 | `SnowNoiseBuildError` | Noise stack failed to initialize | Check key material and pattern compatibility |
 | `BadLengthCiphertext` | Received packet or authenticated transport frame is malformed | Discard message, check sender |
 | `HomeserverResponseError` | Homeserver GET or response-body read failed | Retry the handshake read without restoring; check connectivity, authorization, and server status |

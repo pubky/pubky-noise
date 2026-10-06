@@ -744,6 +744,7 @@ async fn snow_test_cached_handshake_restore() {
                     snapshot.pattern,
                     snapshot.initiator,
                 )
+                .unwrap()
                 .into_iter()
                 .take(snapshot.counter as usize)
                 .enumerate()
@@ -1080,6 +1081,37 @@ async fn snow_test_unknown_pattern() {
     );
     assert!(init_config_ret.is_err());
     assert!(init_config_ret.unwrap_err() == PubkyNoiseError::UnknownNoisePattern);
+}
+
+#[tokio::test]
+async fn snow_test_unsupported_responder_pattern() {
+    let testnet = build_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let session = create_grant_session(&pubky, &testnet.homeserver_app().public_key()).await;
+
+    for pattern in ["IK", "NK"] {
+        let config = PubkyNoiseConfig::new(
+            Keypair::random().secret_key(),
+            0,
+            pattern,
+            session.clone(),
+            "/pub/data".to_string(),
+            pubky.clone(),
+        )
+        .unwrap();
+        let mut responder = PubkyNoiseEncryptor::new(
+            config,
+            Keypair::random().secret_key(),
+            false,
+            Keypair::random().public_key(),
+        )
+        .unwrap();
+        assert_eq!(
+            responder.handle_handshake().await.unwrap_err(),
+            PubkyNoiseError::UnknownNoisePattern,
+            "pattern {pattern}"
+        );
+    }
 }
 
 #[tokio::test]
