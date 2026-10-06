@@ -268,6 +268,15 @@ Use `PubkyNoiseConfig::new_with_paths()` to supply separate write/read paths.
 
 Sessions can be snapshotted, serialized, and restored to recover from crashes or write failures.
 
+`snapshot.next_handshake_read_slot()` inspects the saved cursor without restoring
+the Noise state or performing network I/O. `Some(slot)` lets a caller probe
+`{peer_public_key}/{read_path}/{slot}` before taking a lease. `None` means normal
+advancement is required, not that the session is idle: the next action may be a
+write, control action, step completion, or transport operation. The probe checks
+version and cursor consistency, not snapshot authenticity or transcript validity.
+Existence is advisory only; all authorization, restore, recovery, and advancement
+checks must still run under the existing leases.
+
 If `restore()` returns `HomeserverResponseError`, retain the original snapshot and
 retry after the cause is resolved. Restore uses this error for transport, routing,
 server-response, and response-body download failures, except HTTP 404/410. This

@@ -307,7 +307,7 @@ pub fn resolve_pattern_xx(noise_step: NoiseStep, initiator: bool) -> Vec<Handsha
 ///
 /// Only NN and XX patterns are currently implemented. IK and NK will
 /// panic with "not yet implemented" if called.
-fn resolve_pattern(
+pub(crate) fn resolve_pattern(
     pattern: HandshakePattern,
     noise_step: NoiseStep,
     initiator: bool,
