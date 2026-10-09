@@ -139,15 +139,50 @@ to `PubkyNoiseEncryptor::new`; it is distinct from the Ed25519 keys used for rou
 The Noise protocol name is:
 
 ```text
-Noise_{pattern}_25519_ChaChaPoly_SHA256
+Noise_{pattern}_25519_AESGCMSIV_SHA256
 ```
 
 | Primitive | Algorithm | Purpose |
 |---|---|---|
 | Key exchange | X25519 | Diffie-Hellman |
-| Stream cipher | ChaCha20-Poly1305 | Authenticated encryption |
+| AEAD | AES-256-GCM-SIV | Nonce misuse-resistant authenticated encryption |
 | Hash | SHA-256 | Handshake transcript hashing |
 | Transport mode | Stateless | Explicit nonce per message |
+
+### Misuse Resistance and Compatibility
+
+`AESGCMSIV` is a custom Noise cipher name, not a standard Snow suite. It means
+AES-256-GCM-SIV ([RFC 8452](https://www.rfc-editor.org/rfc/rfc8452.html)), with a
+32-byte key, nonce `0u32 || counter.to_be_bytes()`, and a full 16-byte appended
+tag. Snow's associated data is preserved. The distinct protocol name binds
+handshake and transport key derivation. A private factory couples that name to
+the cipher; Snow's `AESGCM` enum is used only for internal resolver dispatch,
+never for AES-GCM encryption or negotiation. The resolver is not a public API.
+
+This is defense in depth against accidental key/nonce repetition after a stale
+snapshot is restored. It does **not** make stale state safe: replay, slot
+overwrites, lost application state, and peer desynchronization remain possible.
+Identical key, nonce, plaintext and associated data produce identical ciphertext.
+Nonce uniqueness remains the operating policy; misuse resistance is not a
+guarantee for unlimited rollback or adversarial repetitions. Keep durable
+save-before-send, exact-ciphertext retries, freshness checks and storage fencing.
+Do not remove uncertain-write safety waits on the strength of this cipher change.
+
+Both peers and every process sharing session state must use this suite. Snapshot
+version 2 is the only accepted version; version 1 is rejected before replay.
+There is no migration, old-cipher fallback or negotiation. For an unlaunched
+deployment, reset incompatible test sessions and their queued ciphertext together,
+and establish fresh links on both peers. Never relabel snapshots or send old queued
+ciphertext through a new session. Packet sizes and paths are unchanged, so those
+alone cannot identify a compatible peer.
+
+The [RustCrypto implementation](https://docs.rs/aes-gcm-siv/0.12.1/aes_gcm_siv/#security-warning)
+has not received its own security audit and documents platform constraints for
+constant-time execution. Its AEAD, AES and POLYVAL zeroization features are enabled;
+this is not a claim that all session secrets or their copies are wiped. The custom
+Noise integration requires independent cryptographic review before deployment.
+It does not improve forward secrecy for sessions whose reconstructive snapshots
+remain accessible to an attacker.
 
 ## Mental Model
 
@@ -322,7 +357,8 @@ return `RestoreBackupHashMismatch`. Restore neither downloads nor writes remote 
 | 197 | 1 | incoming handshake message count |
 | 198+ | variable | each incoming message: u16 big-endian length, then unpadded bytes |
 
-The format version is 1. Snapshots store at most two incoming messages, each
+The format version is 2 and identifies the AES-256-GCM-SIV suite. Other versions
+are rejected, not converted. Snapshots store at most two incoming messages, each
 bounded by `PUBKY_NOISE_CIPHERTEXT_LEN`; the size ranges from `MIN_SESSION_STATE_LEN`
 (198 bytes) to `MAX_SESSION_STATE_LEN` (2234 bytes).
 With the library's empty handshake payloads, completed NN snapshots
@@ -374,7 +410,7 @@ let mut restored = PubkyNoiseEncryptor::restore(config, loaded.state, peer_pubke
 //  in `loaded.state.endpoint_pubkey` and can be reconstructed from it via pkarr.)
 ```
 
-Encryption uses XChaCha20Poly1305 (the same AEAD the Noise transport runs on, via `snow`)
+Backup encryption remains XChaCha20Poly1305, separate from the Noise suite,
 with a random 192-bit nonce per write, prepended to the ciphertext (the nonce is not secret --
 it only needs to be unique per write, and decryption requires it). `persist_snapshot()` and
 `load_snapshot()` take a caller-provided 32-byte `backup_key`. The optional `backup_crypto::derive_backup_key()`
@@ -424,10 +460,10 @@ without a trusted checkpoint, `load_snapshot()` must be called with `min_generat
 A homeserver that detects the migration (e.g. via a changed client or OS fingerprint) can then
 serve an older, still-valid backup and the rollback is accepted silently. Restoring stale state
 reuses the same Noise key material and nonces that the peer has already seen in the advanced
-session: this breaks confidentiality and authentication for those packets and can lead to
-forgery or session desynchronization. When checkpoint freshness is unknown, the only safe
-choice is to discard the restored session state and start a fresh Noise session with the peer
-rather than resuming the old one.
+session. AES-256-GCM-SIV limits the cryptographic damage of accidental nonce repetition,
+but cannot reject authentic replay or recover lost application state. When checkpoint
+freshness is unknown, do not resume the old session; reconcile application-level recovery
+and establish a fresh Noise session with the peer.
 
 **Checkpoint update order matters.** Advance the trusted local checkpoint to the new
 `generation` *before* (or atomically with) calling `persist_snapshot()`. If the checkpoint is

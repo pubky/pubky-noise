@@ -1008,12 +1008,15 @@ async fn snow_test_cached_restore_rejects_invalid_transcript() {
         wrong_hash.handshake_hash = Some([0; 32]);
         let mut wrong_counter = state.clone();
         wrong_counter.counter = 0;
+        let mut old_suite = state.clone();
+        old_suite.version = 1;
         let corrupt_error = if state.phase == pubky_noise::snow_crypto::NoisePhase::HandShake {
             PubkyNoiseError::RestoreBackupHashMismatch
         } else {
             PubkyNoiseError::RestoreBackupReplayError
         };
         for (invalid, expected) in [
+            (old_suite, PubkyNoiseError::RestoreBackupDeserializeError),
             (missing, PubkyNoiseError::RestoreBackupDeserializeError),
             (corrupted, corrupt_error),
             (wrong_peer, PubkyNoiseError::RestoreBackupDeserializeError),
@@ -2143,6 +2146,123 @@ async fn snow_test_prepared_transport_state_handoff() {
         "message after prepared handoff",
     )
     .await;
+}
+
+/// A stale snapshot can repeat a nonce. The misuse-resistant cipher still
+/// authenticates each fork, but neither prevents replay nor repairs lost state.
+#[tokio::test]
+async fn snow_test_transport_snapshot_rollback_and_durable_retry() {
+    let testnet = build_testnet().await;
+    for pattern in ["NN", "XX"] {
+        let mut pair = setup_encryptors(&testnet, pattern).await;
+        if pattern == "NN" {
+            complete_nn_handshake(&mut pair).await;
+        } else {
+            complete_xx_handshake(&mut pair).await;
+        }
+        for (sender, receiver, sender_config, receiver_config, sender_key, receiver_key) in [
+            (
+                &pair.initiator,
+                &pair.responder,
+                &pair.initiator_config,
+                &pair.responder_config,
+                &pair.initiator_public_key,
+                &pair.responder_public_key,
+            ),
+            (
+                &pair.responder,
+                &pair.initiator,
+                &pair.responder_config,
+                &pair.initiator_config,
+                &pair.responder_public_key,
+                &pair.initiator_public_key,
+            ),
+        ] {
+            let sender_before = sender.snapshot().unwrap();
+            let receiver_before = receiver.snapshot().unwrap();
+            let mut packets = Vec::new();
+            let mut states = Vec::new();
+            for message in [b"fork A".as_slice(), b"fork B", b"fork A"] {
+                let mut restored = PubkyNoiseEncryptor::restore(
+                    sender_config.clone(),
+                    sender_before.clone(),
+                    receiver_key.clone(),
+                )
+                .await
+                .unwrap();
+                let prepared = restored.prepare_send(message).unwrap();
+                let state = prepared.resulting_session_state();
+                assert_eq!(state.sending_nonce, sender_before.sending_nonce + 1);
+                assert_eq!(state.write_counter, sender_before.write_counter + 1);
+                assert_eq!(state.link_id, sender_before.link_id);
+                assert_eq!(state.handshake_hash, sender_before.handshake_hash);
+                packets.push(prepared.ciphertext().to_vec());
+                states.push(state.serialize());
+
+                let mut restored_receiver = PubkyNoiseEncryptor::restore(
+                    receiver_config.clone(),
+                    receiver_before.clone(),
+                    sender_key.clone(),
+                )
+                .await
+                .unwrap();
+                let received = restored_receiver
+                    .prepare_receive(prepared.ciphertext())
+                    .unwrap();
+                assert_eq!(received.plaintext(), message);
+            }
+            // Deterministic equality is expected, not evidence of freshness.
+            assert_eq!(packets[0], packets[2]);
+            assert_ne!(packets[0], packets[1]);
+            assert_eq!(states[0], states[1]);
+
+            // Model a restart after persisting exact ciphertext and advanced
+            // state, but before observing successful publication. Retry bytes
+            // stay unchanged; the restored sender starts at the next nonce.
+            let mut sender_after = PubkyNoiseEncryptor::restore(
+                sender_config.clone(),
+                PubkyNoiseSessionState::deserialize(&states[0]).unwrap(),
+                receiver_key.clone(),
+            )
+            .await
+            .unwrap();
+            let mut receiver_after = PubkyNoiseEncryptor::restore(
+                receiver_config.clone(),
+                receiver_before.clone(),
+                sender_key.clone(),
+            )
+            .await
+            .unwrap();
+            let received = receiver_after.prepare_receive(&packets[0]).unwrap();
+            let receiver_state = received.resulting_session_state().serialize();
+            receiver_after
+                .acknowledge_persisted_receive(received)
+                .unwrap();
+            // Once committed, replay/fork packets at the old nonce fail without
+            // changing state. Restoring receiver_before above accepted them.
+            for packet in &packets {
+                assert_eq!(
+                    receiver_after.prepare_receive(packet).unwrap_err(),
+                    PubkyNoiseError::DecryptionError
+                );
+                assert_eq!(
+                    receiver_after.snapshot().unwrap().serialize(),
+                    receiver_state
+                );
+            }
+            let next = sender_after.prepare_send(b"next durable message").unwrap();
+            assert_eq!(
+                next.resulting_session_state().sending_nonce,
+                sender_before.sending_nonce + 2
+            );
+            let received = receiver_after.prepare_receive(next.ciphertext()).unwrap();
+            assert_eq!(received.plaintext(), b"next durable message");
+            sender_after.acknowledge_persisted_send(next).unwrap();
+            receiver_after
+                .acknowledge_persisted_receive(received)
+                .unwrap();
+        }
+    }
 }
 
 /// The final accepted send and receive state remains serializable and
@@ -3284,7 +3404,7 @@ async fn snow_test_XX_initiator_put_failure_returns_error() {
 ///
 /// The maximum plaintext payload is PUBKY_NOISE_MSG_LEN (1000) bytes.
 /// Every transport packet is PUBKY_NOISE_TRANSPORT_PACKET_LEN (1018) bytes:
-/// a fixed 1002-byte plaintext frame plus the 16-byte ChaChaPoly AEAD tag.
+/// a fixed 1002-byte plaintext frame plus the 16-byte AES-256-GCM-SIV tag.
 ///
 /// - 999 bytes (MSG_LEN - 1): under the limit, should succeed
 /// - 1000 bytes (MSG_LEN):    exactly at the limit, should succeed
