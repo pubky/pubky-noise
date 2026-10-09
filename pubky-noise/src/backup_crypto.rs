@@ -3,8 +3,7 @@
 //! A serialized [`PubkyNoiseSessionState`] contains the session's ephemeral
 //! secret (and optionally the static secret), so it must be encrypted before
 //! it leaves the device. Encryption uses `XChaCha20Poly1305` from the
-//! [`chacha20poly1305`] crate — already in the dependency tree via `snow`
-//! (the Noise transport itself runs `Noise_*_25519_ChaChaPoly_SHA256`) — with
+//! [`chacha20poly1305`] crate, independently of the Noise transport cipher, with
 //! a fresh random 192-bit nonce per write, prepended to the ciphertext.
 //!
 //! The nonce is not a secret — by design it only needs to be unique per
@@ -666,7 +665,7 @@ mod tests {
 
         assert_eq!(
             decrypt_backup(&root_secret, TEST_PATH, &plaintext, None),
-            Err(BackupCryptoError::InvalidMagic([1, 1, 1, 1]))
+            Err(BackupCryptoError::InvalidMagic([2, 1, 1, 1]))
         );
     }
 

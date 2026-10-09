@@ -9,7 +9,7 @@ This library enables two peers to establish an authenticated, encrypted communic
 Key capabilities:
 
 - **Noise protocol handshakes** -- NN (anonymous) and XX (mutually authenticated) patterns, with polling-safe async execution
-- **Encrypted transport** -- ChaCha20-Poly1305 authenticated encryption with explicit nonces via `Noise_*_25519_ChaChaPoly_SHA256`
+- **Encrypted transport** -- AES-256-GCM-SIV authenticated encryption with explicit nonces via the custom `Noise_*_25519_AESGCMSIV_SHA256` suite; see [security and compatibility limits](pubky-noise/README.md#misuse-resistance-and-compatibility)
 - **Session backup & restore** -- Compact snapshots retain incoming handshake messages for local replay without downloads; snapshots are encrypted at rest (XChaCha20Poly1305 under a caller-provided key, derivable from the Pubky root key) before homeserver upload, with generation-based rollback protection
 - **Asymmetric path derivation** -- Per-peer-pair private storage paths derived from DH shared secrets, preventing third-party enumeration of communication relationships
 - **Write failure recovery** -- Automatic pre-mutation snapshots during handshake allow recovery from homeserver write failures

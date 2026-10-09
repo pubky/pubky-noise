@@ -1,16 +1,15 @@
 use ed25519_dalek::SecretKey;
 use pubky::PublicKey;
 
-use snow::Builder;
 use snow::{HandshakeState, StatelessTransportState};
 
-use crate::snow_crypto_resolver::ReplayResolver;
+use crate::snow_crypto_resolver::replay_builder;
 use crate::PubkyNoiseError;
 
 pub const PUBKY_NOISE_MSG_LEN: usize = 1000;
 /// Length of the authenticated transport plaintext: body length, body, and padding.
 pub(crate) const PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + 2;
-/// ChaChaPoly AEAD authentication tag size (Poly1305).
+/// AES-256-GCM-SIV authentication tag size.
 pub const PUBKY_NOISE_TAG_LEN: usize = 16;
 /// Maximum ciphertext size for a [`PUBKY_NOISE_MSG_LEN`]-byte Noise message.
 pub const PUBKY_NOISE_CIPHERTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + PUBKY_NOISE_TAG_LEN;
@@ -449,27 +448,15 @@ impl std::fmt::Debug for DataLinkContext {
 }
 
 impl DataLinkContext {
-    /// Build the Snow protocol name string for the given pattern.
-    /// We're using ChaCha as the stream cipher. Poly1305 as the MAC and SHA256 as a hash function.
-    fn build_protocol_name(handshake_pattern: &HandshakePattern) -> String {
-        format!(
-            "Noise_{}_25519_ChaChaPoly_SHA256",
-            handshake_pattern.as_str()
-        )
-    }
-
-    /// Build a Snow HandshakeState using the ReplayResolver with the given ephemeral seed.
+    /// Build a handshake with the suite-bound resolver and saved ephemeral seed.
     fn build_handshake_state(
-        protocol_name: &str,
         handshake_pattern: &HandshakePattern,
         initiator: bool,
         local_static_key: &Option<SecretKey>,
         ephemeral_seed: &[u8; 32],
     ) -> Result<HandshakeState, ContextError> {
-        let params = protocol_name.parse().map_err(|_| ContextError::Init)?;
-
-        let resolver = ReplayResolver::new(*ephemeral_seed);
-        let builder = Builder::with_resolver(params, resolver);
+        let builder =
+            replay_builder(handshake_pattern, *ephemeral_seed).map_err(|_| ContextError::Init)?;
 
         let noise_stack = if handshake_pattern.needs_local_key() {
             let key = local_static_key.as_ref().ok_or(ContextError::Init)?;
@@ -526,8 +513,6 @@ impl DataLinkContext {
         //   the handshake pattern and crypto functions, as specified in Section 8.
         //   Calls InitializeSymmetric(protocol_name).
 
-        let protocol_name = Self::build_protocol_name(&handshake_pattern);
-
         // Generate or use provided ephemeral seed
         let ephemeral_seed = match ephemeral_secret {
             Some(seed) => seed,
@@ -539,7 +524,6 @@ impl DataLinkContext {
         };
 
         let handshake_state = Self::build_handshake_state(
-            &protocol_name,
             &handshake_pattern,
             initiator,
             &local_static_key,
@@ -1151,7 +1135,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(Sha256::digest(ciphertext)),
-            "a1eeedce594a1947e52c950ec6f207b133a93d1f09c92f01f0f66169d26d5c0c"
+            "8c30ac4da8025313bcfa015de8e9df1e44a9c2eddc5d6fa852b70f3de846479c"
         );
     }
 

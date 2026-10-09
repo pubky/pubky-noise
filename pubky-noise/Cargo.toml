@@ -15,6 +15,10 @@ test-utils = []
 [dependencies]
 pubky = "0.15.0"
 chacha20poly1305 = "0.10.1"
+aes-gcm-siv = { version = "0.12.1", default-features = false, features = ["aes", "zeroize"] }
+# Enable wiping of the primitive key schedules as well as AEAD derivation buffers.
+aes = { version = "0.9", features = ["zeroize"] }
+polyval = { version = "0.7", features = ["zeroize"] }
 ed25519-dalek = "3.0.0"
 curve25519-dalek = "5.0.0"
 snow = { version = "0.10.0", features = ["use-sha2"] }

@@ -9,8 +9,8 @@ use crate::snow_crypto::{
     NoiseStep, PUBKY_NOISE_CIPHERTEXT_LEN,
 };
 
-/// Current serialization format version.
-pub const SESSION_STATE_VERSION: u8 = 1;
+/// Sole supported snapshot version, bound to the AES-256-GCM-SIV Noise suite.
+pub const SESSION_STATE_VERSION: u8 = 2;
 /// Minimum serialized state size, before any incoming handshake messages.
 pub const MIN_SESSION_STATE_LEN: usize = 198;
 /// Maximum serialized state size, including the two incoming XX handshake messages.
@@ -31,7 +31,7 @@ const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
 /// ephemeral material and therefore its exposure window.
 #[derive(Clone)]
 pub struct PubkyNoiseSessionState {
-    /// Format version for forward compatibility.
+    /// Snapshot/suite version; unsupported versions are rejected before replay.
     pub version: u8,
     /// Current phase: Handshake or Transport.
     pub phase: NoisePhase,
@@ -697,9 +697,13 @@ mod tests {
 
     #[test]
     fn serialization_rejects_unsupported_versions() {
-        for version in [0, 2, u8::MAX] {
+        for version in [0, 1, 3, u8::MAX] {
             let mut state = transport_state();
             state.version = version;
+            assert_eq!(
+                state.validate().unwrap_err(),
+                SerializerError::UnsupportedVersion(version)
+            );
             assert_eq!(
                 PubkyNoiseSessionState::deserialize(&state.serialize()).unwrap_err(),
                 SerializerError::UnsupportedVersion(version)
