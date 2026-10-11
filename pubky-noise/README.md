@@ -79,10 +79,13 @@ let messages = initiator.receive_message().await?;
 initiator.close();
 ```
 
-When polling a peer packet, only HTTP 404/410 is treated as absent (`Pending`).
-Other GET or response-body failures return `HomeserverResponseError`; retry the same encryptor
-after the read failure is resolved. The quick start propagates errors to the
-caller; write failures require the [snapshot recovery](#code-example) described below.
+When polling a handshake packet, only HTTP 404/410 is treated as absent (`Pending`).
+Other GET or response-body failures return `HomeserverResponseError`. This error
+does not preserve the HTTP status or establish that the failure is temporary.
+Authorization or request failures, such as HTTP 403 or 405, may require correcting
+the cause before retrying the same encryptor. Callers control retry limits and
+backoff. The quick start propagates errors to the caller; write failures require
+the [snapshot recovery](#code-example) described below.
 
 ## Architecture
 
@@ -164,6 +167,16 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 - **`PreparedSend` / `PreparedReceive`** -- Staged transport results containing the exact message data and resulting session state. Use these when message publication or processing must be committed atomically with session state.
 
 - **`DataLinkContext`** -- Internal Noise state machine managing the handshake and transport phases. Not used directly by consumers.
+
+### Resource Limits
+
+The packet and snapshot size limits apply to one session, not all sessions on a
+host. The library does not manage a global session pool or impose a total session
+limit. Callers control session creation and retention, including admission and
+rate limits, budgets for live encryptors and saved snapshots, and cleanup of
+abandoned handshakes. Cleanup must respect the pending-output persistence and
+checkpoint requirements described below. A bound on one snapshot alone does not
+prevent resource exhaustion across many sessions.
 
 ### Lifecycle
 
@@ -274,9 +287,10 @@ Use `PubkyNoiseConfig::new_with_paths()` to supply separate write/read paths.
 Sessions can be snapshotted, serialized, and restored to recover from crashes or write failures.
 
 Snapshots restore without network I/O: they retain the incoming handshake
-messages and regenerate local writes from the saved ephemeral seed. Replay still
-verifies message authentication and the saved transcript hash or LinkId. Snapshots
-must remain encrypted, authenticated, and current; this is not a cache of live
+messages and regenerate outgoing handshake bytes in memory from the saved
+ephemeral seed. Replay verifies message authentication and the saved transcript
+hash or LinkId. Snapshots must remain encrypted, authenticated, and current;
+this is not a cache of live
 transport counters. Peer authorization and cross-process coordination remain the
 caller's responsibility. Remote deletion or replacement of old handshake files
 does not invalidate a saved transcript or revoke a session.
@@ -384,6 +398,15 @@ used directly; callers that do not hold the root secret supply their own key ins
 The snapshot is not compressed: key material and handshake ciphertexts do not
 compress usefully. Network packet padding is omitted.
 
+Backup encryption does not hide the serialized snapshot's length. A homeserver
+can observe the record size and upload timing, which can reveal handshake
+metadata such as the pattern, role, or progress. Snapshots retain incoming
+handshake messages, not application transport-message history. With the
+library's empty outgoing handshake payloads, these sizes do not track application
+message lengths or directly disclose their contents. Fixed-size transport
+packets do not make backups fixed-size, and this backup format does not provide
+length-hiding padding.
+
 The stored record is a closed, versioned envelope:
 
 ```text
@@ -486,8 +509,9 @@ During handshake, if a homeserver write fails:
 3. Retrieve the pre-mutation snapshot via `last_good_snapshot()`.
 4. Persist it and pass to `restore()` to rebuild the session from the correct position.
 
-The restore mechanism replays saved incoming messages and regenerates local writes
-through a fresh Noise state built with the same ephemeral key material.
+The restore mechanism replays saved incoming messages and regenerates outgoing
+handshake bytes in memory through a fresh Noise state built with the same
+ephemeral key material. It does not issue homeserver writes or republish packets.
 
 ### Handshake Recovery with `last_good_snapshot`
 
@@ -627,7 +651,7 @@ does not detect or republish lost data.
 | `UnknownNoisePattern` | Invalid pattern string or unsupported handshake actions | Use a supported pattern: "NN", "XX" |
 | `SnowNoiseBuildError` | Noise stack failed to initialize | Check key material and pattern compatibility |
 | `BadLengthCiphertext` | Received packet or authenticated transport frame is malformed | Discard message, check sender |
-| `HomeserverResponseError` | Homeserver GET or response-body read failed | Retry the handshake read without restoring; check connectivity, authorization, and server status |
+| `HomeserverResponseError` | Homeserver GET or response-body read failed; HTTP status is not retained | Check connectivity, authorization, and request validity before deciding whether to retry; a handshake read can be retried on the same encryptor after the cause is resolved |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
 | `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
