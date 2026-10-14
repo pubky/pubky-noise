@@ -79,10 +79,41 @@ let messages = initiator.receive_message().await?;
 initiator.close();
 ```
 
-When polling a peer packet, only HTTP 404/410 is treated as absent (`Pending`).
-Other GET or response-body failures return `HomeserverResponseError`; retry the same encryptor
-after the read failure is resolved. The quick start propagates errors to the
-caller; write failures require the [snapshot recovery](#code-example) described below.
+When polling a handshake packet, only HTTP 404/410 is treated as absent (`Pending`).
+Transport reads treat only 404 as absent; snapshot reads map 404/410 to
+`RestoreBackupNotFoundError`. Other non-success HTTP statuses return
+`HomeserverHttpError { status }`. Read failures without an HTTP status and
+successful (2xx) response-body failures return `HomeserverResponseError`. Pubky
+preserves a known non-success status even if reading its error body fails or times out.
+
+Neither error implies that retrying unchanged will help. Use the status to choose
+application-specific handling: authorization or request errors may require
+correction, while 408, 429 and some 5xx responses may warrant bounded retries.
+The failed read does not advance its cursor; earlier successful handshake actions
+remain applied. The quick start propagates errors to the caller; write failures
+still require the [snapshot recovery](#code-example) described below.
+
+### Request Deadlines
+
+Packet and snapshot byte limits bound memory, not elapsed time. Configure a total
+`PubkyHttpClientBuilder::request_timeout` on native clients before using them for
+peer reads or creating the authenticated session used for snapshot reads. Pubky
+0.15 disables native HTTP timeouts by default. Its total request deadline runs
+from connection setup through completion of the response body, including error
+bodies. A separate `read_timeout` resets on each successful read, so it is not a
+substitute for a total deadline when a server continually sends data or empty
+frames. See the compiled example in the `PubkyNoiseConfig` API documentation.
+
+Noise does not impose a timeout or retry automatically. Choose deadlines and
+backoff for the application. Browser/WASM callers must provide operation-level
+deadlines and cancellation; Pubky's native HTTP timeout settings do not apply
+there. Cancellation of a write does not establish that it was rejected: preserve
+the existing snapshot and exact-ciphertext recovery requirements.
+
+An HTTP/1.1 zero-sized chunk terminates a chunked body; an HTTP/2 empty DATA frame
+does not necessarily end the stream. The reader accepts empty frames without
+treating them as EOF or malformed ciphertext. A configured total deadline bounds
+both stalled responses and streams of empty frames.
 
 ## Architecture
 
@@ -397,9 +428,9 @@ backup written for a different path under the same key -- the tag mismatch fails
 before the rollback checkpoint or session state can be poisoned. Only explicitly supported
 envelope versions are accepted, the record must fit the size bounds of its version, and the
 (2xx) response body is read in chunks under a size cap -- malformed, truncated, trailing, and
-oversized records are all rejected. Known limitation: the pubky SDK consumes non-2xx GET bodies
-in full before the cap can run, so an oversized *error* body can still force an unbounded
-allocation; closing that gap needs a bounded raw GET in the SDK.
+oversized records are all rejected. Pubky 0.15 separately bounds non-2xx error bodies
+using its configured error-body cap. Neither byte cap bounds elapsed time; callers
+must also configure a request deadline as described above.
 
 **Rollback protection.** AEAD authenticates the bytes but provides no freshness: a stale or
 malicious homeserver can return an older, still-valid backup after the session has advanced,
@@ -627,7 +658,8 @@ does not detect or republish lost data.
 | `UnknownNoisePattern` | Invalid pattern string or unsupported handshake actions | Use a supported pattern: "NN", "XX" |
 | `SnowNoiseBuildError` | Noise stack failed to initialize | Check key material and pattern compatibility |
 | `BadLengthCiphertext` | Received packet or authenticated transport frame is malformed | Discard message, check sender |
-| `HomeserverResponseError` | Homeserver GET or response-body read failed | Retry the handshake read without restoring; check connectivity, authorization, and server status |
+| `HomeserverHttpError { status }` | A handshake, transport or snapshot read returned a non-success HTTP status not handled as absence | Inspect the status and correct the cause or apply caller-owned retry policy; no automatic retry |
+| `HomeserverResponseError` | A read failed without an HTTP status, a successful (2xx) body read failed, or a snapshot exceeded its size cap | Check client configuration, connectivity and response validity; retry only after addressing the cause |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
 | `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
@@ -643,6 +675,12 @@ does not detect or republish lost data.
 | `RestoreBackupDecryptError` | Persisted snapshot decryption failed | Wrong backup key, or tampered/corrupted backup |
 | `RestoreBackupRollbackError` | Backup generation is older than the trusted local checkpoint | Restart from a fresh handshake; investigate homeserver |
 | `RestoreBackupNotFoundError` | No backup exists at the backup path (distinct from connectivity/server failures) | Persist a snapshot first, or start a new session |
+
+Callers matching `PubkyNoiseError` must handle `HomeserverHttpError` explicitly
+when classifying read failures. In particular, a catch-all that treats errors as
+invalid ciphertext or permanently non-retryable must not silently classify HTTP
+408/429/5xx that way. Status codes are retained without server-supplied error
+bodies or request URLs. Write errors keep their existing recovery contract.
 
 ## Features
 
