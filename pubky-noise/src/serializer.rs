@@ -708,6 +708,20 @@ mod tests {
     }
 
     #[test]
+    fn deserialization_rejects_unknown_and_unsupported_patterns() {
+        for state in [handshake_state(), transport_state()] {
+            for pattern in [0, 3, 4, 5, u8::MAX] {
+                let mut bytes = state.serialize();
+                bytes[2] = pattern;
+                assert_eq!(
+                    PubkyNoiseSessionState::deserialize(&bytes).unwrap_err(),
+                    SerializerError::InvalidField("pattern", pattern)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn debug_redacts_secrets() {
         let mut state = transport_state();
         state.ephemeral_secret = [0xAA; 32];

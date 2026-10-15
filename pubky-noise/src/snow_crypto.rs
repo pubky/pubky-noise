@@ -316,7 +316,7 @@ pub(crate) fn resolve_pattern(
         HandshakePattern::PatternNN => Ok(resolve_pattern_nn(noise_step, initiator)),
         HandshakePattern::PatternXX => Ok(resolve_pattern_xx(noise_step, initiator)),
         HandshakePattern::PatternN | HandshakePattern::PatternIK | HandshakePattern::PatternNK => {
-            Err(PubkyNoiseError::UnknownNoisePattern)
+            Err(PubkyNoiseError::UnsupportedNoisePattern)
         }
         #[cfg(feature = "test-utils")]
         HandshakePattern::TestOnlyPatternAA => {
@@ -333,7 +333,7 @@ pub(crate) fn resolve_pattern(
 /// - `initiator`: boolean parameter which indicates who is initiator and who is responder
 ///
 /// # Errors
-/// Returns [`PubkyNoiseError::UnknownNoisePattern`] for unsupported patterns.
+/// Returns [`PubkyNoiseError::UnsupportedNoisePattern`] for unsupported patterns.
 pub fn full_handshake_actions(
     pattern: HandshakePattern,
     initiator: bool,
@@ -894,12 +894,12 @@ mod tests {
             for initiator in [true, false] {
                 assert!(matches!(
                     full_handshake_actions(pattern, initiator),
-                    Err(PubkyNoiseError::UnknownNoisePattern)
+                    Err(PubkyNoiseError::UnsupportedNoisePattern)
                 ));
                 for step in [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final] {
                     assert!(matches!(
                         resolve_pattern(pattern, step, initiator),
-                        Err(PubkyNoiseError::UnknownNoisePattern)
+                        Err(PubkyNoiseError::UnsupportedNoisePattern)
                     ));
                 }
             }
