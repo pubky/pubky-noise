@@ -165,6 +165,39 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 
 - **`DataLinkContext`** -- Internal Noise state machine managing the handshake and transport phases. Not used directly by consumers.
 
+### Resource Limits
+
+The library does not impose a total session limit. For the supported NN/XX
+sessions, the current packet and version-1 snapshot formats have these bounds:
+
+| Data | Size in bytes | Source |
+|---|---|---|
+| Application body in one transport message | 0 to 1000 | `snow_crypto::PUBKY_NOISE_MSG_LEN` |
+| Stored handshake or transport packet | 1018 when emitted | `PUBKY_NOISE_CIPHERTEXT_LEN + 2` / `PUBKY_NOISE_TRANSPORT_PACKET_LEN` |
+| Serialized valid session state | 198 to 2234 | `serializer::MIN_SESSION_STATE_LEN` / `MAX_SESSION_STATE_LEN` |
+| Encrypted backup record | 252 to 2288 | `backup_crypto::MIN_BACKUP_RECORD_LEN` / `MAX_BACKUP_RECORD_LEN` |
+| Accumulated successful backup response body | At most 4096; the accepted backup must still satisfy the format bounds | `backup_crypto::MAX_BACKUP_RESPONSE_BYTES` |
+
+The maximum serialized state is 198 fixed bytes plus two incoming handshake
+messages of at most 1016 bytes each, with a two-byte length for each message.
+The encrypted record adds 54 bytes for its header, nonce, generation and tag.
+These are data-length limits, not a per-session RAM ceiling. Live encryptors also
+hold Snow state and may retain a pre-mutation snapshot or pending ciphertext.
+Prepared operations, snapshot clones, serialization/encryption buffers, vector
+capacity, and HTTP client/chunk buffers add memory beyond the serialized sizes;
+`size_of::<PubkyNoiseEncryptor>()` alone excludes heap allocations.
+
+For a host budget, measure peak memory on the deployed target while varying live
+handshakes, transport sessions, concurrent reads/restores and queued prepared
+operations. Track session counts, retained snapshot counts/bytes, pending-output
+queue bytes, and handshake age; account separately for shared configuration/HTTP
+resources and per-operation peak allocations. Use those measurements with
+headroom to choose admission, concurrency, rate and retention limits. The library
+does not cap aggregate caller-owned queues or saved snapshots. Cleanup of
+abandoned handshakes must preserve the pending-output persistence and checkpoint
+requirements described below. A bound on one snapshot alone does not prevent
+resource exhaustion across many sessions.
+
 ### Lifecycle
 
 ```text
@@ -274,11 +307,12 @@ Use `PubkyNoiseConfig::new_with_paths()` to supply separate write/read paths.
 Sessions can be snapshotted, serialized, and restored to recover from crashes or write failures.
 
 Snapshots restore without network I/O: they retain the incoming handshake
-messages and regenerate local writes from the saved ephemeral seed. Replay still
-verifies message authentication and the saved transcript hash or LinkId. Snapshots
-must remain encrypted, authenticated, and current; this is not a cache of live
-transport counters. Peer authorization and cross-process coordination remain the
-caller's responsibility. Remote deletion or replacement of old handshake files
+messages and regenerate outgoing handshake bytes in memory from the saved
+ephemeral seed. Replay verifies message authentication and the saved transcript
+hash or LinkId. Snapshots must remain encrypted, authenticated, and current;
+this is not a cache of live transport counters. Peer authorization and
+cross-process coordination remain the caller's responsibility. Remote deletion
+or replacement of old handshake files
 does not invalidate a saved transcript or revoke a session.
 
 `snapshot.next_handshake_read_slot()` inspects the saved cursor without restoring
@@ -384,6 +418,15 @@ used directly; callers that do not hold the root secret supply their own key ins
 The snapshot is not compressed: key material and handshake ciphertexts do not
 compress usefully. Network packet padding is omitted.
 
+Backup encryption does not hide the serialized snapshot's length. A homeserver
+can observe the record size and upload timing, which can reveal handshake
+metadata such as the pattern, role, or progress. Snapshots retain incoming
+handshake messages, not application transport-message history. With the
+library's empty outgoing handshake payloads, these sizes do not track application
+message lengths or directly disclose their contents. Fixed-size transport
+packets do not make backups fixed-size, and this backup format does not provide
+length-hiding padding.
+
 The stored record is a closed, versioned envelope:
 
 ```text
@@ -486,8 +529,9 @@ During handshake, if a homeserver write fails:
 3. Retrieve the pre-mutation snapshot via `last_good_snapshot()`.
 4. Persist it and pass to `restore()` to rebuild the session from the correct position.
 
-The restore mechanism replays saved incoming messages and regenerates local writes
-through a fresh Noise state built with the same ephemeral key material.
+The restore mechanism replays saved incoming messages and regenerates outgoing
+handshake bytes in memory through a fresh Noise state built with the same
+ephemeral key material. It does not issue homeserver writes or republish packets.
 
 ### Handshake Recovery with `last_good_snapshot`
 
