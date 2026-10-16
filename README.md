@@ -10,7 +10,7 @@ Key capabilities:
 
 - **Noise protocol handshakes** -- NN (anonymous) and XX (mutually authenticated) patterns, with polling-safe async execution
 - **Encrypted transport** -- ChaCha20-Poly1305 authenticated encryption with explicit nonces via `Noise_*_25519_ChaChaPoly_SHA256`
-- **Session backup & restore** -- Compact 197-byte snapshots enable crash recovery by replaying handshake messages through a fresh Noise state
+- **Session backup & restore** -- Compact snapshots retain incoming handshake messages for local replay without downloads; snapshots are encrypted at rest (XChaCha20Poly1305 under a caller-provided key, derivable from the Pubky root key) before homeserver upload, with generation-based rollback protection
 - **Asymmetric path derivation** -- Per-peer-pair private storage paths derived from DH shared secrets, preventing third-party enumeration of communication relationships
 - **Write failure recovery** -- Automatic pre-mutation snapshots during handshake allow recovery from homeserver write failures
 
@@ -32,16 +32,16 @@ cargo build
 ### Unit tests (path derivation, serialization)
 
 ```sh
-cargo nextest -p pubky-noise
+cargo nextest run -p pubky-noise
 ```
 
-### End-to-end tests (requires embedded Postgres)
+### End-to-end tests (requires Docker)
 
 ```sh
-cargo nextest -p e2e
+cargo nextest run -p e2e
 ```
 
-The E2E tests spin up ephemeral Pubky testnets with embedded Postgres and exercise the full handshake-to-transport lifecycle, including:
+The E2E tests start a disposable PostgreSQL container through Testcontainers, spin up ephemeral Pubky testnets in-process, and exercise the full handshake-to-transport lifecycle, including:
 
 - NN and XX pattern handshakes (normal and out-of-order polling)
 - Bidirectional encrypted message exchange

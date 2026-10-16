@@ -5,14 +5,21 @@ use snow::Builder;
 use snow::{HandshakeState, StatelessTransportState};
 
 use crate::snow_crypto_resolver::ReplayResolver;
+use crate::PubkyNoiseError;
 
 pub const PUBKY_NOISE_MSG_LEN: usize = 1000;
+/// Length of the authenticated transport plaintext: body length, body, and padding.
+pub(crate) const PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + 2;
 /// ChaChaPoly AEAD authentication tag size (Poly1305).
 pub const PUBKY_NOISE_TAG_LEN: usize = 16;
-/// Ciphertext buffer size: plaintext + AEAD tag.
+/// Maximum ciphertext size for a [`PUBKY_NOISE_MSG_LEN`]-byte Noise message.
 pub const PUBKY_NOISE_CIPHERTEXT_LEN: usize = PUBKY_NOISE_MSG_LEN + PUBKY_NOISE_TAG_LEN;
-/// Noise reserves 2^64 - 1, so 2^64 - 2 is the last usable nonce.
-const MAX_USABLE_NOISE_NONCE: u64 = u64::MAX - 1;
+/// Fixed stored transport packet size: authenticated plaintext plus AEAD tag.
+pub const PUBKY_NOISE_TRANSPORT_PACKET_LEN: usize =
+    PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN + PUBKY_NOISE_TAG_LEN;
+/// Noise reserves `u64::MAX`. The preceding value is the exhausted cursor,
+/// making `u64::MAX - 2` the final usable nonce.
+const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum NoisePhase {
@@ -299,18 +306,17 @@ pub fn resolve_pattern_xx(noise_step: NoiseStep, initiator: bool) -> Vec<Handsha
 
 /// Resolve the handshake actions for a given pattern, step, and role.
 ///
-/// Only NN and XX patterns are currently implemented. IK and NK will
-/// panic with "not yet implemented" if called.
-fn resolve_pattern(
+/// Only NN and XX patterns are supported.
+pub(crate) fn resolve_pattern(
     pattern: HandshakePattern,
     noise_step: NoiseStep,
     initiator: bool,
-) -> Vec<HandshakeAction> {
+) -> Result<Vec<HandshakeAction>, PubkyNoiseError> {
     match pattern {
-        HandshakePattern::PatternNN => resolve_pattern_nn(noise_step, initiator),
-        HandshakePattern::PatternXX => resolve_pattern_xx(noise_step, initiator),
+        HandshakePattern::PatternNN => Ok(resolve_pattern_nn(noise_step, initiator)),
+        HandshakePattern::PatternXX => Ok(resolve_pattern_xx(noise_step, initiator)),
         HandshakePattern::PatternN | HandshakePattern::PatternIK | HandshakePattern::PatternNK => {
-            unimplemented!("handshake pattern {:?} is not yet implemented", pattern)
+            Err(PubkyNoiseError::UnknownNoisePattern)
         }
         #[cfg(feature = "test-utils")]
         HandshakePattern::TestOnlyPatternAA => {
@@ -325,11 +331,17 @@ fn resolve_pattern(
 /// # Parameters:
 /// - `pattern`: a handshake pattern
 /// - `initiator`: boolean parameter which indicates who is initiator and who is responder
-pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec<HandshakeAction> {
+///
+/// # Errors
+/// Returns [`PubkyNoiseError::UnknownNoisePattern`] for unsupported patterns.
+pub fn full_handshake_actions(
+    pattern: HandshakePattern,
+    initiator: bool,
+) -> Result<Vec<HandshakeAction>, PubkyNoiseError> {
     let mut actions = Vec::new();
     let steps = [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final];
     for step in &steps {
-        let step_actions = resolve_pattern(pattern, *step, initiator);
+        let step_actions = resolve_pattern(pattern, *step, initiator)?;
         for action in step_actions {
             match action {
                 HandshakeAction::Write | HandshakeAction::Read => actions.push(action),
@@ -339,13 +351,15 @@ pub fn full_handshake_actions(pattern: HandshakePattern, initiator: bool) -> Vec
             }
         }
     }
-    actions
+    Ok(actions)
 }
 
-//TODO: more granularity for errors
-pub enum ContextError {
+/// Internal Noise state-machine errors.
+#[derive(Debug)]
+pub(crate) enum ContextError {
     Init,
     OngoingHandshake,
+    InvalidPhase,
     InternalSnowTransitionErr,
     InternalSnowWriteErr,
     InternalSnowReadErr,
@@ -354,7 +368,8 @@ pub enum ContextError {
 }
 
 fn ensure_counter_can_increment(counter: u32) -> Result<(), ContextError> {
-    if counter == u32::MAX {
+    // Keep u32::MAX - 1 as the exhausted serialized cursor.
+    if counter >= u32::MAX - 1 {
         Err(ContextError::CounterOverflow)
     } else {
         Ok(())
@@ -362,7 +377,7 @@ fn ensure_counter_can_increment(counter: u32) -> Result<(), ContextError> {
 }
 
 fn ensure_nonce_can_increment(nonce: u64) -> Result<(), ContextError> {
-    if nonce > MAX_USABLE_NOISE_NONCE {
+    if nonce >= EXHAUSTED_NOISE_NONCE {
         Err(ContextError::NonceOverflow)
     } else {
         Ok(())
@@ -370,8 +385,7 @@ fn ensure_nonce_can_increment(nonce: u64) -> Result<(), ContextError> {
 }
 
 /// A Noise state machine
-#[derive(Debug)]
-pub struct DataLinkContext {
+pub(crate) struct DataLinkContext {
     initiator: bool,
     message_patterns: HandshakePattern,
 
@@ -387,6 +401,8 @@ pub struct DataLinkContext {
 
     noise_handshake: Option<HandshakeState>,
     noise_transport: Option<StatelessTransportState>,
+    /// Successfully processed incoming handshake messages for local replay.
+    handshake_messages: Vec<Vec<u8>>,
 
     /// Explicit nonce for outbound transport messages.
     sending_nonce: u64,
@@ -406,6 +422,30 @@ pub struct DataLinkContext {
     // When a Read fails (peer hasn't written yet), we return Pending without advancing
     // sub_step_index, so the next poll retries from the same action.
     sub_step_index: usize,
+}
+
+/// Redacted `Debug`: secret key material (`local_static_seckey`,
+/// `local_ephemeral_seckey`) and the Snow handshake/transport internals are
+/// never rendered. Transport nonce values are hidden as a logging policy
+/// (consistent with `PubkyNoiseSessionState`), not because they are secret —
+/// Noise nonce counters are public values.
+impl std::fmt::Debug for DataLinkContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataLinkContext")
+            .field("initiator", &self.initiator)
+            .field("message_patterns", &self.message_patterns)
+            .field("has_static_secret", &self.local_static_seckey.is_some())
+            .field("noise_step", &self.noise_step)
+            .field("noise_phase", &self.noise_phase)
+            .field("sending_nonce", &"[redacted]")
+            .field("receiving_nonce", &"[redacted]")
+            .field("endpoint_pubkey", &self.endpoint_pubkey)
+            .field("counter", &self.counter)
+            .field("write_counter", &self.write_counter)
+            .field("read_counter", &self.read_counter)
+            .field("sub_step_index", &self.sub_step_index)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DataLinkContext {
@@ -530,6 +570,7 @@ impl DataLinkContext {
 
             noise_handshake: Some(handshake_state),
             noise_transport: None,
+            handshake_messages: Vec::new(),
 
             sending_nonce: 0,
             receiving_nonce: 0,
@@ -608,6 +649,15 @@ impl DataLinkContext {
         self.noise_phase == NoisePhase::Transport
     }
 
+    /// Return the peer's static key only after the handshake completes.
+    pub fn remote_static_public_key(&self) -> Option<&[u8]> {
+        match &self.noise_handshake {
+            Some(handshake) if handshake.is_handshake_finished() => handshake.get_remote_static(),
+            Some(_) => None,
+            None => self.noise_transport.as_ref()?.get_remote_static(),
+        }
+    }
+
     pub fn get_handshake_hash(&self) -> Option<[u8; 32]> {
         if let Some(handshake_state) = &self.noise_handshake {
             let mut buf = [0; 32];
@@ -619,7 +669,7 @@ impl DataLinkContext {
         None
     }
 
-    pub fn to_transport(&mut self) -> Result<(), ContextError> {
+    pub(crate) fn transition_to_transport(&mut self) -> Result<(), ContextError> {
         let hs = self
             .noise_handshake
             .as_ref()
@@ -645,9 +695,9 @@ impl DataLinkContext {
     /// Returns the remaining actions for the current step, starting from sub_step_index.
     /// Uses the stored `initiator` flag -- callers no longer need to pass it.
     /// Does NOT advance noise_step -- call `complete_step()` for that.
-    pub fn remaining_handshake_actions(&self) -> Vec<HandshakeAction> {
-        let all_actions = resolve_pattern(self.message_patterns, self.noise_step, self.initiator);
-        all_actions.into_iter().skip(self.sub_step_index).collect()
+    pub fn remaining_handshake_actions(&self) -> Result<Vec<HandshakeAction>, PubkyNoiseError> {
+        let all_actions = resolve_pattern(self.message_patterns, self.noise_step, self.initiator)?;
+        Ok(all_actions.into_iter().skip(self.sub_step_index).collect())
     }
 
     /// Mark one sub-step action as completed, advancing the sub-step index.
@@ -661,67 +711,80 @@ impl DataLinkContext {
         self.sub_step_index = 0;
     }
 
-    pub fn write_act(
+    pub(crate) fn write_handshake_message(
         &mut self,
         payload: &[u8],
         message: &mut [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
     ) -> Result<usize, ContextError> {
-        match self.noise_phase {
-            NoisePhase::HandShake => self
-                .noise_handshake
-                .as_mut()
-                .unwrap()
-                .write_message(payload, message.as_mut())
-                .map_err(|_| ContextError::InternalSnowWriteErr),
-            NoisePhase::Transport => {
-                let nonce = self.sending_nonce;
-                let size = self
-                    .noise_transport
-                    .as_ref()
-                    .unwrap()
-                    .write_message(nonce, payload, message.as_mut())
-                    .map_err(|_| ContextError::InternalSnowWriteErr)?;
-                // NOTE: sending_nonce is NOT incremented here. The caller
-                // must call increment_sending_nonce() after confirming the
-                // write reached the homeserver. This prevents nonce desync
-                // when put() fails after a successful encryption.
-                Ok(size)
-            }
+        if self.noise_phase != NoisePhase::HandShake {
+            return Err(ContextError::InvalidPhase);
         }
+
+        self.noise_handshake
+            .as_mut()
+            .ok_or(ContextError::InvalidPhase)?
+            .write_message(payload, message.as_mut())
+            .map_err(|_| ContextError::InternalSnowWriteErr)
     }
 
-    pub fn read_act(
+    /// Encrypt a transport message without advancing the sending nonce.
+    pub(crate) fn prepare_transport_write(
+        &self,
+        payload: &[u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN],
+        message: &mut [u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
+    ) -> Result<usize, ContextError> {
+        if !self.is_transport() {
+            return Err(ContextError::OngoingHandshake);
+        }
+
+        self.noise_transport
+            .as_ref()
+            .ok_or(ContextError::OngoingHandshake)?
+            .write_message(self.sending_nonce, payload, message.as_mut())
+            .map_err(|_| ContextError::InternalSnowWriteErr)
+    }
+
+    /// Decrypt a transport message without advancing the receiving nonce.
+    pub(crate) fn prepare_transport_read(
+        &self,
+        message: &[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
+        payload: &mut [u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN],
+    ) -> Result<usize, ContextError> {
+        if !self.is_transport() {
+            return Err(ContextError::OngoingHandshake);
+        }
+
+        self.noise_transport
+            .as_ref()
+            .ok_or(ContextError::OngoingHandshake)?
+            .read_message(self.receiving_nonce, message, payload)
+            .map_err(|_| ContextError::InternalSnowReadErr)
+    }
+
+    pub(crate) fn read_handshake_message(
         &mut self,
         message: &mut [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
         payload: &mut [u8; PUBKY_NOISE_MSG_LEN],
         index: usize,
     ) -> Result<(), ContextError> {
-        match self.noise_phase {
-            NoisePhase::HandShake => {
-                self.noise_handshake
-                    .as_mut()
-                    .unwrap()
-                    .read_message(&message[..index], payload)
-                    .map_err(|_| ContextError::InternalSnowReadErr)?;
-                Ok(())
-            }
-            NoisePhase::Transport => {
-                self.ensure_can_advance_receiving_nonce()?;
-                self.noise_transport
-                    .as_ref()
-                    .unwrap()
-                    .read_message(self.receiving_nonce, &message[..index], payload)
-                    .map_err(|_| ContextError::InternalSnowReadErr)?;
-                self.receiving_nonce = self
-                    .receiving_nonce
-                    .checked_add(1)
-                    .ok_or(ContextError::NonceOverflow)?;
-                Ok(())
-            }
+        if self.noise_phase != NoisePhase::HandShake {
+            return Err(ContextError::InvalidPhase);
         }
+
+        self.noise_handshake
+            .as_mut()
+            .ok_or(ContextError::InvalidPhase)?
+            .read_message(&message[..index], payload)
+            .map_err(|_| ContextError::InternalSnowReadErr)?;
+        self.handshake_messages.push(message[..index].to_vec());
+        Ok(())
     }
 
     // --- Snapshot / restore accessors ---
+
+    pub(crate) fn handshake_messages(&self) -> &[Vec<u8>] {
+        &self.handshake_messages
+    }
 
     /// Get the current noise phase.
     pub fn get_phase(&self) -> NoisePhase {
@@ -803,37 +866,6 @@ impl DataLinkContext {
         self.sub_step_index = index;
     }
 
-    /// Advance the sending nonce by 1.
-    ///
-    /// Call this **after** confirming the encrypted message was successfully
-    /// written to the homeserver. This ensures the nonce stays in sync with
-    /// what the receiver expects, even if a write fails.
-    pub fn increment_sending_nonce(&mut self) -> Result<(), ContextError> {
-        self.sending_nonce = self
-            .sending_nonce
-            .checked_add(1)
-            .ok_or(ContextError::NonceOverflow)?;
-        Ok(())
-    }
-
-    /// Advance the outbound homeserver slot counter by 1.
-    pub fn increment_write_counter(&mut self) -> Result<(), ContextError> {
-        self.write_counter = self
-            .write_counter
-            .checked_add(1)
-            .ok_or(ContextError::CounterOverflow)?;
-        Ok(())
-    }
-
-    /// Advance the remote outbound homeserver slot counter by 1.
-    pub fn increment_read_counter(&mut self) -> Result<(), ContextError> {
-        self.read_counter = self
-            .read_counter
-            .checked_add(1)
-            .ok_or(ContextError::CounterOverflow)?;
-        Ok(())
-    }
-
     /// Set the sending nonce (used during restore after transport transition).
     pub fn set_sending_nonce(&mut self, nonce: u64) {
         self.sending_nonce = nonce;
@@ -842,5 +874,361 @@ impl DataLinkContext {
     /// Set the receiving nonce (used during restore after transport transition).
     pub fn set_receiving_nonce(&mut self, nonce: u64) {
         self.receiving_nonce = nonce;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pubky::prelude::Keypair;
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+
+    #[test]
+    fn test_handshake_actions_reject_unsupported_patterns() {
+        for pattern in [
+            HandshakePattern::PatternN,
+            HandshakePattern::PatternIK,
+            HandshakePattern::PatternNK,
+        ] {
+            for initiator in [true, false] {
+                assert!(matches!(
+                    full_handshake_actions(pattern, initiator),
+                    Err(PubkyNoiseError::UnknownNoisePattern)
+                ));
+                for step in [NoiseStep::StepOne, NoiseStep::StepTwo, NoiseStep::Final] {
+                    assert!(matches!(
+                        resolve_pattern(pattern, step, initiator),
+                        Err(PubkyNoiseError::UnknownNoisePattern)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_full_handshake_actions_preserve_message_order() {
+        use HandshakeAction::{Read, Write};
+
+        for (pattern, initiator, expected) in [
+            (HandshakePattern::PatternNN, true, vec![Write, Read]),
+            (HandshakePattern::PatternNN, false, vec![Read, Write]),
+            (HandshakePattern::PatternXX, true, vec![Write, Read, Write]),
+            (HandshakePattern::PatternXX, false, vec![Read, Write, Read]),
+        ] {
+            assert!(full_handshake_actions(pattern, initiator).unwrap() == expected);
+        }
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let endpoint = Keypair::random().public_key();
+        let context = match DataLinkContext::new_with_ephemeral(
+            HandshakePattern::PatternXX,
+            true,
+            Some([0xDD; 32]),
+            endpoint,
+            Some([0xCC; 32]),
+        ) {
+            Ok(context) => context,
+            Err(_) => panic!("failed to build DataLinkContext"),
+        };
+
+        let rendered = format!("{context:?}");
+
+        assert!(
+            !rendered.contains(format!("{:?}", [0xCC; 32]).as_str()),
+            "ephemeral secret leaked in Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains(format!("{:?}", [0xDD; 32]).as_str()),
+            "static secret leaked in Debug: {rendered}"
+        );
+        // Non-secret fields remain visible for debugging.
+        assert!(rendered.contains("sending_nonce"));
+        // Transport nonce values are hidden as a logging policy; the field
+        // names remain visible.
+        assert!(
+            !rendered.contains("sending_nonce: 0"),
+            "sending nonce value leaked in Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains("receiving_nonce: 0"),
+            "receiving nonce value leaked in Debug: {rendered}"
+        );
+    }
+
+    fn transport_contexts() -> (DataLinkContext, DataLinkContext) {
+        let initiator_keypair = Keypair::from_secret(&[3; 32]);
+        let responder_keypair = Keypair::from_secret(&[4; 32]);
+        let mut initiator = DataLinkContext::new_with_ephemeral(
+            HandshakePattern::PatternNN,
+            true,
+            None,
+            responder_keypair.public_key(),
+            Some([1; 32]),
+        )
+        .unwrap();
+        let mut responder = DataLinkContext::new_with_ephemeral(
+            HandshakePattern::PatternNN,
+            false,
+            None,
+            initiator_keypair.public_key(),
+            Some([2; 32]),
+        )
+        .unwrap();
+
+        let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+        let len = initiator
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        responder
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
+
+        let len = responder
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        initiator
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
+
+        initiator.transition_to_transport().unwrap();
+        responder.transition_to_transport().unwrap();
+        (initiator, responder)
+    }
+
+    #[test]
+    fn test_remote_static_public_key() {
+        let initiator_secret = [3; 32];
+        let responder_secret = [4; 32];
+        let mut initiator = DataLinkContext::new(
+            HandshakePattern::PatternXX,
+            true,
+            Some(initiator_secret),
+            Keypair::random().public_key(),
+        )
+        .unwrap();
+        let mut responder = DataLinkContext::new(
+            HandshakePattern::PatternXX,
+            false,
+            Some(responder_secret),
+            Keypair::random().public_key(),
+        )
+        .unwrap();
+        assert_eq!(initiator.remote_static_public_key(), None);
+        assert_eq!(responder.remote_static_public_key(), None);
+
+        let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+        let len = initiator
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        responder
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
+        assert_eq!(responder.remote_static_public_key(), None);
+        let len = responder
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        initiator
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
+        let responder_key = crate::derive_static_public_key(&responder_secret);
+        assert_eq!(initiator.remote_static_public_key(), None);
+        let len = initiator
+            .write_handshake_message(&[], &mut message)
+            .unwrap();
+        assert_eq!(
+            initiator.remote_static_public_key(),
+            Some(responder_key.as_slice())
+        );
+        responder
+            .read_handshake_message(&mut message, &mut payload, len)
+            .unwrap();
+        let initiator_key = crate::derive_static_public_key(&initiator_secret);
+        assert_eq!(
+            responder.remote_static_public_key(),
+            Some(initiator_key.as_slice())
+        );
+
+        initiator.transition_to_transport().unwrap();
+        responder.transition_to_transport().unwrap();
+        assert_eq!(
+            initiator.remote_static_public_key(),
+            Some(responder_key.as_slice())
+        );
+        assert_eq!(
+            responder.remote_static_public_key(),
+            Some(initiator_key.as_slice())
+        );
+        let (initiator, responder) = transport_contexts();
+        assert_eq!(initiator.remote_static_public_key(), None);
+        assert_eq!(responder.remote_static_public_key(), None);
+    }
+
+    #[test]
+    fn test_remote_static_public_key_rejects_unauthenticated_handshake() {
+        for tamper_second_message in [true, false] {
+            let mut initiator = DataLinkContext::new(
+                HandshakePattern::PatternXX,
+                true,
+                Some([3; 32]),
+                Keypair::random().public_key(),
+            )
+            .unwrap();
+            let mut responder = DataLinkContext::new(
+                HandshakePattern::PatternXX,
+                false,
+                Some([4; 32]),
+                Keypair::random().public_key(),
+            )
+            .unwrap();
+            let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+            let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+            let len = initiator
+                .write_handshake_message(&[], &mut message)
+                .unwrap();
+            responder
+                .read_handshake_message(&mut message, &mut payload, len)
+                .unwrap();
+            let mut len = responder
+                .write_handshake_message(&[], &mut message)
+                .unwrap();
+            let receiver = if tamper_second_message {
+                &mut initiator
+            } else {
+                initiator
+                    .read_handshake_message(&mut message, &mut payload, len)
+                    .unwrap();
+                len = initiator
+                    .write_handshake_message(&[], &mut message)
+                    .unwrap();
+                &mut responder
+            };
+            message[len - 1] ^= 1;
+            assert!(receiver
+                .read_handshake_message(&mut message, &mut payload, len)
+                .is_err());
+            assert!(receiver.is_handshake());
+            assert_eq!(receiver.remote_static_public_key(), None);
+        }
+    }
+
+    #[test]
+    fn test_prepared_transport_operations_do_not_advance_state() {
+        let (initiator, responder) = transport_contexts();
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
+        let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+        let message = [42; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+
+        let ciphertext_len = initiator
+            .prepare_transport_write(&message, &mut ciphertext)
+            .unwrap();
+        let plaintext_len = responder
+            .prepare_transport_read(&ciphertext, &mut plaintext)
+            .unwrap();
+
+        assert_eq!(ciphertext_len, PUBKY_NOISE_TRANSPORT_PACKET_LEN);
+        assert_eq!(plaintext_len, PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN);
+        assert_eq!(plaintext, message);
+        assert_eq!(initiator.get_sending_nonce(), 0);
+        assert_eq!(responder.get_receiving_nonce(), 0);
+    }
+
+    #[test]
+    fn test_authenticated_transport_wire_vector() {
+        let (initiator, _) = transport_contexts();
+        let plaintext = crate::encode_transport_plaintext(b"paykit!").unwrap();
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
+
+        assert_eq!(
+            initiator
+                .prepare_transport_write(&plaintext, &mut ciphertext)
+                .unwrap(),
+            PUBKY_NOISE_TRANSPORT_PACKET_LEN
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(ciphertext)),
+            "a1eeedce594a1947e52c950ec6f207b133a93d1f09c92f01f0f66169d26d5c0c"
+        );
+    }
+
+    #[test]
+    fn test_authenticated_transport_rejects_non_zero_padding_without_advancing_state() {
+        let (initiator, responder) = transport_contexts();
+        let mut plaintext = crate::encode_transport_plaintext(b"message").unwrap();
+        *plaintext.last_mut().unwrap() = 1;
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
+        let sender_before = initiator.get_sending_nonce();
+        let receiver_before = responder.get_receiving_nonce();
+
+        assert_eq!(
+            initiator
+                .prepare_transport_write(&plaintext, &mut ciphertext)
+                .unwrap(),
+            PUBKY_NOISE_TRANSPORT_PACKET_LEN
+        );
+
+        let mut decrypted = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+        assert_eq!(
+            responder
+                .prepare_transport_read(&ciphertext, &mut decrypted)
+                .unwrap(),
+            PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN
+        );
+        assert_eq!(
+            crate::decode_transport_plaintext(&decrypted).unwrap_err(),
+            crate::PubkyNoiseError::BadLengthCiphertext
+        );
+        assert_eq!(initiator.get_sending_nonce(), sender_before);
+        assert_eq!(responder.get_receiving_nonce(), receiver_before);
+    }
+
+    #[test]
+    fn test_handshake_message_methods_reject_transport_phase() {
+        let (mut initiator, mut responder) = transport_contexts();
+        let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+        let initiator_before = (initiator.get_sending_nonce(), initiator.get_write_counter());
+        let responder_before = (
+            responder.get_receiving_nonce(),
+            responder.get_read_counter(),
+        );
+
+        assert!(matches!(
+            initiator.write_handshake_message(&[], &mut message),
+            Err(ContextError::InvalidPhase)
+        ));
+        assert!(matches!(
+            responder.read_handshake_message(&mut message, &mut payload, 0),
+            Err(ContextError::InvalidPhase)
+        ));
+        assert_eq!(
+            (initiator.get_sending_nonce(), initiator.get_write_counter()),
+            initiator_before
+        );
+        assert_eq!(
+            (
+                responder.get_receiving_nonce(),
+                responder.get_read_counter()
+            ),
+            responder_before
+        );
+    }
+
+    #[test]
+    fn test_transport_cursor_boundaries_reserve_restorable_sentinel() {
+        assert!(ensure_counter_can_increment(u32::MAX - 2).is_ok());
+        assert!(matches!(
+            ensure_counter_can_increment(u32::MAX - 1),
+            Err(ContextError::CounterOverflow)
+        ));
+        assert!(ensure_nonce_can_increment(u64::MAX - 2).is_ok());
+        assert!(matches!(
+            ensure_nonce_can_increment(u64::MAX - 1),
+            Err(ContextError::NonceOverflow)
+        ));
     }
 }

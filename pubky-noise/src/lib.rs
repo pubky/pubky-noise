@@ -1,3 +1,4 @@
+pub mod backup_crypto;
 pub mod identity_payload;
 pub mod path_derivation;
 pub mod serializer;
@@ -10,11 +11,13 @@ use std::sync::Arc;
 use pubky::errors::RequestError;
 use pubky::prelude::*;
 use pubky::PubkySession;
+use sha2::{Digest, Sha256};
 
 use serializer::{PubkyNoiseSessionState, SESSION_STATE_VERSION};
 use snow_crypto::{
     full_handshake_actions, ContextError, DataLinkContext, HandshakeAction, HandshakePattern,
-    NoisePhase, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN,
+    NoisePhase, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN, PUBKY_NOISE_TRANSPORT_PACKET_LEN,
+    PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN,
 };
 
 /// A 32-byte identifier derived from the Noise handshake.
@@ -24,16 +27,25 @@ use snow_crypto::{
 #[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 pub struct LinkId(pub [u8; 32]);
 
+/// Derive the X25519 public key for the static secret passed to
+/// [`PubkyNoiseEncryptor::new`]. This is not an Ed25519 public-key conversion.
+pub fn derive_static_public_key(secret_key: &[u8; 32]) -> [u8; 32] {
+    curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(*secret_key).to_bytes()
+}
+
 /// Decode a length-prefixed packet into a message buffer and its length.
 ///
 /// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
-fn decode_packet(
+fn decode_handshake_packet(
     ciphertext: &[u8],
 ) -> Result<([u8; PUBKY_NOISE_CIPHERTEXT_LEN], usize), PubkyNoiseError> {
-    if ciphertext.len() > PUBKY_NOISE_CIPHERTEXT_LEN + 2 {
+    if ciphertext.len() < 2 || ciphertext.len() > PUBKY_NOISE_CIPHERTEXT_LEN + 2 {
         return Err(PubkyNoiseError::BadLengthCiphertext);
     }
     let len = u16::from_be_bytes([ciphertext[0], ciphertext[1]]) as usize;
+    if len > PUBKY_NOISE_CIPHERTEXT_LEN || len + 2 > ciphertext.len() {
+        return Err(PubkyNoiseError::BadLengthCiphertext);
+    }
     let mut message = [0u8; PUBKY_NOISE_CIPHERTEXT_LEN];
     message[..len].copy_from_slice(&ciphertext[2..len + 2]);
     Ok((message, len))
@@ -42,7 +54,7 @@ fn decode_packet(
 /// Encode a message into a length-prefixed packet.
 ///
 /// Wire format: `[len_hi, len_lo, payload...]` where len is big-endian u16.
-fn encode_packet(data: &[u8], len: usize) -> [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2] {
+fn encode_handshake_packet(data: &[u8], len: usize) -> [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2] {
     let mut packet = [0u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2];
     let be_bytes = (len as u16).to_be_bytes();
     packet[0..2].copy_from_slice(&be_bytes);
@@ -50,11 +62,142 @@ fn encode_packet(data: &[u8], len: usize) -> [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2
     packet
 }
 
+async fn read_handshake_packet(
+    response: pubky::Result<reqwest::Response>,
+) -> Result<Option<([u8; PUBKY_NOISE_CIPHERTEXT_LEN], usize)>, PubkyNoiseError> {
+    let response = match response {
+        Ok(response) => response,
+        Err(Error::Request(RequestError::Server { status, .. }))
+            if status == StatusCode::NOT_FOUND || status == StatusCode::GONE =>
+        {
+            return Ok(None);
+        }
+        Err(_) => return Err(PubkyNoiseError::HomeserverResponseError),
+    };
+    let ciphertext = read_bounded_packet(response, PUBKY_NOISE_CIPHERTEXT_LEN + 2).await?;
+    decode_handshake_packet(&ciphertext).map(Some)
+}
+
+async fn read_bounded_packet(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, PubkyNoiseError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max_bytes as u64)
+    {
+        return Err(PubkyNoiseError::BadLengthCiphertext);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| PubkyNoiseError::HomeserverResponseError)?
+    {
+        // Check before extending; Content-Length may be absent or untrustworthy.
+        if chunk.len() > max_bytes - body.len() {
+            return Err(PubkyNoiseError::BadLengthCiphertext);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Build the fixed-size plaintext frame protected by Noise transport AEAD.
+///
+/// Format: `[body_len_hi, body_len_lo, body, zero padding]`.
+fn encode_transport_plaintext(
+    body: &[u8],
+) -> Result<[u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN], PubkyNoiseError> {
+    if body.len() > PUBKY_NOISE_MSG_LEN {
+        return Err(PubkyNoiseError::EncryptionError);
+    }
+
+    let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+    plaintext[..2].copy_from_slice(&(body.len() as u16).to_be_bytes());
+    plaintext[2..body.len() + 2].copy_from_slice(body);
+    Ok(plaintext)
+}
+
+/// Extract a message from an authenticated transport plaintext frame.
+fn decode_transport_plaintext(
+    plaintext: &[u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN],
+) -> Result<([u8; PUBKY_NOISE_MSG_LEN], usize), PubkyNoiseError> {
+    let body_len = u16::from_be_bytes([plaintext[0], plaintext[1]]) as usize;
+    if body_len > PUBKY_NOISE_MSG_LEN {
+        return Err(PubkyNoiseError::BadLengthCiphertext);
+    }
+    if plaintext[body_len + 2..].iter().any(|byte| *byte != 0) {
+        return Err(PubkyNoiseError::BadLengthCiphertext);
+    }
+
+    let mut body = [0; PUBKY_NOISE_MSG_LEN];
+    body[..body_len].copy_from_slice(&plaintext[2..body_len + 2]);
+    Ok((body, body_len))
+}
+
 fn map_context_overflow(err: ContextError) -> PubkyNoiseError {
     match err {
         ContextError::CounterOverflow => PubkyNoiseError::CounterOverflow,
         ContextError::NonceOverflow => PubkyNoiseError::NonceOverflow,
         _ => PubkyNoiseError::OtherError,
+    }
+}
+
+fn map_backup_error(err: backup_crypto::BackupCryptoError) -> PubkyNoiseError {
+    match err {
+        backup_crypto::BackupCryptoError::Rollback { .. } => {
+            PubkyNoiseError::RestoreBackupRollbackError
+        }
+        backup_crypto::BackupCryptoError::DecryptError => {
+            PubkyNoiseError::RestoreBackupDecryptError
+        }
+        _ => PubkyNoiseError::RestoreBackupDeserializeError,
+    }
+}
+
+// Hash the exact prepared operation so stale or modified values cannot be acknowledged.
+fn prepared_transport_digest(
+    operation_kind: u8,
+    resource: &[u8],
+    message: &[u8],
+    state: &PubkyNoiseSessionState,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update([operation_kind]);
+    hasher.update((resource.len() as u64).to_be_bytes());
+    hasher.update(resource);
+    hasher.update((message.len() as u64).to_be_bytes());
+    hasher.update(message);
+    hasher.update(state.serialize());
+    hasher.finalize().into()
+}
+
+/// A session snapshot loaded and decrypted from the homeserver.
+///
+/// Returned by [`PubkyNoiseEncryptor::load_snapshot`]. The `generation` is
+/// the caller-managed monotonic counter bound into the backup; after a
+/// successful load, callers should record it in trusted local storage as
+/// their new rollback checkpoint (the accepted generation is never lower
+/// than the `min_generation` the load was checked against, but may be
+/// higher).
+#[derive(Clone)]
+pub struct LoadedSnapshot {
+    /// The generation the backup was persisted with.
+    pub generation: u64,
+    /// The decrypted session state, ready for
+    /// [`PubkyNoiseEncryptor::restore`].
+    pub state: PubkyNoiseSessionState,
+}
+
+/// Redacted `Debug`: delegates to the redacted `Debug` of
+/// [`PubkyNoiseSessionState`], which never renders secret key material.
+impl std::fmt::Debug for LoadedSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedSnapshot")
+            .field("generation", &self.generation)
+            .field("state", &self.state)
+            .finish()
     }
 }
 
@@ -71,19 +214,36 @@ pub enum PubkyNoiseError {
     HomeserverWriteError,
     IsHandshake,
     /// Restore failed: handshake replay error.
-    RestoreReplayError,
+    RestoreBackupReplayError,
     /// Restore failed: handshake hash mismatch after replay.
-    RestoreHashMismatch,
+    RestoreBackupHashMismatch,
     /// Restore failed: deserialization error.
-    RestoreDeserializeError,
-    /// Transport-phase encryption (write_act) failed.
+    RestoreBackupDeserializeError,
+    /// Restore failed: persisted snapshot decryption failed.
+    RestoreBackupDecryptError,
+    /// Restore failed: persisted snapshot is older than the trusted local
+    /// checkpoint (rollback detected).
+    RestoreBackupRollbackError,
+    /// Restore failed: no backup exists at the backup path on the homeserver.
+    ///
+    /// Distinct from [`PubkyNoiseError::HomeserverResponseError`], which
+    /// signals a connectivity or server problem rather than the confirmed
+    /// absence of a backup.
+    RestoreBackupNotFoundError,
+    /// Handshake or transport message encryption failed.
     EncryptionError,
-    /// Transport-phase decryption (read_act) failed.
+    /// Handshake or transport message authentication/decryption failed.
     DecryptionError,
     /// Message slot counter space is exhausted.
     CounterOverflow,
     /// Transport nonce space is exhausted.
     NonceOverflow,
+    /// A prepared transport operation is awaiting durable acknowledgement.
+    UnacknowledgedPreparedTransport,
+    /// No prepared transport operation is awaiting acknowledgement.
+    NoPreparedTransport,
+    /// The prepared value does not match the operation awaiting acknowledgement.
+    PreparedTransportMismatch,
     OtherError,
 }
 
@@ -91,6 +251,172 @@ pub enum PubkyNoiseError {
 pub enum HandshakeResult {
     Pending,
     Terminal,
+}
+
+/// A handshake step prepared for durable storage and later publication.
+///
+/// Persist the resulting state and optional exact packet/path together before
+/// publishing. Keep the packet pending across uncertain writes and retry those
+/// same bytes. While a packet is pending, do not restore and advance the state
+/// or promote it to transport. The caller must durably acknowledge publication
+/// under its ownership and peer-authorization checks. Completion here is
+/// cryptographic only.
+#[must_use = "persist the state and exact pending packet before publication"]
+pub struct PreparedHandshakeStep {
+    resulting_session_state: PubkyNoiseSessionState,
+    outgoing: Option<(String, [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2])>,
+    handshake_complete: bool,
+    remote_static_public_key: Option<Vec<u8>>,
+}
+
+impl PreparedHandshakeStep {
+    /// Return the post-step state, which remains in handshake phase.
+    pub fn resulting_session_state(&self) -> &PubkyNoiseSessionState {
+        &self.resulting_session_state
+    }
+
+    /// Return the publication path, present exactly when [`Self::packet`] is.
+    pub fn destination_path(&self) -> Option<&str> {
+        self.outgoing.as_ref().map(|(path, _)| path.as_str())
+    }
+
+    /// Return the exact length-prefixed, padded wire packet to publish or retry.
+    pub fn packet(&self) -> Option<&[u8]> {
+        self.outgoing.as_ref().map(|(_, packet)| packet.as_slice())
+    }
+
+    /// Return cryptographic completion, not publication or application readiness.
+    /// A completed step can still contain an outgoing packet.
+    pub fn is_handshake_complete(&self) -> bool {
+        self.handshake_complete
+    }
+
+    /// Return the learned static key after cryptographic completion, if any.
+    /// Compare it with the independently authenticated expected peer key.
+    pub fn remote_static_public_key(&self) -> Option<&[u8]> {
+        self.remote_static_public_key.as_deref()
+    }
+}
+
+impl std::fmt::Debug for PreparedHandshakeStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedHandshakeStep")
+            .field("resulting_session_state", &"<redacted>")
+            .field("outgoing", &"<redacted>")
+            .field("handshake_complete", &self.handshake_complete)
+            .field("remote_static_public_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// A transport message staged for persistent handoff and later publication.
+///
+/// Preparing a send reserves its nonce and storage slot on the encryptor.
+/// Callers must persist this value before publishing its ciphertext.
+#[must_use = "persist and acknowledge the prepared send before continuing"]
+pub struct PreparedSend {
+    /// Pubky storage path for the ciphertext.
+    destination_path: String,
+    /// Exact ciphertext packet to publish or retry.
+    ciphertext: [u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
+    /// Session state to persist with this prepared ciphertext.
+    resulting_session_state: PubkyNoiseSessionState,
+    // Binds acknowledgement to this exact prepared operation; it is not a secret.
+    acknowledgement_digest: [u8; 32],
+}
+
+impl PreparedSend {
+    /// Return the Pubky path where the ciphertext must be published.
+    pub fn destination_path(&self) -> &str {
+        &self.destination_path
+    }
+
+    /// Return the exact ciphertext packet to publish or retry.
+    pub fn ciphertext(&self) -> &[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN] {
+        &self.ciphertext
+    }
+
+    /// Return the session state produced by this send.
+    pub fn resulting_session_state(&self) -> &PubkyNoiseSessionState {
+        &self.resulting_session_state
+    }
+}
+
+impl std::fmt::Debug for PreparedSend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedSend")
+            .field("destination_path", &self.destination_path)
+            .field(
+                "ciphertext",
+                &format_args!("<redacted:{} bytes>", self.ciphertext.len()),
+            )
+            .field("resulting_session_state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// A decrypted transport message and its resulting session state.
+///
+/// Preparing a receive advances the encryptor past its ciphertext. Callers
+/// should atomically replace the previous persisted session snapshot with
+/// `resulting_session_state` while storing the application state produced from
+/// `plaintext`, before exposing the event as processed.
+///
+/// The plaintext is sensitive application data. Avoid logging it, minimize
+/// copies, and protect it at rest if the application protocol requires its
+/// persistence.
+#[must_use = "persist the processing result and acknowledge the receive before continuing"]
+pub struct PreparedReceive {
+    /// Decrypted private message payload buffer.
+    plaintext: [u8; PUBKY_NOISE_MSG_LEN],
+    plaintext_len: usize,
+    /// Session state to persist with the application's processing result.
+    resulting_session_state: PubkyNoiseSessionState,
+    // Binds acknowledgement to this exact prepared operation; it is not a secret.
+    acknowledgement_digest: [u8; 32],
+}
+
+impl PreparedReceive {
+    /// Return the exact decrypted private message payload.
+    pub fn plaintext(&self) -> &[u8] {
+        &self.plaintext[..self.plaintext_len]
+    }
+
+    /// Return the session state produced by this receive.
+    pub fn resulting_session_state(&self) -> &PubkyNoiseSessionState {
+        &self.resulting_session_state
+    }
+}
+
+impl std::fmt::Debug for PreparedReceive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedReceive")
+            .field("plaintext", &"<redacted>")
+            .field("resulting_session_state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Exact in-memory retry state retained by the deprecated convenience send API.
+struct PendingConvenienceSend {
+    /// Pubky path targeted by the original send attempt.
+    destination_path: String,
+    /// Ciphertext that must be retried without re-encryption.
+    ciphertext: [u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
+    /// Digest used to acknowledge the matching prepared state transition.
+    acknowledgement_digest: [u8; 32],
+}
+
+impl std::fmt::Debug for PendingConvenienceSend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingConvenienceSend")
+            .field("destination_path", &self.destination_path)
+            .field(
+                "ciphertext",
+                &format_args!("<redacted:{} bytes>", self.ciphertext.len()),
+            )
+            .finish()
+    }
 }
 
 /// Shared configuration and resources for multiple `PubkyNoiseEncryptor` instances.
@@ -216,6 +542,10 @@ pub struct PubkyNoiseEncryptor {
     /// [`handle_handshake()`](Self::handle_handshake) call, before any
     /// state-mutating work. See [`last_good_snapshot()`](Self::last_good_snapshot).
     last_good_snapshot: Option<PubkyNoiseSessionState>,
+    /// Fences transport operations until the prepared transition is persisted.
+    unacknowledged_transport_digest: Option<[u8; 32]>,
+    /// Exact retry data retained after an ambiguous convenience-send failure.
+    pending_convenience_send: Option<PendingConvenienceSend>,
 
     // test-only fields — stripped from production builds
     #[cfg(feature = "test-utils")]
@@ -223,7 +553,7 @@ pub struct PubkyNoiseEncryptor {
     #[cfg(feature = "test-utils")]
     simulate_write_failure: bool,
     #[cfg(feature = "test-utils")]
-    last_ciphertext: Option<[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]>,
+    last_ciphertext: Option<[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN]>,
 }
 
 impl PubkyNoiseEncryptor {
@@ -261,6 +591,8 @@ impl PubkyNoiseEncryptor {
             link_id: None,
             endpoint_pubkey,
             last_good_snapshot: None,
+            unacknowledged_transport_digest: None,
+            pending_convenience_send: None,
             #[cfg(feature = "test-utils")]
             simulate_tampering: false,
             #[cfg(feature = "test-utils")]
@@ -275,20 +607,130 @@ impl PubkyNoiseEncryptor {
         !self.context.is_handshake()
     }
 
+    /// Return the remote X25519 static key learned from the Noise handshake.
+    ///
+    /// Returns `None` until the handshake completes, or when the
+    /// pattern has no remote static key. Available in transport and after restore.
+    /// Callers must compare this with their independently authenticated expected
+    /// key before trusting the completed link or exchanging application messages.
+    pub fn remote_static_public_key(&self) -> Option<&[u8]> {
+        self.context.remote_static_public_key()
+    }
+
+    /// Consume this encryptor to prepare one handshake step without network I/O.
+    ///
+    /// Supply the complete incoming wire packet exactly when the current step
+    /// requires a read. Use the saved state's
+    /// [`PubkyNoiseSessionState::next_handshake_read_slot`] to plan that read,
+    /// and validate the source checkpoint and peer authorization before applying
+    /// the result. Absence is a polling outcome, not an input that skips a read.
+    ///
+    /// On failure, discard the consumed state and restore the previous durable
+    /// checkpoint. On success, persist the returned state and pending output
+    /// atomically before any PUT. The final XX output must be published and
+    /// durably acknowledged before promoting the handshake to transport.
+    ///
+    /// # Errors
+    /// Returns [`PubkyNoiseError::BadLengthCiphertext`] for missing, unexpected or
+    /// malformed input, [`PubkyNoiseError::DecryptionError`] for authentication
+    /// failure, [`PubkyNoiseError::EncryptionError`] for a failed Noise write,
+    /// [`PubkyNoiseError::CounterOverflow`] for exhausted message slots, or
+    /// [`PubkyNoiseError::OtherError`] if already in transport phase.
+    /// Unsupported patterns return [`PubkyNoiseError::UnknownNoisePattern`].
+    pub fn prepare_handshake_step(
+        mut self,
+        incoming_packet: Option<&[u8]>,
+    ) -> Result<PreparedHandshakeStep, PubkyNoiseError> {
+        if self.context.is_transport() {
+            return Err(PubkyNoiseError::OtherError);
+        }
+        let actions = self.context.remaining_handshake_actions()?;
+        if actions.contains(&HandshakeAction::Read) != incoming_packet.is_some() {
+            return Err(PubkyNoiseError::BadLengthCiphertext);
+        }
+        let mut incoming = incoming_packet.map(decode_handshake_packet).transpose()?;
+        let mut outgoing = None;
+        for action in actions {
+            match action {
+                HandshakeAction::Read => {
+                    let (message, len) = incoming
+                        .take()
+                        .ok_or(PubkyNoiseError::BadLengthCiphertext)?;
+                    self.apply_handshake_read(message, len)?;
+                }
+                HandshakeAction::Write => {
+                    self.context
+                        .ensure_can_increment_counter()
+                        .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+                    outgoing = Some(self.prepare_handshake_packet()?);
+                    self.advance_handshake_message()?;
+                }
+                HandshakeAction::Pending => {
+                    self.context.advance_sub_step();
+                    break;
+                }
+                HandshakeAction::Terminal => break,
+            }
+        }
+        self.context.complete_step();
+        Ok(PreparedHandshakeStep {
+            resulting_session_state: self.snapshot_unchecked(),
+            outgoing,
+            handshake_complete: self.is_handshake_complete(),
+            remote_static_public_key: self.remote_static_public_key().map(<[u8]>::to_vec),
+        })
+    }
+
+    fn apply_handshake_read(
+        &mut self,
+        mut message: [u8; PUBKY_NOISE_CIPHERTEXT_LEN],
+        len: usize,
+    ) -> Result<(), PubkyNoiseError> {
+        self.context
+            .ensure_can_increment_counter()
+            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+        let mut payload = [0; PUBKY_NOISE_MSG_LEN];
+        self.context
+            .read_handshake_message(&mut message, &mut payload, len)
+            .map_err(|_| PubkyNoiseError::DecryptionError)?;
+        self.advance_handshake_message()
+    }
+
+    fn prepare_handshake_packet(
+        &mut self,
+    ) -> Result<(String, [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]), PubkyNoiseError> {
+        let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let len = self
+            .context
+            .write_handshake_message(&[], &mut message)
+            .map_err(|_| PubkyNoiseError::EncryptionError)?;
+        let path = format!("{}/{}", self.config.write_path, self.context.get_counter());
+        Ok((path, encode_handshake_packet(&message, len)))
+    }
+
+    fn advance_handshake_message(&mut self) -> Result<(), PubkyNoiseError> {
+        self.context
+            .increment_counter()
+            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
+        self.context.advance_sub_step();
+        Ok(())
+    }
+
     /// Handle the forwarding and processing of Noise handshake messages.
     ///
     /// This method is **polling-safe**: it can be called repeatedly by either
     /// the initiator or responder in any order. If the peer's message is not
-    /// yet available, returns `HandshakeResult::Pending` without advancing state.
+    /// yet available, returns `HandshakeResult::Pending` without advancing that read.
     ///
     /// # Outbox reliability and recovery
     ///
     /// In the outbox model, two kinds of interruption can occur:
     ///
-    /// - **Read failure** (Responder fails to read from Initiator's outbox):
-    ///   The method returns `Pending` without advancing `step`, `sub_step`, or
-    ///   `counter`. Subsequent calls will retry the same read and succeed once
-    ///   the message appears. No special recovery is needed.
+    /// - **Absent message** (HTTP 404/410 from the peer's outbox):
+    ///   The method returns `Pending` without advancing the pending read.
+    ///   Other GET or body-read failures return
+    ///   [`PubkyNoiseError::HomeserverResponseError`]. Subsequent calls retry
+    ///   the same read; earlier successful actions in this call remain applied.
     ///
     /// - **Write failure** (Initiator fails to write to her outbox):
     ///   If the homeserver `put()` call fails, this method returns
@@ -300,13 +742,19 @@ impl PubkyNoiseEncryptor {
     ///
     ///   **Recovery**: each call to `handle_handshake` automatically captures
     ///   a pre-mutation snapshot accessible via
-    ///   [`last_good_snapshot()`](Self::last_good_snapshot). Callers should
-    ///   persist this snapshot (e.g. via [`persist_snapshot()`](Self::persist_snapshot))
-    ///   so that on restart they can pass it to if there has been a failure
-    ///   [`restore()`](Self::restore).
-    ///   The replay mechanism will rebuild the Noise state from what is
-    ///   actually on the homeservers, correcting the state and allowing the
-    ///   handshake to resume from the right position.
+    ///   [`last_good_snapshot()`](Self::last_good_snapshot). For in-process
+    ///   recovery, pass that snapshot directly to [`restore()`](Self::restore);
+    ///   the replay mechanism rebuilds the Noise state at that checkpoint,
+    ///   allowing the handshake to resume from the right position.
+    ///
+    ///   Callers that need crash recovery must durably persist the
+    ///   pre-mutation snapshot themselves: encrypt it with
+    ///   [`backup_crypto::encrypt_backup_with_key`] and store it through
+    ///   caller-managed storage *before* the risky call. Note that
+    ///   [`persist_snapshot()`](Self::persist_snapshot) snapshots the
+    ///   encryptor's state at call time — it cannot persist
+    ///   `last_good_snapshot()`, and after a write failure the current state
+    ///   may already be advanced and corrupted.
     ///
     ///   Note: if the `put()` succeeds but the data is subsequently lost
     ///   (e.g. homeserver crash after acknowledgment), the same snapshot-based
@@ -314,17 +762,26 @@ impl PubkyNoiseEncryptor {
     ///   method.
     ///
     /// # Errors:
+    /// - Returns [`PubkyNoiseError::UnknownNoisePattern`] for unsupported patterns.
     /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] on malformed messages.
-    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on response parse failure.
+    /// - Returns [`PubkyNoiseError::DecryptionError`] if a handshake message fails
+    ///   authentication. The failed read does not advance the message counter or
+    ///   handshake step. Restore from [`last_good_snapshot()`](Self::last_good_snapshot)
+    ///   before reusing the encryptor.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on GET failures other
+    ///   than HTTP 404/410, or if the response body cannot be read.
     /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
     ///   write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
     ///   and [`restore()`](Self::restore) is required.
     /// - Returns [`PubkyNoiseError::CounterOverflow`] if message slot space is exhausted.
+    ///
+    /// Successful response bodies are size-bounded before packet validation.
+    /// Non-2xx bodies are handled by the Pubky SDK's configured error-body limit.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyNoiseError> {
         // Capture pre-mutation snapshot so callers can recover from write failures.
-        self.last_good_snapshot = Some(self.snapshot());
+        self.last_good_snapshot = Some(self.snapshot_unchecked());
 
-        let remaining_actions = self.context.remaining_handshake_actions();
+        let remaining_actions = self.context.remaining_handshake_actions()?;
         for action in remaining_actions {
             match action {
                 HandshakeAction::Read => {
@@ -336,42 +793,22 @@ impl PubkyNoiseEncryptor {
                     let public_key = &self.endpoint_pubkey;
                     let formatted_path = format!("{public_key}/{path}/{counter}");
 
-                    if let Ok(response) = self
+                    let response = self
                         .config
                         .outbox_client
                         .public_storage()
                         .get(formatted_path)
-                        .await
-                    {
-                        if response.status().is_success() {
-                            if let Ok(ciphertext) = response.bytes().await {
-                                let (mut message, len) = decode_packet(&ciphertext)?;
-                                let mut payload = [0; PUBKY_NOISE_MSG_LEN];
-                                let _ = self.context.read_act(&mut message, &mut payload, len);
-                            } else {
-                                return Err(PubkyNoiseError::HomeserverResponseError);
-                            }
-                            self.context
-                                .increment_counter()
-                                .map_err(|_| PubkyNoiseError::CounterOverflow)?;
-                            self.context.advance_sub_step();
-                        } else {
-                            return Ok(HandshakeResult::Pending);
-                        }
-                    } else {
+                        .await;
+                    let Some((message, len)) = read_handshake_packet(response).await? else {
                         return Ok(HandshakeResult::Pending);
-                    }
+                    };
+                    self.apply_handshake_read(message, len)?;
                 }
                 HandshakeAction::Write => {
                     self.context
                         .ensure_can_increment_counter()
                         .map_err(|_| PubkyNoiseError::CounterOverflow)?;
-                    let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
-                    if let Ok(len) = self.context.write_act(&[], &mut message) {
-                        let path = self.config.write_path.as_str();
-                        let counter = self.context.get_counter();
-                        let formatted_path = format!("{path}/{counter}");
-                        let packet = encode_packet(&message, len);
+                    if let Ok((formatted_path, packet)) = self.prepare_handshake_packet() {
                         // Check for simulated write failure (test-only) or
                         // actual homeserver write failure.
                         #[cfg(feature = "test-utils")]
@@ -399,10 +836,7 @@ impl PubkyNoiseEncryptor {
                             // last_good_snapshot() + restore().
                             return Err(PubkyNoiseError::HomeserverWriteError);
                         }
-                        self.context
-                            .increment_counter()
-                            .map_err(|_| PubkyNoiseError::CounterOverflow)?;
-                        self.context.advance_sub_step();
+                        self.advance_handshake_message()?;
                     }
                 }
                 HandshakeAction::Pending => {
@@ -432,25 +866,15 @@ impl PubkyNoiseEncryptor {
             return Err(PubkyNoiseError::IsHandshake);
         }
         let link_id = LinkId(self.context.get_handshake_hash().unwrap());
-        let _ = self.context.to_transport();
+        let _ = self.context.transition_to_transport();
         self.link_id = Some(link_id);
         Ok(link_id)
     }
 
-    /// Encrypt and send plaintext over the established transport.
-    /// The maximum payload size is [`PUBKY_NOISE_MSG_LEN`] bytes.
-    ///
-    /// # Errors:
-    /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
-    /// - Returns [`PubkyNoiseError::EncryptionError`] if Noise encryption fails.
-    /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
-    ///   write fails.
-    /// - Returns [`PubkyNoiseError::CounterOverflow`] if the outbound transport
-    ///   slot space is exhausted.
-    /// - Returns [`PubkyNoiseError::NonceOverflow`] if the sending nonce space
-    ///   is exhausted.
-    pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), PubkyNoiseError> {
-        // Phase guard: must be in transport mode
+    fn build_prepared_send(&self, plaintext: &[u8]) -> Result<PreparedSend, PubkyNoiseError> {
+        if self.unacknowledged_transport_digest.is_some() {
+            return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
+        }
         if !self.context.is_transport() {
             return Err(PubkyNoiseError::IsHandshake);
         }
@@ -461,47 +885,393 @@ impl PubkyNoiseEncryptor {
         self.context
             .ensure_can_advance_sending_nonce()
             .map_err(map_context_overflow)?;
-        let counter = self.context.get_write_slot();
 
-        let mut out = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+        let plaintext = encode_transport_plaintext(plaintext)?;
+        let mut ciphertext = [0; PUBKY_NOISE_TRANSPORT_PACKET_LEN];
         let len = self
             .context
-            .write_act(plaintext, &mut out)
+            .prepare_transport_write(&plaintext, &mut ciphertext)
             .map_err(|_| PubkyNoiseError::EncryptionError)?;
+        if len != PUBKY_NOISE_TRANSPORT_PACKET_LEN {
+            return Err(PubkyNoiseError::EncryptionError);
+        }
+        let counter = self.context.get_write_slot();
+        let destination_path = format!("{}/{counter}", self.config.write_path);
 
-        let packet = encode_packet(&out, len);
+        let mut resulting_session_state = self.snapshot_unchecked();
+        resulting_session_state.sending_nonce = resulting_session_state
+            .sending_nonce
+            .checked_add(1)
+            .ok_or(PubkyNoiseError::NonceOverflow)?;
+        resulting_session_state.write_counter = resulting_session_state
+            .write_counter
+            .checked_add(1)
+            .ok_or(PubkyNoiseError::CounterOverflow)?;
 
+        let acknowledgement_digest = prepared_transport_digest(
+            0,
+            destination_path.as_bytes(),
+            &ciphertext,
+            &resulting_session_state,
+        );
+
+        Ok(PreparedSend {
+            destination_path,
+            ciphertext,
+            resulting_session_state,
+            acknowledgement_digest,
+        })
+    }
+
+    fn apply_prepared_send(&mut self, prepared: &PreparedSend) {
+        self.context
+            .set_sending_nonce(prepared.resulting_session_state.sending_nonce);
+        self.context
+            .set_write_counter(prepared.resulting_session_state.write_counter);
+    }
+
+    /// Encrypt and stage a transport message for persistent handoff.
+    ///
+    /// This method performs the Noise encryption without writing to Pubky. It
+    /// reserves the nonce and storage slot on this encryptor so another call
+    /// cannot prepare different plaintext with the same nonce. The maximum
+    /// payload size is [`PUBKY_NOISE_MSG_LEN`] bytes.
+    ///
+    /// Persist the returned destination path, exact ciphertext, and
+    /// `resulting_session_state` together before publishing the ciphertext. Use
+    /// caller-managed persistent storage for this transaction; [`persist_snapshot()`](Self::persist_snapshot)
+    /// is rejected while a prepared operation awaits acknowledgement. If
+    /// persistence fails, discard this encryptor and restore its previous
+    /// persisted state. If publication status is uncertain, retry the exact
+    /// prepared ciphertext instead of preparing the plaintext again.
+    ///
+    /// Callers sharing session state across processes must serialize preparation
+    /// and conditionally persist the resulting state against the state they
+    /// loaded.
+    /// Call [`acknowledge_persisted_send()`](Self::acknowledge_persisted_send) after
+    /// persistence succeeds. No other transport operation can be prepared on
+    /// this encryptor until then.
+    ///
+    /// # Errors
+    /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] if another staged
+    ///   transport operation has not been acknowledged.
+    /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
+    /// - Returns [`PubkyNoiseError::EncryptionError`] if Noise encryption fails.
+    /// - Returns [`PubkyNoiseError::CounterOverflow`] if the outbound transport
+    ///   slot space is exhausted.
+    /// - Returns [`PubkyNoiseError::NonceOverflow`] if the sending nonce space
+    ///   is exhausted.
+    pub fn prepare_send(&mut self, plaintext: &[u8]) -> Result<PreparedSend, PubkyNoiseError> {
+        let prepared = self.build_prepared_send(plaintext)?;
         #[cfg(feature = "test-utils")]
         if self.simulate_tampering {
-            self.last_ciphertext = Some(packet);
+            self.last_ciphertext = Some(prepared.ciphertext);
+        }
+        self.apply_prepared_send(&prepared);
+        self.unacknowledged_transport_digest = Some(prepared.acknowledgement_digest);
+        Ok(prepared)
+    }
+
+    /// Encrypt and send plaintext over the established transport.
+    /// The maximum payload size is [`PUBKY_NOISE_MSG_LEN`] bytes.
+    ///
+    /// This convenience method cannot make the ciphertext and resulting Noise
+    /// state durable atomically. Use [`prepare_send()`](Self::prepare_send) for
+    /// crash-safe publication and exact-ciphertext retry.
+    /// If the homeserver write fails, this encryptor remains fenced;
+    /// [`retry_pending_send()`](Self::retry_pending_send) republishes the exact
+    /// retained ciphertext. That recovery is in-memory only and does not make
+    /// this method crash-safe.
+    ///
+    /// # Errors:
+    /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] if a staged
+    ///   transport operation has not been acknowledged.
+    /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
+    /// - Returns [`PubkyNoiseError::EncryptionError`] if Noise encryption fails.
+    /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
+    ///   write fails.
+    /// - Returns [`PubkyNoiseError::CounterOverflow`] if the outbound transport
+    ///   slot space is exhausted.
+    /// - Returns [`PubkyNoiseError::NonceOverflow`] if the sending nonce space
+    ///   is exhausted.
+    #[deprecated(
+        note = "use prepare_send and acknowledge_persisted_send for crash-safe publication"
+    )]
+    pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), PubkyNoiseError> {
+        let prepared = self.prepare_send(plaintext)?;
+
+        self.pending_convenience_send = Some(PendingConvenienceSend {
+            destination_path: prepared.destination_path.clone(),
+            ciphertext: prepared.ciphertext,
+            acknowledgement_digest: prepared.acknowledgement_digest,
+        });
+
+        self.publish_pending_convenience_send().await
+    }
+
+    async fn publish_pending_convenience_send(&mut self) -> Result<(), PubkyNoiseError> {
+        let Some(pending) = self.pending_convenience_send.as_ref() else {
+            return Err(PubkyNoiseError::NoPreparedTransport);
+        };
+        let destination_path = pending.destination_path.clone();
+        let ciphertext = pending.ciphertext;
+        let acknowledgement_digest = pending.acknowledgement_digest;
+
+        #[cfg(feature = "test-utils")]
+        if self.simulate_write_failure {
+            return Err(PubkyNoiseError::HomeserverWriteError);
         }
 
-        let path = self.config.write_path.as_str();
-        let formatted_path = format!("{path}/{counter}");
         self.config
             .local_session
             .storage()
-            .put(formatted_path, packet.to_vec())
+            .put(destination_path, ciphertext.to_vec())
             .await
             .map_err(|_| PubkyNoiseError::HomeserverWriteError)?;
-        // Advance the sending nonce only after the write is confirmed.
-        // write_act() no longer increments the nonce internally, so that
-        // a failed put() does not desynchronize the nonce with the receiver.
-        self.context
-            .increment_sending_nonce()
-            .map_err(map_context_overflow)?;
-        self.context
-            .increment_write_counter()
-            .map_err(map_context_overflow)?;
+        self.acknowledge_prepared_transport(&acknowledgement_digest)?;
+        self.pending_convenience_send = None;
         Ok(())
+    }
+
+    /// Retry the exact ciphertext retained after an ambiguous `send_message` failure.
+    ///
+    /// Prefer the staged persistence API for new code. This in-memory retry does not
+    /// survive a process crash.
+    ///
+    /// # Errors
+    /// - Returns [`PubkyNoiseError::NoPreparedTransport`] if no convenience send
+    ///   is awaiting retry.
+    /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if publication fails.
+    #[deprecated(note = "use prepare_send with a persisted outbound record")]
+    pub async fn retry_pending_send(&mut self) -> Result<(), PubkyNoiseError> {
+        self.publish_pending_convenience_send().await
+    }
+
+    /// Return the Pubky resource path for the next inbound transport message.
+    ///
+    /// This method does not perform network I/O or mutate the encryptor.
+    ///
+    /// # Errors
+    /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] if a staged
+    ///   transport operation has not been acknowledged.
+    /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
+    /// - Returns [`PubkyNoiseError::CounterOverflow`] or
+    ///   [`PubkyNoiseError::NonceOverflow`] if the inbound transport space is
+    ///   exhausted.
+    pub fn next_receive_path(&self) -> Result<String, PubkyNoiseError> {
+        if self.unacknowledged_transport_digest.is_some() {
+            return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
+        }
+        if !self.context.is_transport() {
+            return Err(PubkyNoiseError::IsHandshake);
+        }
+        self.context
+            .ensure_can_advance_read_slot()
+            .map_err(map_context_overflow)?;
+        self.context
+            .ensure_can_advance_receiving_nonce()
+            .map_err(map_context_overflow)?;
+
+        Ok(format!(
+            "{}/{}/{}",
+            self.context.get_endpoint(),
+            self.config.read_path,
+            self.context.get_read_slot()
+        ))
+    }
+
+    fn build_prepared_receive(
+        &self,
+        ciphertext: &[u8],
+    ) -> Result<PreparedReceive, PubkyNoiseError> {
+        if self.unacknowledged_transport_digest.is_some() {
+            return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
+        }
+        if !self.context.is_transport() {
+            return Err(PubkyNoiseError::IsHandshake);
+        }
+        self.context
+            .ensure_can_advance_read_slot()
+            .map_err(map_context_overflow)?;
+        self.context
+            .ensure_can_advance_receiving_nonce()
+            .map_err(map_context_overflow)?;
+
+        let message: &[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN] = ciphertext
+            .try_into()
+            .map_err(|_| PubkyNoiseError::BadLengthCiphertext)?;
+        #[cfg(feature = "test-utils")]
+        let message = {
+            let mut message = *message;
+            if self.simulate_tampering {
+                message[1] ^= 1;
+            }
+            message
+        };
+        #[cfg(feature = "test-utils")]
+        let message = &message;
+        let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+
+        let plaintext_len = self
+            .context
+            .prepare_transport_read(message, &mut plaintext)
+            .map_err(|err| match err {
+                ContextError::NonceOverflow => PubkyNoiseError::NonceOverflow,
+                _ => PubkyNoiseError::DecryptionError,
+            })?;
+        if plaintext_len != PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN {
+            return Err(PubkyNoiseError::DecryptionError);
+        }
+        let (plaintext, plaintext_len) = decode_transport_plaintext(&plaintext)?;
+
+        let mut resulting_session_state = self.snapshot_unchecked();
+        resulting_session_state.receiving_nonce = resulting_session_state
+            .receiving_nonce
+            .checked_add(1)
+            .ok_or(PubkyNoiseError::NonceOverflow)?;
+        resulting_session_state.read_counter = resulting_session_state
+            .read_counter
+            .checked_add(1)
+            .ok_or(PubkyNoiseError::CounterOverflow)?;
+
+        let acknowledgement_digest = prepared_transport_digest(
+            1,
+            self.config.read_path.as_bytes(),
+            &plaintext[..plaintext_len],
+            &resulting_session_state,
+        );
+
+        Ok(PreparedReceive {
+            plaintext,
+            plaintext_len,
+            resulting_session_state,
+            acknowledgement_digest,
+        })
+    }
+
+    fn apply_prepared_receive(&mut self, prepared: &PreparedReceive) {
+        self.context
+            .set_receiving_nonce(prepared.resulting_session_state.receiving_nonce);
+        self.context
+            .set_read_counter(prepared.resulting_session_state.read_counter);
+    }
+
+    /// Prepare an inbound ciphertext for persistent application processing.
+    ///
+    /// This method decrypts the packet and advances this encryptor past it
+    /// without performing network I/O. Atomically replace the previous persisted
+    /// session snapshot with `resulting_session_state` while storing the
+    /// application state produced from the plaintext, before treating the event
+    /// as processed. Use caller-managed persistent storage;
+    /// [`persist_snapshot()`](Self::persist_snapshot) is rejected while a
+    /// prepared operation awaits acknowledgement. If persistence fails, discard
+    /// this encryptor and restore its previous persisted state.
+    ///
+    /// Treat the plaintext as sensitive application data. Do not log it, and
+    /// protect it at rest if the application protocol requires its persistence.
+    ///
+    /// Callers sharing session state across processes must serialize preparation
+    /// and conditionally persist the resulting state against the state they
+    /// loaded.
+    /// Call [`acknowledge_persisted_receive()`](Self::acknowledge_persisted_receive) after
+    /// persistence succeeds. No other transport operation can be prepared on
+    /// this encryptor until then.
+    ///
+    /// # Errors
+    /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] if another staged
+    ///   transport operation has not been acknowledged.
+    /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
+    /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] if the packet is malformed.
+    /// - Returns [`PubkyNoiseError::DecryptionError`] if Noise decryption fails.
+    /// - Returns [`PubkyNoiseError::CounterOverflow`] if the remote outbound
+    ///   transport slot space is exhausted.
+    /// - Returns [`PubkyNoiseError::NonceOverflow`] if the receiving nonce space
+    ///   is exhausted.
+    pub fn prepare_receive(
+        &mut self,
+        ciphertext: &[u8],
+    ) -> Result<PreparedReceive, PubkyNoiseError> {
+        let prepared = self.build_prepared_receive(ciphertext)?;
+        self.apply_prepared_receive(&prepared);
+        self.unacknowledged_transport_digest = Some(prepared.acknowledgement_digest);
+        Ok(prepared)
+    }
+
+    fn acknowledge_prepared_transport(
+        &mut self,
+        acknowledgement_digest: &[u8; 32],
+    ) -> Result<(), PubkyNoiseError> {
+        let Some(pending_digest) = self.unacknowledged_transport_digest.as_ref() else {
+            return Err(PubkyNoiseError::NoPreparedTransport);
+        };
+        if pending_digest != acknowledgement_digest {
+            return Err(PubkyNoiseError::PreparedTransportMismatch);
+        }
+        self.unacknowledged_transport_digest = None;
+        Ok(())
+    }
+
+    /// Acknowledge that a prepared send and its resulting state were durably persisted.
+    ///
+    /// Call this only after atomically persisting both values from `prepared`.
+    /// The prepared handle is consumed so it cannot be acknowledged twice.
+    ///
+    /// # Errors
+    /// - Returns [`PubkyNoiseError::NoPreparedTransport`] if no operation is pending.
+    /// - Returns [`PubkyNoiseError::PreparedTransportMismatch`] if `prepared`
+    ///   belongs to another encryptor or an earlier operation.
+    pub fn acknowledge_persisted_send(
+        &mut self,
+        prepared: PreparedSend,
+    ) -> Result<(), PubkyNoiseError> {
+        let acknowledgement_digest = prepared_transport_digest(
+            0,
+            prepared.destination_path.as_bytes(),
+            &prepared.ciphertext,
+            &prepared.resulting_session_state,
+        );
+        if acknowledgement_digest != prepared.acknowledgement_digest {
+            return Err(PubkyNoiseError::PreparedTransportMismatch);
+        }
+        self.acknowledge_prepared_transport(&acknowledgement_digest)
+    }
+
+    /// Acknowledge that a prepared receive and its resulting state were durably persisted.
+    ///
+    /// Call this only after atomically persisting the resulting state with the
+    /// application's durable processing result. The prepared handle is consumed
+    /// so it cannot be acknowledged twice.
+    ///
+    /// # Errors
+    /// - Returns [`PubkyNoiseError::NoPreparedTransport`] if no operation is pending.
+    /// - Returns [`PubkyNoiseError::PreparedTransportMismatch`] if `prepared`
+    ///   belongs to another encryptor or an earlier operation.
+    pub fn acknowledge_persisted_receive(
+        &mut self,
+        prepared: PreparedReceive,
+    ) -> Result<(), PubkyNoiseError> {
+        let acknowledgement_digest = prepared_transport_digest(
+            1,
+            self.config.read_path.as_bytes(),
+            prepared.plaintext(),
+            &prepared.resulting_session_state,
+        );
+        if acknowledgement_digest != prepared.acknowledgement_digest {
+            return Err(PubkyNoiseError::PreparedTransportMismatch);
+        }
+        self.acknowledge_prepared_transport(&acknowledgement_digest)
     }
 
     /// Receive and decrypt a message from the remote peer.
     ///
     /// Returns `Ok` with an empty vector when no message is available yet
     /// (normal polling behaviour).
+    /// Successful response bodies are size-bounded before packet validation.
+    /// Non-2xx bodies are handled by the Pubky SDK's configured error-body limit.
     ///
     /// # Errors:
+    /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] if a staged
+    ///   transport operation has not been acknowledged.
     /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
     /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the homeserver read
     ///   fails with a non-404 error (network failure, 5xx, 403, etc.) or if the
@@ -512,26 +1282,9 @@ impl PubkyNoiseEncryptor {
     ///   transport slot space is exhausted.
     /// - Returns [`PubkyNoiseError::NonceOverflow`] if the receiving nonce space
     ///   is exhausted.
-    pub async fn receive_message(
-        &mut self,
-    ) -> Result<Vec<[u8; PUBKY_NOISE_MSG_LEN]>, PubkyNoiseError> {
-        // Phase guard: must be in transport mode
-        if !self.context.is_transport() {
-            return Err(PubkyNoiseError::IsHandshake);
-        }
-
-        self.context
-            .ensure_can_advance_read_slot()
-            .map_err(map_context_overflow)?;
-        self.context
-            .ensure_can_advance_receiving_nonce()
-            .map_err(map_context_overflow)?;
-        let counter = self.context.get_read_slot();
-
+    pub async fn receive_message(&mut self) -> Result<Vec<Vec<u8>>, PubkyNoiseError> {
         let mut results = Vec::new();
-        let path = self.config.read_path.as_str();
-        let public_key = self.context.get_endpoint();
-        let formatted_path = format!("{public_key}/{path}/{counter}");
+        let formatted_path = self.next_receive_path()?;
         match self
             .config
             .outbox_client
@@ -541,29 +1294,11 @@ impl PubkyNoiseEncryptor {
         {
             Ok(response) => {
                 // pubky's get() only returns Ok for 2xx responses.
-                let ciphertext = response
-                    .bytes()
-                    .await
-                    .map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
-                let (mut message, len) = decode_packet(&ciphertext)?;
-                let mut payload = [0; PUBKY_NOISE_MSG_LEN];
-
-                #[cfg(feature = "test-utils")]
-                if self.simulate_tampering {
-                    message[1] = 0xff;
-                }
-
-                // the read_act() is checking the authenticity of the 16-byte message tag
-                self.context
-                    .read_act(&mut message, &mut payload, len)
-                    .map_err(|err| match err {
-                        ContextError::NonceOverflow => PubkyNoiseError::NonceOverflow,
-                        _ => PubkyNoiseError::DecryptionError,
-                    })?;
-                self.context
-                    .increment_read_counter()
-                    .map_err(map_context_overflow)?;
-                results.push(payload);
+                let ciphertext =
+                    read_bounded_packet(response, PUBKY_NOISE_TRANSPORT_PACKET_LEN).await?;
+                let prepared = self.build_prepared_receive(&ciphertext)?;
+                self.apply_prepared_receive(&prepared);
+                results.push(prepared.plaintext().to_vec());
             }
             // 404 = no message available yet (normal polling behaviour)
             Err(Error::Request(RequestError::Server { status, .. }))
@@ -591,12 +1326,35 @@ impl PubkyNoiseEncryptor {
     /// This snapshot contains everything needed to restore the session later
     /// by replaying persisted handshake messages.
     ///
+    /// # Security
+    ///
+    /// The snapshot contains static and ephemeral secret key material. Encrypt
+    /// and authenticate it at rest, restrict access to authorized callers, and
+    /// ensure superseded snapshots are no longer recoverable. Retaining
+    /// restorable ephemeral material extends its lifetime and can expose messages
+    /// from this Noise session if the snapshot is compromised. Starting a fresh
+    /// session does not protect old traffic while older snapshots remain
+    /// recoverable.
+    /// This crate does not authenticate or authorize processes that access
+    /// caller-managed snapshots.
+    ///
     /// During the handshake phase, a pre-mutation snapshot is captured
     /// automatically by [`handle_handshake()`](Self::handle_handshake) and
     /// is accessible via [`last_good_snapshot()`](Self::last_good_snapshot).
     /// This method remains useful for taking snapshots at arbitrary points
     /// (e.g. after transitioning to transport or after exchanging messages).
-    pub fn snapshot(&self) -> PubkyNoiseSessionState {
+    ///
+    /// # Errors
+    /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] while a
+    ///   prepared operation still needs to be persisted and acknowledged.
+    pub fn snapshot(&self) -> Result<PubkyNoiseSessionState, PubkyNoiseError> {
+        if self.unacknowledged_transport_digest.is_some() {
+            return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
+        }
+        Ok(self.snapshot_unchecked())
+    }
+
+    fn snapshot_unchecked(&self) -> PubkyNoiseSessionState {
         let phase = self.context.get_phase();
         let handshake_hash = self.context.get_handshake_hash();
 
@@ -617,33 +1375,198 @@ impl PubkyNoiseEncryptor {
             write_counter: self.context.get_write_counter(),
             read_counter: self.context.get_read_counter(),
             endpoint_pubkey: self.endpoint_pubkey.to_bytes(),
+            handshake_messages: self.context.handshake_messages().to_vec(),
         }
     }
 
     /// Persist the current session snapshot to the homeserver (encrypted path).
-    pub async fn persist_snapshot(&self) -> Result<(), PubkyNoiseError> {
-        let state = self.snapshot();
-        let serialized = state.serialize();
-        // TODO: encrypt serialized bytes with a key derived from pubky_root_keypair
-        // before storing. For now, store as-is.
+    ///
+    /// The serialized snapshot contains the session's ephemeral and static
+    /// secrets, so it is encrypted with a caller-provided key
+    /// (`XChaCha20Poly1305`, see [`backup_crypto`]) before uploading.
+    ///
+    /// # Parameters:
+    /// - `backup_key`: A 32-byte key used to encrypt the snapshot. For
+    ///   apps with access to the Pubky root secret this can be obtained by
+    ///   calling [`backup_crypto::derive_backup_key`]; delegated
+    ///   apps may supply a key derived from a shared Noise/state key instead.
+    /// - `generation`: A caller-managed, monotonically increasing counter that
+    ///   is bound into the encrypted backup. Persist the latest value in
+    ///   trusted local storage and pass it as `min_generation` to
+    ///   [`load_snapshot()`](Self::load_snapshot) to detect a stale or
+    ///   malicious homeserver replaying an older backup.
+    ///
+    /// # Checkpoint update order
+    ///
+    /// The trusted local checkpoint must be advanced to `generation`
+    /// **before** (or atomically with) this upload. If the checkpoint is
+    /// advanced only after the upload and the process crashes in between, the
+    /// checkpoint still holds `generation - 1`, so a homeserver replaying the
+    /// previous backup would be accepted — the exact rollback the checkpoint
+    /// exists to prevent. Crashing with the checkpoint already advanced only
+    /// loses the new upload: loading then fails (or rejects the older record)
+    /// instead of silently accepting stale state.
+    ///
+    /// # Errors
+    /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] if a prepared
+    ///   message and its resulting state must first be persisted together.
+    /// - Returns [`PubkyNoiseError::OtherError`] if the homeserver write fails.
+    pub async fn persist_snapshot(
+        &self,
+        backup_key: &[u8; 32],
+        generation: u64,
+    ) -> Result<(), PubkyNoiseError> {
+        if self.unacknowledged_transport_digest.is_some() {
+            return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
+        }
+        let state = self.snapshot()?;
         let path = format!("{}/backup", self.config.write_path);
+        let encrypted =
+            backup_crypto::encrypt_backup_with_key(backup_key, &path, generation, &state);
         self.config
             .local_session
             .storage()
-            .put(path, serialized)
+            .put(path, encrypted)
             .await
             .map_err(|_| PubkyNoiseError::OtherError)?;
         Ok(())
+    }
+
+    /// Load and decrypt a session snapshot previously stored with
+    /// [`persist_snapshot()`](Self::persist_snapshot).
+    ///
+    /// The returned state can be passed to [`restore()`](Self::restore) to
+    /// reconstruct the encryptor.
+    ///
+    /// Successful (2xx) response bodies are read in chunks under a size cap
+    /// ([`backup_crypto::MAX_BACKUP_RESPONSE_BYTES`]), and the record must
+    /// match the size bounds of its envelope version. The backup path is
+    /// probed with a `HEAD` request first: `HEAD` responses carry no body,
+    /// so a malicious homeserver cannot use the probe itself to force a
+    /// large allocation, and a confirmed-absent backup can be reported
+    /// distinctly from a connectivity or server failure.
+    ///
+    /// Known limitation: the pubky SDK consumes *non-2xx* GET bodies in
+    /// full before this method regains control, so a malicious homeserver
+    /// can force an unbounded allocation through an oversized error body.
+    /// The `HEAD` probe rejects oversized `Content-Length` values up front,
+    /// but a server can lie on the probe and the subsequent GET. Closing
+    /// this gap needs a bounded raw/streaming GET in the pubky SDK
+    /// (tracked in <https://github.com/pubky/pubky-noise/issues/36>).
+    ///
+    /// # Parameters:
+    /// - `backup_key`: A 32-byte key used to decrypt the snapshot. Must match
+    ///   the key used during [`persist_snapshot()`](Self::persist_snapshot).
+    ///   For apps with access to the Pubky root secret this can be obtained
+    ///   by calling [`backup_crypto::derive_backup_key`]; delegated
+    ///   apps may supply a key derived from a shared Noise/state key instead.
+    /// - `min_generation`: The highest backup generation observed so far, from
+    ///   the caller's trusted local checkpoint. Older backups are rejected
+    ///   with [`PubkyNoiseError::RestoreBackupRollbackError`]. Pass `None`
+    ///   only when no trusted checkpoint exists (e.g. restoring onto a fresh
+    ///   device) — in that case rollback to an older backup cannot be
+    ///   detected.
+    ///
+    /// # Errors:
+    /// - Returns [`PubkyNoiseError::RestoreBackupNotFoundError`] if no backup
+    ///   exists at the backup path.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the backup
+    ///   cannot be fetched (connectivity or server failure) or a 2xx
+    ///   response exceeds the size cap.
+    /// - Returns [`PubkyNoiseError::RestoreBackupDecryptError`] if decryption
+    ///   fails (wrong key, tampered/corrupted ciphertext, or a record that
+    ///   was encrypted for a different backup path — the path is bound into
+    ///   the AEAD tag as associated data, defeating cross-path substitution
+    ///   by a malicious homeserver).
+    /// - Returns [`PubkyNoiseError::RestoreBackupRollbackError`] if the backup
+    ///   generation is older than `min_generation`.
+    /// - Returns [`PubkyNoiseError::RestoreBackupDeserializeError`] if the record is
+    ///   not a valid backup envelope or the decrypted bytes are not a valid
+    ///   session state.
+    pub async fn load_snapshot(
+        config: &PubkyNoiseConfig,
+        backup_key: &[u8; 32],
+        min_generation: Option<u64>,
+    ) -> Result<LoadedSnapshot, PubkyNoiseError> {
+        let path = format!("{}/backup", config.write_path);
+        let storage = config.local_session.storage();
+
+        // Probe with HEAD first. Responses to HEAD carry no body
+        // (RFC 9110, Section 9.3.2), so this step cannot be tricked into an
+        // unbounded allocation the way a non-2xx GET body can — the pubky
+        // SDK's `get()` consumes error bodies in full (`Response::text()`)
+        // before returning, i.e. before the size cap below could run.
+        match storage.stats(&path).await {
+            // Reject an oversized backup before issuing the GET.
+            Ok(Some(stats)) => {
+                if let Some(len) = stats.content_length {
+                    if len > backup_crypto::MAX_BACKUP_RESPONSE_BYTES as u64 {
+                        return Err(PubkyNoiseError::HomeserverResponseError);
+                    }
+                }
+            }
+            // 404/410: the backup path is confirmed empty.
+            Ok(None) => return Err(PubkyNoiseError::RestoreBackupNotFoundError),
+            Err(_) => return Err(PubkyNoiseError::HomeserverResponseError),
+        }
+
+        // NOTE: a non-2xx GET body is still consumed by the SDK before this
+        // code regains control; the HEAD probe above covers the common cases
+        // (absent backup, oversized Content-Length), and fully closing that
+        // gap needs a raw streaming API in the pubky SDK.
+        let mut response = storage.get(&path).await.map_err(|err| match err {
+            Error::Request(RequestError::Server { status, .. })
+                if status == StatusCode::NOT_FOUND || status == StatusCode::GONE =>
+            {
+                PubkyNoiseError::RestoreBackupNotFoundError
+            }
+            _ => PubkyNoiseError::HomeserverResponseError,
+        })?;
+
+        // Bounded body read: reject oversized responses before proportional
+        // allocation, regardless of what the Content-Length header claims
+        // (the HEAD probe above is only advisory — the GET response may
+        // differ from it).
+        if let Some(len) = response.content_length() {
+            if len > backup_crypto::MAX_BACKUP_RESPONSE_BYTES as u64 {
+                return Err(PubkyNoiseError::HomeserverResponseError);
+            }
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| PubkyNoiseError::HomeserverResponseError)?
+        {
+            if body.len() + chunk.len() > backup_crypto::MAX_BACKUP_RESPONSE_BYTES {
+                return Err(PubkyNoiseError::HomeserverResponseError);
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        let (generation, serialized) =
+            backup_crypto::decrypt_backup_with_key(backup_key, &path, &body, min_generation)
+                .map_err(map_backup_error)?;
+
+        let state = PubkyNoiseSessionState::deserialize(&serialized)
+            .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?;
+
+        Ok(LoadedSnapshot { generation, state })
     }
 
     /// Restore a `PubkyNoiseEncryptor` from a previously saved session state.
     ///
     /// This method:
     /// 1. Builds a fresh `DataLinkContext` with the saved ephemeral key
-    /// 2. Reads all handshake messages from the homeservers
+    /// 2. Uses saved incoming handshake messages
     /// 3. Replays them through the fresh `HandshakeState` to re-derive state
     /// 4. For transport restore: transitions to transport and sets nonces/counters
     /// 5. For handshake restore: stops at the saved step position
+    ///
+    /// Restoration performs no network I/O. It verifies the saved
+    /// transcript by replaying it, not by trusting cached transport keys. Missing
+    /// or changed remote handshake files do not invalidate that snapshot. Callers
+    /// must still validate current peer authorization and coordinate fresh state.
     ///
     /// # Parameters:
     /// - `config`: Shared configuration (must match the original session).
@@ -651,17 +1574,24 @@ impl PubkyNoiseEncryptor {
     ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
-    /// - Returns [`PubkyNoiseError::RestoreReplayError`] if handshake replay fails.
-    /// - Returns [`PubkyNoiseError::RestoreHashMismatch`] if the replayed handshake
-    ///   produces a different hash than the saved one.
+    /// - Returns [`PubkyNoiseError::RestoreBackupDeserializeError`] for invalid
+    ///   snapshot cursors, message counts, sizes, or a mismatched endpoint.
+    /// - Returns [`PubkyNoiseError::RestoreBackupReplayError`] for failed cryptographic
+    ///   replay.
+    /// - Returns [`PubkyNoiseError::RestoreBackupHashMismatch`] if the replayed handshake
+    ///   produces a different hash than the saved handshake hash or LinkId, or
+    ///   neither is present in a transport snapshot.
     pub async fn restore(
         config: Arc<PubkyNoiseConfig>,
         state: PubkyNoiseSessionState,
         endpoint_pubkey: PublicKey,
     ) -> Result<Self, PubkyNoiseError> {
+        state
+            .validate()
+            .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?;
         // Verify the caller-provided pubkey matches the snapshot (consistency check)
         if endpoint_pubkey.to_bytes() != state.endpoint_pubkey {
-            return Err(PubkyNoiseError::RestoreDeserializeError);
+            return Err(PubkyNoiseError::RestoreBackupDeserializeError);
         }
 
         // Build a fresh context with the saved ephemeral key
@@ -674,84 +1604,32 @@ impl PubkyNoiseEncryptor {
         )
         .map_err(|_| PubkyNoiseError::SnowNoiseBuildError)?;
 
-        // Determine the full sequence of handshake Write/Read actions
-        let all_actions = full_handshake_actions(state.pattern, state.initiator);
-
-        // Determine how many actions to replay:
-        // - For transport restore: replay ALL handshake actions
-        // - For handshake restore: replay up to the saved position
-        let replay_all = state.phase == NoisePhase::Transport;
-
-        // We need to figure out which homeserver slots correspond to which actions.
-        // The counter tracks slot indices. During the original handshake:
-        // - Write actions write to local homeserver at write_path/counter, then increment
-        // - Read actions read from remote homeserver at read_path/counter, then increment
-        //
-        // For replay, we need to re-read ALL messages (both our own writes and
-        // the peer's writes) from the homeservers and feed them through Snow.
-
-        let mut replay_counter: u32 = 0;
-
-        // How many actions were completed in the original session?
-        // For transport: all of them. For handshake: we need to count.
-        let actions_to_replay = if replay_all {
-            all_actions.len()
-        } else {
-            // Count completed actions based on saved counter.
-            // Each Write or Read increments the counter by 1.
-            // The saved counter tells us how many Write/Read actions completed.
-            state.counter as usize
-        };
-
-        for (i, action) in all_actions.iter().enumerate() {
-            if i >= actions_to_replay {
-                break;
-            }
-
+        let mut saved_messages = state.handshake_messages.iter();
+        // The validated counter counts completed reads and writes, not control actions.
+        for action in full_handshake_actions(state.pattern, state.initiator)
+            .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?
+            .into_iter()
+            .take(state.counter as usize)
+        {
             match action {
                 HandshakeAction::Write => {
-                    // During replay, we need to re-read our own written message
-                    // from the homeserver and feed it through Snow's write_message.
-                    //
-                    // However, Snow's write_message generates the message -- it doesn't
-                    // consume an existing one. So for Write actions during replay,
-                    // we just call write_message with empty payload (same as original)
-                    // and discard the output. The important thing is that Snow's
-                    // internal state advances correctly.
+                    // Local writes are deterministic from the saved ephemeral seed.
                     let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
                     context
-                        .write_act(&[], &mut message)
-                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
-                    replay_counter += 1;
+                        .write_handshake_message(&[], &mut message)
+                        .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
                 }
                 HandshakeAction::Read => {
-                    // Read the peer's message from their homeserver
-                    let read_path = config.read_path.as_str();
-                    let formatted_path = format!("{endpoint_pubkey}/{read_path}/{replay_counter}");
-
-                    let response = config
-                        .outbox_client
-                        .public_storage()
-                        .get(formatted_path)
-                        .await
-                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
-
-                    if !response.status().is_success() {
-                        return Err(PubkyNoiseError::RestoreReplayError);
-                    }
-
-                    let ciphertext = response
-                        .bytes()
-                        .await
-                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
-
-                    let (mut message, len) = decode_packet(&ciphertext)?;
+                    let saved = saved_messages
+                        .next()
+                        .ok_or(PubkyNoiseError::RestoreBackupDeserializeError)?;
+                    let mut message = [0; PUBKY_NOISE_CIPHERTEXT_LEN];
+                    message[..saved.len()].copy_from_slice(saved);
                     let mut payload = [0; PUBKY_NOISE_MSG_LEN];
 
                     context
-                        .read_act(&mut message, &mut payload, len)
-                        .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
-                    replay_counter += 1;
+                        .read_handshake_message(&mut message, &mut payload, saved.len())
+                        .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
                 }
                 HandshakeAction::Pending | HandshakeAction::Terminal => {
                     // These don't correspond to actual messages
@@ -759,27 +1637,35 @@ impl PubkyNoiseEncryptor {
             }
         }
 
+        if state.phase == NoisePhase::HandShake
+            && state.handshake_hash != context.get_handshake_hash()
+        {
+            return Err(PubkyNoiseError::RestoreBackupHashMismatch);
+        }
+
         // Now set the context state to match the saved snapshot
         let link_id = if state.phase == NoisePhase::Transport {
             // Verify the handshake completed
             if context.is_handshake() {
-                return Err(PubkyNoiseError::RestoreReplayError);
+                return Err(PubkyNoiseError::RestoreBackupReplayError);
             }
 
-            // Verify handshake hash matches (integrity check)
-            if let Some(saved_hash) = state.handshake_hash {
-                if let Some(replayed_hash) = context.get_handshake_hash() {
-                    if saved_hash != replayed_hash {
-                        return Err(PubkyNoiseError::RestoreHashMismatch);
-                    }
-                }
+            // Transport snapshots retain the transcript hash in their LinkId.
+            let hash = context
+                .get_handshake_hash()
+                .ok_or(PubkyNoiseError::RestoreBackupReplayError)?;
+            let saved_hash = state
+                .handshake_hash
+                .or(state.link_id)
+                .ok_or(PubkyNoiseError::RestoreBackupHashMismatch)?;
+            if saved_hash != hash || state.link_id.is_some_and(|id| id != hash) {
+                return Err(PubkyNoiseError::RestoreBackupHashMismatch);
             }
 
             // Transition to transport
-            let hash = context.get_handshake_hash().unwrap();
             context
-                .to_transport()
-                .map_err(|_| PubkyNoiseError::RestoreReplayError)?;
+                .transition_to_transport()
+                .map_err(|_| PubkyNoiseError::RestoreBackupReplayError)?;
 
             // Set nonces from saved state
             context.set_sending_nonce(state.sending_nonce);
@@ -791,7 +1677,7 @@ impl PubkyNoiseEncryptor {
             context.set_write_counter(state.write_counter);
             context.set_read_counter(state.read_counter);
 
-            Some(LinkId(state.link_id.unwrap_or(hash)))
+            Some(LinkId(hash))
         } else {
             // Handshake restore: set step/sub_step/counter
             context.set_noise_step(state.noise_step);
@@ -806,6 +1692,8 @@ impl PubkyNoiseEncryptor {
             link_id,
             endpoint_pubkey,
             last_good_snapshot: None,
+            unacknowledged_transport_digest: None,
+            pending_convenience_send: None,
             #[cfg(feature = "test-utils")]
             simulate_tampering: false,
             #[cfg(feature = "test-utils")]
@@ -853,9 +1741,15 @@ impl PubkyNoiseEncryptor {
         self.simulate_write_failure = true;
     }
 
-    /// Test-only: get the last ciphertext produced by send_message.
+    /// Test-only: disable simulated homeserver write failures.
     #[cfg(feature = "test-utils")]
-    pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2]> {
+    pub fn test_disable_write_failure(&mut self) {
+        self.simulate_write_failure = false;
+    }
+
+    /// Test-only: get the last ciphertext produced by `prepare_send`.
+    #[cfg(feature = "test-utils")]
+    pub fn test_last_ciphertext(&self) -> Option<[u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN]> {
         self.last_ciphertext
     }
 }
@@ -868,5 +1762,249 @@ impl std::fmt::Debug for PubkyNoiseConfig {
             .field("pubky_noise_version", &self.pubky_noise_version)
             .field("default_pattern", &self.default_pattern)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snow_crypto::{HandshakePattern, NoisePhase, NoiseStep};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    async fn response_for_test(wire: Vec<u8>) -> pubky::Result<reqwest::Response> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream.write_all(&wire).unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .map_err(Error::from);
+        server.join().unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn handshake_read_distinguishes_absence_from_errors() {
+        for status in [404, 410, 401, 403, 429, 500, 503] {
+            let response = Err(Error::Request(RequestError::Server {
+                status: StatusCode::from_u16(status).unwrap(),
+                message: String::new(),
+            }));
+            let result = read_handshake_packet(response).await;
+            if status == 404 || status == 410 {
+                assert_eq!(result, Ok(None), "status {status}");
+            } else {
+                assert_eq!(
+                    result,
+                    Err(PubkyNoiseError::HomeserverResponseError),
+                    "status {status}"
+                );
+            }
+        }
+        let error = Error::Request(RequestError::Validation {
+            message: "invalid resource".into(),
+        });
+        assert_eq!(
+            read_handshake_packet(Err(error)).await,
+            Err(PubkyNoiseError::HomeserverResponseError)
+        );
+        let response = response_for_test(Vec::new()).await;
+        assert!(matches!(
+            response,
+            Err(Error::Request(RequestError::Transport(_)))
+        ));
+        assert_eq!(
+            read_handshake_packet(response).await,
+            Err(PubkyNoiseError::HomeserverResponseError)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_packet_read_enforces_limit() {
+        let cases = [
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd",
+                Ok(b"abcd".to_vec()),
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n",
+                Ok(b"abcd".to_vec()),
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+                Err(PubkyNoiseError::BadLengthCiphertext),
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+                Err(PubkyNoiseError::BadLengthCiphertext),
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nab",
+                Err(PubkyNoiseError::HomeserverResponseError),
+            ),
+        ];
+        for (wire, expected) in cases {
+            let response = response_for_test(wire.as_bytes().to_vec()).await.unwrap();
+            assert_eq!(read_bounded_packet(response, 4).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_read_validates_packet_framing() {
+        let cases = [
+            (
+                encode_handshake_packet(b"abc", 3).to_vec(),
+                Some(&b"abc"[..]),
+            ),
+            (vec![0, 1, 42], Some(&[42][..])),
+            (vec![], None),
+            (vec![0], None),
+            (vec![0, 2, 42], None),
+            (vec![0xff, 0xff], None),
+            (vec![0; PUBKY_NOISE_CIPHERTEXT_LEN + 3], None),
+        ];
+        for (body, expected) in cases {
+            let mut wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            wire.extend_from_slice(&body);
+            let result = read_handshake_packet(response_for_test(wire).await).await;
+            if let Some(expected) = expected {
+                let (message, len) = result.unwrap().unwrap();
+                assert_eq!(&message[..len], expected);
+            } else {
+                assert_eq!(result, Err(PubkyNoiseError::BadLengthCiphertext));
+            }
+        }
+    }
+
+    fn state_with_secrets() -> PubkyNoiseSessionState {
+        PubkyNoiseSessionState {
+            version: SESSION_STATE_VERSION,
+            phase: NoisePhase::Transport,
+            pattern: HandshakePattern::PatternNN,
+            initiator: true,
+            ephemeral_secret: [0xAA; 32],
+            static_secret: Some([0xBB; 32]),
+            counter: 2,
+            noise_step: NoiseStep::Final,
+            sub_step_index: 0,
+            handshake_hash: Some([2; 32]),
+            link_id: Some([3; 32]),
+            sending_nonce: 2,
+            receiving_nonce: 1,
+            write_counter: 9,
+            read_counter: 7,
+            endpoint_pubkey: [4; 32],
+            handshake_messages: vec![vec![5; 48]],
+        }
+    }
+
+    #[test]
+    fn loaded_snapshot_debug_redacts_secrets() {
+        let loaded = LoadedSnapshot {
+            generation: 7,
+            state: state_with_secrets(),
+        };
+
+        let rendered = format!("{loaded:?}");
+
+        assert!(
+            !rendered.contains(format!("{:?}", [0xAA; 32]).as_str()),
+            "ephemeral secret leaked in Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains(format!("{:?}", [0xBB; 32]).as_str()),
+            "static secret leaked in Debug: {rendered}"
+        );
+        assert!(rendered.contains("generation"));
+    }
+
+    #[test]
+    fn prepared_handshake_debug_redacts_state_and_packet() {
+        let prepared = PreparedHandshakeStep {
+            resulting_session_state: state_with_secrets(),
+            outgoing: Some((
+                "/pub/private-handshake/2".into(),
+                [42; PUBKY_NOISE_CIPHERTEXT_LEN + 2],
+            )),
+            handshake_complete: true,
+            remote_static_public_key: Some(vec![99; 32]),
+        };
+        let rendered = format!("{prepared:?}");
+        for sensitive in [
+            prepared.destination_path().unwrap().to_string(),
+            format!("{:?}", prepared.packet().unwrap()),
+            format!("{:?}", [0xAA; 32]),
+            format!("{:?}", [0xBB; 32]),
+            format!("{:?}", [99; 32]),
+        ] {
+            assert!(!rendered.contains(&sensitive));
+        }
+        assert!(rendered.contains("handshake_complete: true"));
+    }
+
+    #[test]
+    fn transport_plaintext_round_trip_preserves_body_and_trailing_zeros() {
+        let body = b"message with trailing zeros\0\0";
+        let plaintext = encode_transport_plaintext(body).unwrap();
+        let (decoded, decoded_len) = decode_transport_plaintext(&plaintext).unwrap();
+
+        assert_eq!(&decoded[..decoded_len], body);
+        assert_eq!(decoded_len, body.len());
+        assert!(plaintext[body.len() + 2..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn transport_plaintext_accepts_maximum_body() {
+        let body = [42; PUBKY_NOISE_MSG_LEN];
+        let plaintext = encode_transport_plaintext(&body).unwrap();
+        let (decoded, decoded_len) = decode_transport_plaintext(&plaintext).unwrap();
+
+        assert_eq!(decoded, body);
+        assert_eq!(decoded_len, PUBKY_NOISE_MSG_LEN);
+    }
+
+    #[test]
+    fn transport_plaintext_rejects_invalid_lengths() {
+        assert_eq!(
+            encode_transport_plaintext(&[0; PUBKY_NOISE_MSG_LEN + 1]).unwrap_err(),
+            PubkyNoiseError::EncryptionError
+        );
+
+        let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+        plaintext[..2].copy_from_slice(&((PUBKY_NOISE_MSG_LEN + 1) as u16).to_be_bytes());
+        assert_eq!(
+            decode_transport_plaintext(&plaintext).unwrap_err(),
+            PubkyNoiseError::BadLengthCiphertext
+        );
+    }
+
+    #[test]
+    fn transport_plaintext_rejects_non_zero_padding() {
+        let mut plaintext = encode_transport_plaintext(b"message").unwrap();
+        *plaintext.last_mut().unwrap() = 1;
+
+        assert_eq!(
+            decode_transport_plaintext(&plaintext).unwrap_err(),
+            PubkyNoiseError::BadLengthCiphertext
+        );
     }
 }
