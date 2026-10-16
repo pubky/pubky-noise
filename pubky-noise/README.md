@@ -79,13 +79,10 @@ let messages = initiator.receive_message().await?;
 initiator.close();
 ```
 
-When polling a handshake packet, only HTTP 404/410 is treated as absent (`Pending`).
-Other GET or response-body failures return `HomeserverResponseError`. This error
-does not preserve the HTTP status or establish that the failure is temporary.
-Authorization or request failures, such as HTTP 403 or 405, may require correcting
-the cause before retrying the same encryptor. Callers control retry limits and
-backoff. The quick start propagates errors to the caller; write failures require
-the [snapshot recovery](#code-example) described below.
+When polling a peer packet, only HTTP 404/410 is treated as absent (`Pending`).
+Other GET or response-body failures return `HomeserverResponseError`; retry the same encryptor
+after the read failure is resolved. The quick start propagates errors to the
+caller; write failures require the [snapshot recovery](#code-example) described below.
 
 ## Architecture
 
@@ -170,13 +167,36 @@ Noise_{pattern}_25519_ChaChaPoly_SHA256
 
 ### Resource Limits
 
-The packet and snapshot size limits apply to one session, not all sessions on a
-host. The library does not manage a global session pool or impose a total session
-limit. Callers control session creation and retention, including admission and
-rate limits, budgets for live encryptors and saved snapshots, and cleanup of
-abandoned handshakes. Cleanup must respect the pending-output persistence and
-checkpoint requirements described below. A bound on one snapshot alone does not
-prevent resource exhaustion across many sessions.
+The library does not impose a total session limit. For the supported NN/XX
+sessions, the current packet and version-1 snapshot formats have these bounds:
+
+| Data | Size in bytes | Source |
+|---|---|---|
+| Application body in one transport message | 0 to 1000 | `snow_crypto::PUBKY_NOISE_MSG_LEN` |
+| Stored handshake or transport packet | 1018 when emitted | `PUBKY_NOISE_CIPHERTEXT_LEN + 2` / `PUBKY_NOISE_TRANSPORT_PACKET_LEN` |
+| Serialized valid session state | 198 to 2234 | `serializer::MIN_SESSION_STATE_LEN` / `MAX_SESSION_STATE_LEN` |
+| Encrypted backup record | 252 to 2288 | `backup_crypto::MIN_BACKUP_RECORD_LEN` / `MAX_BACKUP_RECORD_LEN` |
+| Accumulated successful backup response body | At most 4096; the accepted backup must still satisfy the format bounds | `backup_crypto::MAX_BACKUP_RESPONSE_BYTES` |
+
+The maximum serialized state is 198 fixed bytes plus two incoming handshake
+messages of at most 1016 bytes each, with a two-byte length for each message.
+The encrypted record adds 54 bytes for its header, nonce, generation and tag.
+These are data-length limits, not a per-session RAM ceiling. Live encryptors also
+hold Snow state and may retain a pre-mutation snapshot or pending ciphertext.
+Prepared operations, snapshot clones, serialization/encryption buffers, vector
+capacity, and HTTP client/chunk buffers add memory beyond the serialized sizes;
+`size_of::<PubkyNoiseEncryptor>()` alone excludes heap allocations.
+
+For a host budget, measure peak memory on the deployed target while varying live
+handshakes, transport sessions, concurrent reads/restores and queued prepared
+operations. Track session counts, retained snapshot counts/bytes, pending-output
+queue bytes, and handshake age; account separately for shared configuration/HTTP
+resources and per-operation peak allocations. Use those measurements with
+headroom to choose admission, concurrency, rate and retention limits. The library
+does not cap aggregate caller-owned queues or saved snapshots. Cleanup of
+abandoned handshakes must preserve the pending-output persistence and checkpoint
+requirements described below. A bound on one snapshot alone does not prevent
+resource exhaustion across many sessions.
 
 ### Lifecycle
 
@@ -290,9 +310,9 @@ Snapshots restore without network I/O: they retain the incoming handshake
 messages and regenerate outgoing handshake bytes in memory from the saved
 ephemeral seed. Replay verifies message authentication and the saved transcript
 hash or LinkId. Snapshots must remain encrypted, authenticated, and current;
-this is not a cache of live
-transport counters. Peer authorization and cross-process coordination remain the
-caller's responsibility. Remote deletion or replacement of old handshake files
+this is not a cache of live transport counters. Peer authorization and
+cross-process coordination remain the caller's responsibility. Remote deletion
+or replacement of old handshake files
 does not invalidate a saved transcript or revoke a session.
 
 `snapshot.next_handshake_read_slot()` inspects the saved cursor without restoring
@@ -651,7 +671,7 @@ does not detect or republish lost data.
 | `UnknownNoisePattern` | Invalid pattern string or unsupported handshake actions | Use a supported pattern: "NN", "XX" |
 | `SnowNoiseBuildError` | Noise stack failed to initialize | Check key material and pattern compatibility |
 | `BadLengthCiphertext` | Received packet or authenticated transport frame is malformed | Discard message, check sender |
-| `HomeserverResponseError` | Homeserver GET or response-body read failed; HTTP status is not retained | Check connectivity, authorization, and request validity before deciding whether to retry; a handshake read can be retried on the same encryptor after the cause is resolved |
+| `HomeserverResponseError` | Homeserver GET or response-body read failed | Retry the handshake read without restoring; check connectivity, authorization, and server status |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
 | `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
