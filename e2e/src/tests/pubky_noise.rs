@@ -857,7 +857,7 @@ async fn snow_test_prepared_handshake_rejects_invalid_input() {
         .unwrap();
         assert_eq!(
             initial.prepare_handshake_step(Some(&[])).unwrap_err(),
-            PubkyNoiseError::BadLengthCiphertext
+            PubkyNoiseError::UnexpectedHandshakePacket
         );
 
         pair.initiator.handle_handshake().await.unwrap();
@@ -881,7 +881,7 @@ async fn snow_test_prepared_handshake_rejects_invalid_input() {
         tampered[message_len + 1] ^= 1;
 
         for (input, error) in [
-            (None, PubkyNoiseError::BadLengthCiphertext),
+            (None, PubkyNoiseError::MissingHandshakePacket),
             (Some(vec![0]), PubkyNoiseError::BadLengthCiphertext),
             (Some(vec![0, 2, 42]), PubkyNoiseError::BadLengthCiphertext),
             (
@@ -1045,6 +1045,24 @@ async fn snow_test_cached_restore_rejects_invalid_transcript() {
                 .await
                 .err(),
                 Some(PubkyNoiseError::RestoreBackupReplayError)
+            );
+        }
+        for pattern in [
+            HandshakePattern::PatternN,
+            HandshakePattern::PatternIK,
+            HandshakePattern::PatternNK,
+        ] {
+            let mut unsupported = state.clone();
+            unsupported.pattern = pattern;
+            assert_eq!(
+                PubkyNoiseEncryptor::restore(
+                    pair.responder_config.clone(),
+                    unsupported,
+                    pair.initiator_public_key.clone(),
+                )
+                .await
+                .unwrap_err(),
+                PubkyNoiseError::RestoreBackupDeserializeError
             );
         }
     }
@@ -1303,7 +1321,12 @@ async fn snow_test_unsupported_responder_pattern() {
         .unwrap();
         assert_eq!(
             responder.handle_handshake().await.unwrap_err(),
-            PubkyNoiseError::UnknownNoisePattern,
+            PubkyNoiseError::UnsupportedNoisePattern,
+            "pattern {pattern}"
+        );
+        assert_eq!(
+            responder.prepare_handshake_step(None).unwrap_err(),
+            PubkyNoiseError::UnsupportedNoisePattern,
             "pattern {pattern}"
         );
     }
@@ -1602,6 +1625,33 @@ async fn snow_test_simple_backup() {
         .unwrap();
     assert_eq!(loaded.generation, 1);
     assert_eq!(loaded.state.serialize(), plaintext_a);
+
+    for pattern in [
+        HandshakePattern::PatternN,
+        HandshakePattern::PatternIK,
+        HandshakePattern::PatternNK,
+    ] {
+        let mut unsupported = loaded.state.clone();
+        unsupported.pattern = pattern;
+        let record = backup_crypto::encrypt_backup_with_key(
+            &backup_key,
+            "/pub/data/backup",
+            1,
+            &unsupported,
+        );
+        pair.initiator_config
+            .local_session
+            .storage()
+            .put("/pub/data/backup", record)
+            .await
+            .unwrap();
+        assert_eq!(
+            PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, Some(1))
+                .await
+                .unwrap_err(),
+            PubkyNoiseError::RestoreBackupDeserializeError
+        );
+    }
 
     // Advance the session and persist generation 2.
     send_and_verify(&mut pair.initiator, &mut pair.responder, "Hello_Again").await;

@@ -214,9 +214,16 @@ impl std::fmt::Debug for LoadedSnapshot {
 
 #[derive(Eq, Hash, PartialEq, Debug)]
 pub enum PubkyNoiseError {
+    /// The configured pattern name is not recognized.
     UnknownNoisePattern,
+    /// The pattern is recognized but its handshake actions are not supported.
+    UnsupportedNoisePattern,
     SnowNoiseBuildError,
     BadLengthCiphertext,
+    /// Handshake preparation requires an incoming packet, but none was supplied.
+    MissingHandshakePacket,
+    /// Handshake preparation received a packet when no read was required.
+    UnexpectedHandshakePacket,
     /// A homeserver read failed without an HTTP status, a successful (2xx)
     /// response body could not be read, or a snapshot exceeded its size cap.
     /// This does not imply that retrying will help.
@@ -279,8 +286,10 @@ pub enum HandshakeResult {
 /// publishing. Keep the packet pending across uncertain writes and retry those
 /// same bytes. While a packet is pending, do not restore and advance the state
 /// or promote it to transport. The caller must durably acknowledge publication
-/// under its ownership and peer-authorization checks. Completion here is
-/// cryptographic only.
+/// while holding its session lease and checking its application policy for the
+/// peer. Noise completion does not grant application access. For XX, compare the
+/// learned static key with the independently authenticated expected peer key.
+/// NN does not authenticate a peer identity.
 #[must_use = "persist the state and exact pending packet before publication"]
 pub struct PreparedHandshakeStep {
     resulting_session_state: PubkyNoiseSessionState,
@@ -301,6 +310,8 @@ impl PreparedHandshakeStep {
     }
 
     /// Return the exact length-prefixed, padded wire packet to publish or retry.
+    /// Every returned slice contains `PUBKY_NOISE_CIPHERTEXT_LEN + 2` bytes,
+    /// borrowed from the prepared step's fixed-size packet.
     pub fn packet(&self) -> Option<&[u8]> {
         self.outgoing.as_ref().map(|(_, packet)| packet.as_slice())
     }
@@ -668,11 +679,19 @@ impl PubkyNoiseEncryptor {
 
     /// Consume this encryptor to prepare one handshake step without network I/O.
     ///
-    /// Supply the complete incoming wire packet exactly when the current step
-    /// requires a read. Use the saved state's
-    /// [`PubkyNoiseSessionState::next_handshake_read_slot`] to plan that read,
-    /// and validate the source checkpoint and peer authorization before applying
-    /// the result. Absence is a polling outcome, not an input that skips a read.
+    /// Supports NN and XX. For a handshake-phase snapshot, use
+    /// [`PubkyNoiseSessionState::next_handshake_read_slot`] to choose the input:
+    /// - `Some(slot)`: fetch that peer slot and pass `Some(packet)` containing
+    ///   the complete length-prefixed wire packet. If the slot is absent
+    ///   (HTTP 404/410), wait and poll it again instead of calling this method.
+    /// - `None`: pass `None` to perform the remaining write or control actions,
+    ///   or to return an already-completed handshake step.
+    ///
+    /// Before applying the result, recheck the session lease, source checkpoint,
+    /// and the application's policy permitting use of the peer. These checks
+    /// belong to the caller, not the Noise handshake. For XX, compare the learned
+    /// static key with the independently authenticated expected peer key before
+    /// exchanging application messages. NN does not authenticate a peer identity.
     ///
     /// On failure, discard the consumed state and restore the previous durable
     /// checkpoint. On success, persist the returned state and pending output
@@ -680,12 +699,15 @@ impl PubkyNoiseEncryptor {
     /// durably acknowledged before promoting the handshake to transport.
     ///
     /// # Errors
-    /// Returns [`PubkyNoiseError::BadLengthCiphertext`] for missing, unexpected or
-    /// malformed input, [`PubkyNoiseError::DecryptionError`] for authentication
-    /// failure, [`PubkyNoiseError::EncryptionError`] for a failed Noise write,
-    /// [`PubkyNoiseError::CounterOverflow`] for exhausted message slots, or
-    /// [`PubkyNoiseError::OtherError`] if already in transport phase.
-    /// Unsupported patterns return [`PubkyNoiseError::UnknownNoisePattern`].
+    /// Returns [`PubkyNoiseError::MissingHandshakePacket`] if a read is required
+    /// but no packet is supplied, or [`PubkyNoiseError::UnexpectedHandshakePacket`]
+    /// if a packet is supplied when no read is required. Malformed packet framing
+    /// returns [`PubkyNoiseError::BadLengthCiphertext`]. Authentication failures
+    /// return [`PubkyNoiseError::DecryptionError`], failed Noise writes return
+    /// [`PubkyNoiseError::EncryptionError`], and exhausted message slots return
+    /// [`PubkyNoiseError::CounterOverflow`]. Already being in transport phase
+    /// returns [`PubkyNoiseError::OtherError`]. Unsupported patterns return
+    /// [`PubkyNoiseError::UnsupportedNoisePattern`].
     pub fn prepare_handshake_step(
         mut self,
         incoming_packet: Option<&[u8]>,
@@ -694,8 +716,13 @@ impl PubkyNoiseEncryptor {
             return Err(PubkyNoiseError::OtherError);
         }
         let actions = self.context.remaining_handshake_actions()?;
-        if actions.contains(&HandshakeAction::Read) != incoming_packet.is_some() {
-            return Err(PubkyNoiseError::BadLengthCiphertext);
+        match (
+            actions.contains(&HandshakeAction::Read),
+            incoming_packet.is_some(),
+        ) {
+            (true, false) => return Err(PubkyNoiseError::MissingHandshakePacket),
+            (false, true) => return Err(PubkyNoiseError::UnexpectedHandshakePacket),
+            _ => {}
         }
         let mut incoming = incoming_packet.map(decode_handshake_packet).transpose()?;
         let mut outgoing = None;
@@ -704,7 +731,7 @@ impl PubkyNoiseEncryptor {
                 HandshakeAction::Read => {
                     let (message, len) = incoming
                         .take()
-                        .ok_or(PubkyNoiseError::BadLengthCiphertext)?;
+                        .ok_or(PubkyNoiseError::MissingHandshakePacket)?;
                     self.apply_handshake_read(message, len)?;
                 }
                 HandshakeAction::Write => {
@@ -813,7 +840,7 @@ impl PubkyNoiseEncryptor {
     ///   method.
     ///
     /// # Errors:
-    /// - Returns [`PubkyNoiseError::UnknownNoisePattern`] for unsupported patterns.
+    /// - Returns [`PubkyNoiseError::UnsupportedNoisePattern`] for unsupported patterns.
     /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] on malformed messages.
     /// - Returns [`PubkyNoiseError::DecryptionError`] if a handshake message fails
     ///   authentication. The failed read does not advance the message counter or
@@ -1537,7 +1564,7 @@ impl PubkyNoiseEncryptor {
     ///   generation is older than `min_generation`.
     /// - Returns [`PubkyNoiseError::RestoreBackupDeserializeError`] if the record is
     ///   not a valid backup envelope or the decrypted bytes are not a valid
-    ///   session state.
+    ///   session state, including an unknown or unsupported snapshot pattern.
     pub async fn load_snapshot(
         config: &PubkyNoiseConfig,
         backup_key: &[u8; 32],
@@ -1621,8 +1648,9 @@ impl PubkyNoiseEncryptor {
     ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
-    /// - Returns [`PubkyNoiseError::RestoreBackupDeserializeError`] for invalid
-    ///   snapshot cursors, message counts, sizes, or a mismatched endpoint.
+    /// - Returns [`PubkyNoiseError::RestoreBackupDeserializeError`] for unsupported
+    ///   snapshot versions or patterns, invalid cursors, message counts, sizes,
+    ///   or a mismatched endpoint.
     /// - Returns [`PubkyNoiseError::RestoreBackupReplayError`] for failed cryptographic
     ///   replay.
     /// - Returns [`PubkyNoiseError::RestoreBackupHashMismatch`] if the replayed handshake

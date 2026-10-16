@@ -279,7 +279,9 @@ Decrypted plaintext is sensitive application data. Avoid logging it, minimize co
 | `IK` | Declared | Mutual | Initiator knows responder's static key upfront |
 | `NK` | Declared | One-way | Initiator authenticates to known responder |
 
-Patterns marked "Declared" are defined in the enum but are not supported. Resolving their handshake actions returns `UnknownNoisePattern`.
+Patterns marked "Declared" are recognized but are not supported. Resolving their
+handshake actions returns `UnsupportedNoisePattern`. An unrecognized pattern name
+passed to a configuration constructor returns `UnknownNoisePattern`.
 
 ### Handshake Flow (XX Pattern)
 
@@ -300,6 +302,29 @@ Initiator                          Responder
 ### Polling-Safe Handshake
 
 `handle_handshake()` is designed for polling: it can be called repeatedly by either side in any order. If the peer's message is not yet available, it returns `HandshakeResult::Pending` without advancing state. This makes it safe for use in event loops and async contexts.
+
+### Durable Handshake Preparation
+
+`prepare_handshake_step()` consumes an encryptor and prepares one NN or XX step
+without network I/O. For a handshake-phase snapshot, inspect
+`next_handshake_read_slot()` first:
+
+- `Some(slot)`: fetch the complete peer packet and pass `Some(packet)`. If that
+  slot returns HTTP 404/410, wait and poll again without preparing the step.
+- `None`: pass `None` for the remaining write or control actions, including an
+  already-completed handshake step. This is not a way to skip a required read.
+
+Persist the returned snapshot and exact outgoing packet/path atomically before
+publication. Keep uncertain writes pending and retry the same bytes. Do not
+advance or enter transport until publication is durably acknowledged, including
+the final XX packet. Preparation consumes the encryptor even on failure, so
+recover from the previous durable checkpoint after an error.
+
+The caller must recheck its session lease, source checkpoint, and application
+policy permitting use of the peer before applying a prepared result. Noise does
+not grant application access. For XX, compare the learned static key against the
+independently authenticated expected peer key before exchanging application
+messages. NN does not authenticate a peer identity.
 
 ## Asymmetric Path Derivation
 
@@ -699,9 +724,12 @@ does not detect or republish lost data.
 
 | Error | Cause | Recovery |
 |---|---|---|
-| `UnknownNoisePattern` | Invalid pattern string or unsupported handshake actions | Use a supported pattern: "NN", "XX" |
+| `UnknownNoisePattern` | Unrecognized configuration pattern name | Correct the pattern name |
+| `UnsupportedNoisePattern` | Recognized pattern has no supported handshake actions | Use a supported pattern: "NN", "XX" |
 | `SnowNoiseBuildError` | Noise stack failed to initialize | Check key material and pattern compatibility |
 | `BadLengthCiphertext` | Received packet or authenticated transport frame is malformed | Discard message, check sender |
+| `MissingHandshakePacket` | Preparation requires a read, but no packet was supplied | Recover the previous checkpoint and fetch the required packet before preparing |
+| `UnexpectedHandshakePacket` | Preparation received a packet when no read was required | Recover the previous checkpoint and follow its read-slot probe |
 | `HomeserverHttpError { status }` | A handshake, transport or snapshot read returned a non-success HTTP status not handled as absence | Inspect the status and correct the cause or apply caller-owned retry policy; no automatic retry |
 | `HomeserverResponseError` | A read failed without an HTTP status, a successful (2xx) body read failed, or a snapshot exceeded its size cap | Check client configuration, connectivity and response validity; retry only after addressing the cause |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
@@ -715,7 +743,7 @@ does not detect or republish lost data.
 | `PreparedTransportMismatch` | A prepared handle belongs to another encryptor or operation | Use the handle returned by the current encryptor |
 | `RestoreBackupReplayError` | Handshake replay failed during restore | Check snapshot integrity |
 | `RestoreBackupHashMismatch` | Replayed handshake produced different hash | Snapshot may be from a different session |
-| `RestoreBackupDeserializeError` | Backup envelope or snapshot deserialization failed | Check data integrity |
+| `RestoreBackupDeserializeError` | Backup envelope or snapshot is invalid, including an unknown or unsupported snapshot pattern | Check data integrity and snapshot compatibility |
 | `RestoreBackupDecryptError` | Persisted snapshot decryption failed | Wrong backup key, or tampered/corrupted backup |
 | `RestoreBackupRollbackError` | Backup generation is older than the trusted local checkpoint | Restart from a fresh handshake; investigate homeserver |
 | `RestoreBackupNotFoundError` | No backup exists at the backup path (distinct from connectivity/server failures) | Persist a snapshot first, or start a new session |
