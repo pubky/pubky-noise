@@ -95,7 +95,9 @@ still require the [snapshot recovery](#code-example) described below.
 
 ### Request Deadlines
 
-Packet and snapshot byte limits bound memory, not elapsed time. Configure a total
+Packet and snapshot byte limits bound accumulated successful-response bytes.
+Pubky separately caps captured error-body bytes. These byte limits do not bound
+elapsed time or total/peak memory. Configure a total
 `PubkyHttpClientBuilder::request_timeout` on native clients before using them for
 peer reads or creating the authenticated session used for snapshot reads. Pubky
 0.15 disables native HTTP timeouts by default. Its total request deadline runs
