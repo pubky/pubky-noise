@@ -3,12 +3,12 @@
 use std::{
     ops::Deref,
     sync::{Arc, Weak},
+    time::Duration,
 };
 
+use pubky::{ClientId, Keypair, Pubky, PubkySession, PublicKey};
 use pubky_testnet::{
-    docker_postgres::DockerPostgres,
-    pubky::{ClientId, Keypair, Pubky, PubkySession, PublicKey},
-    EphemeralTestnet,
+    docker_postgres::DockerPostgres, pubky::PublicKey as HomeserverPublicKey, EphemeralTestnet,
 };
 use tokio::sync::{Mutex, OnceCell};
 
@@ -57,6 +57,24 @@ struct SharedTestnet {
     _postgres: Arc<DockerPostgres>,
 }
 
+impl SharedTestnet {
+    // Exercise Homeserver with the SDK version used by Noise, not the testnet's SDK.
+    fn client_builder(&self) -> pubky::PubkyHttpClientBuilder {
+        let mut builder = pubky::PubkyHttpClient::builder();
+        builder.pkarr(|pkarr| {
+            *pkarr = self.testnet.pkarr_client_builder();
+            pkarr
+                .dht_request_timeout(Duration::from_millis(100))
+                .relay_request_timeout(Duration::from_millis(100))
+        });
+        builder
+    }
+
+    fn sdk(&self) -> Result<Pubky, pubky::BuildError> {
+        Ok(Pubky::with_client(self.client_builder().build()?))
+    }
+}
+
 impl Deref for SharedTestnet {
     type Target = EphemeralTestnet;
 
@@ -74,9 +92,12 @@ async fn build_testnet() -> SharedTestnet {
     }
 }
 
-async fn create_grant_session(pubky: &Pubky, homeserver: &PublicKey) -> PubkySession {
+async fn create_grant_session(pubky: &Pubky, homeserver: &HomeserverPublicKey) -> PubkySession {
     let signer = pubky.signer(Keypair::random());
-    signer.signup(homeserver, None).await.unwrap();
+    signer
+        .signup(&PublicKey::from(homeserver.as_inner()), None)
+        .await
+        .unwrap();
     signer
         .signin(ClientId::new(E2E_CLIENT_ID).unwrap())
         .await
@@ -108,7 +129,7 @@ struct EncryptorPair {
 }
 
 /// Create a pair of encryptors on the same homeserver.
-async fn setup_encryptors(testnet: &EphemeralTestnet, pattern: &str) -> EncryptorPair {
+async fn setup_encryptors(testnet: &SharedTestnet, pattern: &str) -> EncryptorPair {
     setup_encryptors_on_server(
         testnet.sdk().unwrap(),
         testnet.homeserver_app().public_key(),
@@ -119,7 +140,7 @@ async fn setup_encryptors(testnet: &EphemeralTestnet, pattern: &str) -> Encrypto
 
 async fn setup_encryptors_on_server(
     initiator_pubky: Pubky,
-    homeserver: PublicKey,
+    homeserver: HomeserverPublicKey,
     pattern: &str,
 ) -> EncryptorPair {
     let responder_pubky = initiator_pubky.clone();
@@ -184,7 +205,7 @@ async fn setup_encryptors_on_server(
 }
 
 /// Create a pair of encryptors on separate homeservers.
-async fn setup_encryptors_dual_server(testnet: &EphemeralTestnet, pattern: &str) -> EncryptorPair {
+async fn setup_encryptors_dual_server(testnet: &SharedTestnet, pattern: &str) -> EncryptorPair {
     let first_server = testnet.homeserver_app();
     let second_server = testnet.homeserver_app();
 
@@ -253,10 +274,7 @@ async fn setup_encryptors_dual_server(testnet: &EphemeralTestnet, pattern: &str)
 }
 
 /// Create a pair of encryptors with tampering enabled on both sides.
-async fn setup_encryptors_with_tampering(
-    testnet: &EphemeralTestnet,
-    pattern: &str,
-) -> EncryptorPair {
+async fn setup_encryptors_with_tampering(testnet: &SharedTestnet, pattern: &str) -> EncryptorPair {
     let mut pair = setup_encryptors(testnet, pattern).await;
     pair.initiator.test_enable_tampering();
     pair.responder.test_enable_tampering();
