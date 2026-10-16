@@ -9,7 +9,7 @@ Peers use their homeservers as outboxes: each party writes encrypted Noise messa
 ```toml
 # Cargo.toml
 [dependencies]
-pubky-noise = "0.1.0-rc13"
+pubky-noise = "0.1.0"
 ```
 
 ### Actual dependencies (for reference)
@@ -100,7 +100,7 @@ Pubky separately caps captured error-body bytes. These byte limits do not bound
 elapsed time or total/peak memory. Configure a total
 `PubkyHttpClientBuilder::request_timeout` on native clients before using them for
 peer reads or creating the authenticated session used for snapshot reads. Pubky
-0.15 disables native HTTP timeouts by default. Its total request deadline runs
+0.16.2 disables native HTTP timeouts by default. Its total request deadline runs
 from connection setup through completion of the response body, including error
 bodies. A separate `read_timeout` resets on each successful read, so it is not a
 substitute for a total deadline when a server continually sends data or empty
@@ -498,7 +498,7 @@ backup written for a different path under the same key -- the tag mismatch fails
 before the rollback checkpoint or session state can be poisoned. Only explicitly supported
 envelope versions are accepted, the record must fit the size bounds of its version, and the
 (2xx) response body is read in chunks under a size cap -- malformed, truncated, trailing, and
-oversized records are all rejected. Pubky 0.15 separately bounds non-2xx error bodies
+oversized records are all rejected. Pubky 0.16.2 separately bounds non-2xx error bodies
 using its configured error-body cap. Neither byte cap bounds elapsed time; callers
 must also configure a request deadline as described above.
 
