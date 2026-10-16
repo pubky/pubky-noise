@@ -146,12 +146,11 @@ pub const MIN_BACKUP_RECORD_LEN: usize =
 pub const MAX_BACKUP_RECORD_LEN: usize =
     HEADER_LEN + NONCE_LEN + GENERATION_LEN + MAX_SESSION_STATE_LEN + TAG_LEN;
 
-/// Size cap on the homeserver response body when fetching a backup.
+/// Size cap on successful (2xx) homeserver response bodies when fetching a backup.
 ///
-/// Bounds memory allocation against a malicious homeserver returning a huge
-/// 2xx body (the pubky SDK consumes *error* bodies in full before callers
-/// regain control, so this cap cannot cover those). This accommodates the
-/// largest supported record while keeping allocation strictly bounded.
+/// Bounds the accumulated backup body while accommodating the largest supported
+/// record. Non-2xx error-body capture is bounded separately by the Pubky SDK's
+/// configured limit. Neither byte cap bounds elapsed time or total memory use.
 pub const MAX_BACKUP_RESPONSE_BYTES: usize = 4096;
 
 // The size cap must always fit the largest supported record.
