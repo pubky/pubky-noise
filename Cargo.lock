@@ -1385,7 +1385,6 @@ name = "e2e"
 version = "0.1.0-rc1"
 dependencies = [
  "bytes",
- "pubky 0.15.0",
  "pubky-noise",
  "pubky-testnet",
  "serde",
@@ -3693,38 +3692,6 @@ checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 
 [[package]]
 name = "pubky"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c298b2ec3f482618764c4bdc5cd69a9e52515e95e315d8f2dd946b83e4d03362"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "cookie",
- "flume 0.12.0",
- "futures-lite",
- "futures-util",
- "httpdate",
- "log",
- "lru 0.18.2",
- "percent-encoding",
- "pkarr",
- "pubky-common 0.15.0",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sse-core",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
- "wasm-bindgen-futures",
- "web-time",
- "webpki-roots 1.0.7",
-]
-
-[[package]]
-name = "pubky"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff4bc2538a42cabe599f857222cda99571ad78f7240a435cc6a9c3ef59127e01"
@@ -3741,7 +3708,7 @@ dependencies = [
  "lru 0.18.2",
  "percent-encoding",
  "pkarr",
- "pubky-common 0.16.2",
+ "pubky-common",
  "reqwest",
  "rustls",
  "serde",
@@ -3755,28 +3722,6 @@ dependencies = [
  "web-time",
  "webpki-roots 1.0.7",
  "zeroize",
-]
-
-[[package]]
-name = "pubky-common"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4a8b4c4831885f025577109215022f7e785b8c421b516cdfe1b510c8f2653fe"
-dependencies = [
- "argon2",
- "base64 0.23.1",
- "blake3",
- "crypto_secretbox",
- "ed25519-dalek",
- "percent-encoding",
- "pkarr",
- "postcard",
- "pubky-timestamp",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "url",
 ]
 
 [[package]]
@@ -3844,7 +3789,7 @@ dependencies = [
  "percent-encoding",
  "pkarr",
  "prometheus",
- "pubky-common 0.16.2",
+ "pubky-common",
  "pubky_test_utils",
  "rand 0.10.1",
  "reqwest",
@@ -3878,7 +3823,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.3.4",
  "hex",
- "pubky 0.15.0",
+ "pubky",
  "rand 0.9.4",
  "reqwest",
  "sha2 0.11.0",
@@ -3899,8 +3844,8 @@ dependencies = [
  "mainline",
  "pkarr",
  "pkarr-relay",
- "pubky 0.16.2",
- "pubky-common 0.16.2",
+ "pubky",
+ "pubky-common",
  "pubky-homeserver",
  "pubky_test_utils",
  "tempfile",
