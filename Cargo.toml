@@ -22,3 +22,9 @@ opt-level = 'z'
 
 [workspace.dependencies]
 pkarr = "6"
+
+[patch.crates-io]
+pubky = { git = "https://github.com/pubky/pubky-homeserver", rev = "85a6cfbedec7164f78e267479a0282c014bceb55" }
+pubky-common = { git = "https://github.com/pubky/pubky-homeserver", rev = "85a6cfbedec7164f78e267479a0282c014bceb55" }
+pubky-testnet = { git = "https://github.com/pubky/pubky-homeserver", rev = "85a6cfbedec7164f78e267479a0282c014bceb55" }
+pubky-homeserver = { git = "https://github.com/pubky/pubky-homeserver", rev = "85a6cfbedec7164f78e267479a0282c014bceb55" }

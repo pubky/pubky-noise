@@ -3694,8 +3694,7 @@ checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 [[package]]
 name = "pubky"
 version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff4bc2538a42cabe599f857222cda99571ad78f7240a435cc6a9c3ef59127e01"
+source = "git+https://github.com/pubky/pubky-homeserver?rev=85a6cfbedec7164f78e267479a0282c014bceb55#85a6cfbedec7164f78e267479a0282c014bceb55"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3728,8 +3727,7 @@ dependencies = [
 [[package]]
 name = "pubky-common"
 version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d37187c4312c76a0716c337dce1e111e145117e559a621f64e719d02ffa0c3e8"
+source = "git+https://github.com/pubky/pubky-homeserver?rev=85a6cfbedec7164f78e267479a0282c014bceb55#85a6cfbedec7164f78e267479a0282c014bceb55"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -3754,8 +3752,7 @@ dependencies = [
 [[package]]
 name = "pubky-homeserver"
 version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bea963f2468d4eb5d36da614d599ac44ffb21bd79697487021a326af8d96442a"
+source = "git+https://github.com/pubky/pubky-homeserver?rev=85a6cfbedec7164f78e267479a0282c014bceb55#85a6cfbedec7164f78e267479a0282c014bceb55"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3838,8 +3835,7 @@ dependencies = [
 [[package]]
 name = "pubky-testnet"
 version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8eccbf8041b16ceaa87b864ded21f46a0decef709b8d6c38d308ced9a21784d"
+source = "git+https://github.com/pubky/pubky-homeserver?rev=85a6cfbedec7164f78e267479a0282c014bceb55#85a6cfbedec7164f78e267479a0282c014bceb55"
 dependencies = [
  "anyhow",
  "clap",
@@ -3879,8 +3875,7 @@ dependencies = [
 [[package]]
 name = "pubky_test_utils"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cbd737dac148da5c734b4abd7f34d4cf64dfc4441cc253dfc05acedb203d7e5"
+source = "git+https://github.com/pubky/pubky-homeserver?rev=85a6cfbedec7164f78e267479a0282c014bceb55#85a6cfbedec7164f78e267479a0282c014bceb55"
 dependencies = [
  "pubky_test_utils_drop_db_helper",
  "pubky_test_utils_macro",
@@ -3889,8 +3884,7 @@ dependencies = [
 [[package]]
 name = "pubky_test_utils_drop_db_helper"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b556c3800e017f2229115713ba1a0d05796ec0724185c6ad7f865eee9b030d2"
+source = "git+https://github.com/pubky/pubky-homeserver?rev=85a6cfbedec7164f78e267479a0282c014bceb55#85a6cfbedec7164f78e267479a0282c014bceb55"
 dependencies = [
  "sqlx",
 ]
@@ -3898,8 +3892,7 @@ dependencies = [
 [[package]]
 name = "pubky_test_utils_macro"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1714113e8be46e6fe799d6997a22b3beaa1efcde6d9e24527795fbeec5a81bb7"
+source = "git+https://github.com/pubky/pubky-homeserver?rev=85a6cfbedec7164f78e267479a0282c014bceb55#85a6cfbedec7164f78e267479a0282c014bceb55"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",

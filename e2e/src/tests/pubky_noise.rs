@@ -1736,7 +1736,7 @@ async fn snow_test_backup_oversized_rejected() {
     let err = PubkyNoiseEncryptor::load_snapshot(&pair.initiator_config, &backup_key, None)
         .await
         .unwrap_err();
-    assert_eq!(err, PubkyNoiseError::HomeserverResponseError);
+    assert_eq!(err, PubkyNoiseError::RestoreBackupTooLargeError);
 }
 
 #[tokio::test]
@@ -2645,7 +2645,9 @@ async fn snow_test_handshake_read_error_preserves_state_for_retry() {
     .unwrap();
     assert_eq!(
         pair.responder.handle_handshake().await.unwrap_err(),
-        PubkyNoiseError::HomeserverResponseError
+        PubkyNoiseError::HomeserverRequestError {
+            kind: pubky_testnet::pubky::errors::RequestErrorKind::Connection,
+        }
     );
     assert_eq!(pair.responder.snapshot().unwrap().serialize(), before);
     assert_eq!(
