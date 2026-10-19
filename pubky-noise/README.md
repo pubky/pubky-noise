@@ -82,11 +82,13 @@ initiator.close();
 When polling a handshake packet, only HTTP 404/410 is treated as absent (`Pending`).
 Transport reads treat only 404 as absent; snapshot reads map 404/410 to
 `RestoreBackupNotFoundError`. Other non-success HTTP statuses return
-`HomeserverHttpError { status }`. Read failures without an HTTP status and
-successful (2xx) response-body failures return `HomeserverResponseError`. Pubky
-preserves a known non-success status even if reading its error body fails or times out.
-Failures without a status include refused connections and other non-timeout
-transport failures, not just expired deadlines.
+`HomeserverHttpError { status }`. Once Pubky receives a non-success HTTP response
+status code, such as 503, it retains that code even if reading the response body
+fails or times out. Noise reports it as `HomeserverHttpError { status: 503 }`.
+Read failures before receiving an HTTP response status code and successful (2xx)
+response-body failures return `HomeserverResponseError`. Failures without an HTTP
+status code include refused connections and other non-timeout transport failures,
+not just expired deadlines.
 
 Neither error implies that retrying unchanged will help. Use the status to choose
 application-specific handling: authorization or request errors may require
