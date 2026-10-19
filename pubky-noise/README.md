@@ -85,10 +85,15 @@ Transport reads treat only 404 as absent; snapshot reads map 404/410 to
 `HomeserverHttpError { status }`. Read failures without an HTTP status and
 successful (2xx) response-body failures return `HomeserverResponseError`. Pubky
 preserves a known non-success status even if reading its error body fails or times out.
+Failures without a status include refused connections and other non-timeout
+transport failures, not just expired deadlines.
 
 Neither error implies that retrying unchanged will help. Use the status to choose
 application-specific handling: authorization or request errors may require
 correction, while 408, 429 and some 5xx responses may warrant bounded retries.
+For example, 501 (Not Implemented) is not interchangeable with 503 (Service
+Unavailable). Pubky owns HTTP transport and response handling; Noise preserves
+the exact status while applying its operation-specific absence rules.
 The failed read does not advance its cursor; earlier successful handshake actions
 remain applied. The quick start propagates errors to the caller; write failures
 still require the [snapshot recovery](#code-example) described below.
@@ -106,8 +111,12 @@ bodies. A separate `read_timeout` resets on each successful read, so it is not a
 substitute for a total deadline when a server continually sends data or empty
 frames. See the compiled example in the `PubkyNoiseConfig` API documentation.
 
-Noise does not impose a timeout or retry automatically. Choose deadlines and
-backoff for the application. Browser/WASM callers must provide operation-level
+Noise does not impose a timeout or retry automatically. Each total deadline
+bounds one HTTP request, not a sequence of requests, retries, or concurrent peers.
+Callers must bound retries, backoff, peer admission and concurrency separately.
+With error-body capture enabled, even a known HTTP error can wait for body
+completion, capture overflow or the deadline before returning its status.
+Browser/WASM callers must provide operation-level
 deadlines and cancellation; Pubky's native HTTP timeout settings do not apply
 there. Cancellation of a write does not establish that it was rejected: preserve
 the existing snapshot and exact-ciphertext recovery requirements.
@@ -115,7 +124,7 @@ the existing snapshot and exact-ciphertext recovery requirements.
 An HTTP/1.1 zero-sized chunk terminates a chunked body; an HTTP/2 empty DATA frame
 does not necessarily end the stream. The reader accepts empty frames without
 treating them as EOF or malformed ciphertext. A configured total deadline bounds
-both stalled responses and streams of empty frames.
+stalled responses and continuous streams of empty or non-empty frames.
 
 ## Architecture
 
@@ -213,6 +222,9 @@ sessions, the current packet and version-1 snapshot formats have these bounds:
 
 The maximum serialized state is 198 fixed bytes plus two incoming handshake
 messages of at most 1016 bytes each, with a two-byte length for each message.
+Thus 1016 bounds one incoming message, not the snapshot; the version-1 NN/XX
+snapshot ceiling is 2234 bytes. Supporting other patterns requires evaluating
+their transcript requirements separately.
 The encrypted record adds 54 bytes for its header, nonce, generation and tag.
 These are data-length limits, not a per-session RAM ceiling. Live encryptors also
 hold Snow state and may retain a pre-mutation snapshot or pending ciphertext.
@@ -368,8 +380,12 @@ Snapshots restore without network I/O: they retain the incoming handshake
 messages and regenerate outgoing handshake bytes in memory from the saved
 ephemeral seed. Replay verifies message authentication and the saved transcript
 hash or LinkId. Snapshots must remain encrypted, authenticated, and current;
-this is not a cache of live transport counters. Peer authorization and
-cross-process coordination remain the caller's responsibility. Remote deletion
+this is not a cache of live transport counters. Peer authorization means the
+application permits this peer/session to be used, on either side and after
+restore; it does not grant a Pubky account session. For XX, bind the learned
+static key to an independently authenticated expected peer key before exchanging
+application messages. NN does not authenticate peer identity. Cross-process
+coordination also remains the caller's responsibility. Remote deletion
 or replacement of old handshake files
 does not invalidate a saved transcript or revoke a session.
 

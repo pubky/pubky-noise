@@ -1907,7 +1907,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_read_distinguishes_absence_from_errors() {
-        for status in [404, 410, 401, 403, 405, 406, 408, 429, 500, 503] {
+        for status in [404, 410, 401, 403, 405, 406, 408, 429, 500, 501, 503] {
             let response = Err(Error::Request(RequestError::Server {
                 status: StatusCode::from_u16(status).unwrap(),
                 message: String::new(),
@@ -1932,8 +1932,8 @@ mod tests {
         );
         let response = response_for_test(Vec::new()).await;
         assert!(matches!(
-            response,
-            Err(Error::Request(RequestError::Transport(_)))
+            &response,
+            Err(Error::Request(RequestError::Transport(error))) if !error.is_timeout()
         ));
         assert_eq!(
             read_handshake_packet(response).await,
@@ -1986,21 +1986,26 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_packet_read_obeys_total_deadline() {
-        for send_empty_frames in [false, true] {
+        for frame in [None, Some(&b""[..]), Some(&b"x"[..])] {
             let (mut response, mut body, mut tasks) = http2_response_for_test().await;
             tasks.spawn(async move {
                 loop {
-                    if send_empty_frames && body.send_data(bytes::Bytes::new(), false).is_err() {
-                        break;
+                    if let Some(frame) = frame {
+                        if body
+                            .send_data(bytes::Bytes::from_static(frame), false)
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             });
-            if send_empty_frames {
-                assert!(response.chunk().await.unwrap().unwrap().is_empty());
+            if let Some(frame) = frame {
+                assert_eq!(response.chunk().await.unwrap().unwrap().as_ref(), frame);
             }
             let result =
-                tokio::time::timeout(Duration::from_secs(5), read_bounded_packet(response, 4))
+                tokio::time::timeout(Duration::from_secs(5), read_bounded_packet(response, 1000))
                     .await
                     .expect("the configured HTTP deadline must end the body read");
             assert_eq!(result, Err(PubkyNoiseError::HomeserverResponseError));
