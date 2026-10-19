@@ -82,11 +82,16 @@ initiator.close();
 When polling a handshake packet, only HTTP 404/410 is treated as absent (`Pending`).
 Transport reads treat only 404 as absent; snapshot reads map 404/410 to
 `RestoreBackupNotFoundError`. Other non-success HTTP statuses return
-`HomeserverHttpError { status }`. Read failures without an HTTP status and
-successful (2xx) response-body failures return `HomeserverResponseError`. Pubky
+`HomeserverHttpError { status }`. Request and successful (2xx) response-body
+failures return `HomeserverRequestError { kind }`, preserving Pubky's
+`RequestErrorKind`. Other Pubky failures, such as resolution or credential
+preparation, retain the `HomeserverResponseError` fallback. Pubky
 preserves a known non-success status even if reading its error body fails or times out.
 
-Neither error implies that retrying unchanged will help. Use the status to choose
+No category implies that retrying unchanged will help. `Decode` includes truncated
+HTTP framing and does not establish corrupt stored application data. Browser
+transports can report `Other` when a more specific cause is unavailable.
+Use the status and cause to choose
 application-specific handling: authorization or request errors may require
 correction, while 408, 429 and some 5xx responses may warrant bounded retries.
 The failed read does not advance its cursor; earlier successful handshake actions
@@ -733,7 +738,9 @@ does not detect or republish lost data.
 | `MissingHandshakePacket` | Preparation requires a read, but no packet was supplied | Recover the previous checkpoint and fetch the required packet before preparing |
 | `UnexpectedHandshakePacket` | Preparation received a packet when no read was required | Recover the previous checkpoint and follow its read-slot probe |
 | `HomeserverHttpError { status }` | A handshake, transport or snapshot read returned a non-success HTTP status not handled as absence | Inspect the status and correct the cause or apply caller-owned retry policy; no automatic retry |
-| `HomeserverResponseError` | A read failed without an HTTP status, a successful (2xx) body read failed, or a snapshot exceeded its size cap | Check client configuration, connectivity and response validity; retry only after addressing the cause |
+| `HomeserverRequestError { kind }` | A request or successful response-body read failed | Inspect the cause; preserve the checkpoint and apply operation-specific retry policy |
+| `HomeserverResponseError` | A Pubky failure outside request classification, such as resolution or credential preparation | Check the cause; do not infer absence or corrupt application data |
+| `RestoreBackupTooLargeError` | The snapshot response exceeds the read size cap | Retain the trusted checkpoint and investigate; do not overwrite the backup or start a new session on this error alone |
 | `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
 | `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
@@ -750,11 +757,17 @@ does not detect or republish lost data.
 | `RestoreBackupRollbackError` | Backup generation is older than the trusted local checkpoint | Restart from a fresh handshake; investigate homeserver |
 | `RestoreBackupNotFoundError` | No backup exists at the backup path (distinct from connectivity/server failures) | Persist a snapshot first, or start a new session |
 
-Callers matching `PubkyNoiseError` must handle `HomeserverHttpError` explicitly
-when classifying read failures. In particular, a catch-all that treats errors as
-invalid ciphertext or permanently non-retryable must not silently classify HTTP
-408/429/5xx that way. Status codes are retained without server-supplied error
-bodies or request URLs. Write errors keep their existing recovery contract.
+Callers matching `PubkyNoiseError` must handle `HomeserverHttpError` and
+`HomeserverRequestError` explicitly when classifying read failures. A catch-all
+must not turn these failures into invalid ciphertext or permission to discard
+recovery state. Categories contain no server-supplied bodies or request URLs.
+They are not a retry-safe flag: a failed write may already have committed.
+Write errors keep their existing recovery contract, including retained exact
+ciphertext for uncertain sends.
+
+These error variants change the Rust API, not the peer protocol or snapshot
+format. Dependency upgrades must update downstream error matches. Existing
+peers do not need to upgrade together or re-establish their Encrypted Links.
 
 ## Features
 

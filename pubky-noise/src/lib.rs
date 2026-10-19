@@ -89,11 +89,7 @@ async fn read_bounded_packet(
         return Err(PubkyNoiseError::BadLengthCiphertext);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| PubkyNoiseError::HomeserverResponseError)?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(map_homeserver_body_error)? {
         // Check before extending; Content-Length may be absent or untrustworthy.
         if chunk.len() > max_bytes - body.len() {
             return Err(PubkyNoiseError::BadLengthCiphertext);
@@ -105,12 +101,21 @@ async fn read_bounded_packet(
 
 fn map_homeserver_read_error(error: Error) -> PubkyNoiseError {
     match error {
-        Error::Request(RequestError::Server { status, .. }) => {
-            PubkyNoiseError::HomeserverHttpError {
-                status: status.as_u16(),
-            }
-        }
+        Error::Request(error) => map_homeserver_request_kind(error.kind()),
         _ => PubkyNoiseError::HomeserverResponseError,
+    }
+}
+
+fn map_homeserver_body_error(error: reqwest::Error) -> PubkyNoiseError {
+    map_homeserver_request_kind(pubky::errors::RequestErrorKind::from_transport(&error))
+}
+
+fn map_homeserver_request_kind(kind: pubky::errors::RequestErrorKind) -> PubkyNoiseError {
+    match kind {
+        pubky::errors::RequestErrorKind::Http { status } => {
+            PubkyNoiseError::HomeserverHttpError { status }
+        }
+        kind => PubkyNoiseError::HomeserverRequestError { kind },
     }
 }
 
@@ -224,10 +229,15 @@ pub enum PubkyNoiseError {
     MissingHandshakePacket,
     /// Handshake preparation received a packet when no read was required.
     UnexpectedHandshakePacket,
-    /// A homeserver read failed without an HTTP status, a successful (2xx)
-    /// response body could not be read, or a snapshot exceeded its size cap.
-    /// This does not imply that retrying will help.
+    /// A homeserver read failed outside Pubky's request-error classification,
+    /// for example during resolution or credential preparation.
     HomeserverResponseError,
+    /// A request or successful-response body read failed.
+    /// The cause does not imply that retrying will help or that a write was absent.
+    HomeserverRequestError {
+        /// Context-free cause; contains no URL, response body or credentials.
+        kind: pubky::errors::RequestErrorKind,
+    },
     /// A homeserver read returned a non-success HTTP status other than an
     /// absence status handled by that operation. Retry policy belongs to the
     /// caller; authorization or request errors may need correction first.
@@ -254,9 +264,12 @@ pub enum PubkyNoiseError {
     /// Restore failed: no backup exists at the backup path on the homeserver.
     ///
     /// Distinct from [`PubkyNoiseError::HomeserverResponseError`] and
-    /// [`PubkyNoiseError::HomeserverHttpError`], neither of which confirms
+    /// [`PubkyNoiseError::HomeserverHttpError`] or
+    /// [`PubkyNoiseError::HomeserverRequestError`], none of which confirms
     /// the absence of a backup.
     RestoreBackupNotFoundError,
+    /// The snapshot response exceeds the read size limit.
+    RestoreBackupTooLargeError,
     /// Handshake or transport message encryption failed.
     EncryptionError,
     /// Handshake or transport message authentication/decryption failed.
@@ -805,8 +818,9 @@ impl PubkyNoiseEncryptor {
     /// - **Absent message** (HTTP 404/410 from the peer's outbox):
     ///   The method returns `Pending` without advancing the pending read.
     ///   Other HTTP statuses return [`PubkyNoiseError::HomeserverHttpError`];
-    ///   failures without a status and successful (2xx) body-read failures return
-    ///   [`PubkyNoiseError::HomeserverResponseError`]. Neither implies that a
+    ///   request and successful (2xx) body-read failures retain their cause in
+    ///   [`PubkyNoiseError::HomeserverRequestError`]. Other Pubky failures use
+    ///   [`PubkyNoiseError::HomeserverResponseError`]. None implies that a
     ///   retry will help. Once the cause is addressed, subsequent calls attempt
     ///   the same read; earlier successful actions in this call remain applied.
     ///
@@ -848,8 +862,9 @@ impl PubkyNoiseEncryptor {
     ///   before reusing the encryptor.
     /// - Returns [`PubkyNoiseError::HomeserverHttpError`] on HTTP statuses other
     ///   than success or 404/410, retaining the status for caller classification.
-    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on GET failures
-    ///   without a status, or if a successful (2xx) response body cannot be read.
+    /// - Returns [`PubkyNoiseError::HomeserverRequestError`] on request or
+    ///   successful (2xx) response-body failures, preserving Pubky's cause category.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on other Pubky failures.
     /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
     ///   write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
     ///   and [`restore()`](Self::restore) is required.
@@ -1356,9 +1371,10 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::IsHandshake`] if not yet in transport phase.
     /// - Returns [`PubkyNoiseError::HomeserverHttpError`] for non-success HTTP
     ///   statuses other than 404. In particular, 410 is not treated as absence here.
-    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the homeserver read
-    ///   fails without a status or if a successful (2xx) body cannot be read, including
+    /// - Returns [`PubkyNoiseError::HomeserverRequestError`] on request or
+    ///   successful (2xx) body-read failures, including
     ///   expiry of a caller-configured [deadline](PubkyNoiseConfig#request-deadlines).
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on other Pubky failures.
     /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] if the packet is malformed.
     /// - Returns [`PubkyNoiseError::DecryptionError`] if Noise decryption fails.
     /// - Returns [`PubkyNoiseError::CounterOverflow`] if the remote outbound
@@ -1552,9 +1568,11 @@ impl PubkyNoiseEncryptor {
     ///   exists at the backup path.
     /// - Returns [`PubkyNoiseError::HomeserverHttpError`] if the HEAD or GET
     ///   returns a non-success HTTP status other than 404/410.
-    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the backup
-    ///   cannot be fetched without an HTTP status, a successful (2xx) body cannot be read,
-    ///   or a 2xx response exceeds the size cap.
+    /// - Returns [`PubkyNoiseError::HomeserverRequestError`] on request or
+    ///   successful (2xx) body-read failures.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on other Pubky failures.
+    /// - Returns [`PubkyNoiseError::RestoreBackupTooLargeError`] if the snapshot
+    ///   response exceeds the read size cap. This does not authorize replacing it.
     /// - Returns [`PubkyNoiseError::RestoreBackupDecryptError`] if decryption
     ///   fails (wrong key, tampered/corrupted ciphertext, or a record that
     ///   was encrypted for a different backup path — the path is bound into
@@ -1579,7 +1597,7 @@ impl PubkyNoiseEncryptor {
             Ok(Some(stats)) => {
                 if let Some(len) = stats.content_length {
                     if len > backup_crypto::MAX_BACKUP_RESPONSE_BYTES as u64 {
-                        return Err(PubkyNoiseError::HomeserverResponseError);
+                        return Err(PubkyNoiseError::RestoreBackupTooLargeError);
                     }
                 }
             }
@@ -1603,17 +1621,13 @@ impl PubkyNoiseEncryptor {
         // differ from it).
         if let Some(len) = response.content_length() {
             if len > backup_crypto::MAX_BACKUP_RESPONSE_BYTES as u64 {
-                return Err(PubkyNoiseError::HomeserverResponseError);
+                return Err(PubkyNoiseError::RestoreBackupTooLargeError);
             }
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| PubkyNoiseError::HomeserverResponseError)?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(map_homeserver_body_error)? {
             if body.len() + chunk.len() > backup_crypto::MAX_BACKUP_RESPONSE_BYTES {
-                return Err(PubkyNoiseError::HomeserverResponseError);
+                return Err(PubkyNoiseError::RestoreBackupTooLargeError);
             }
             body.extend_from_slice(&chunk);
         }
@@ -1928,16 +1942,59 @@ mod tests {
         });
         assert_eq!(
             read_handshake_packet(Err(error)).await,
-            Err(PubkyNoiseError::HomeserverResponseError)
+            Err(PubkyNoiseError::HomeserverRequestError {
+                kind: pubky::errors::RequestErrorKind::InvalidRequest,
+            })
         );
         let response = response_for_test(Vec::new()).await;
         assert!(matches!(
             response,
             Err(Error::Request(RequestError::Transport(_)))
         ));
+        let Error::Request(request) = response.as_ref().unwrap_err() else {
+            panic!("expected a request failure");
+        };
+        let expected = PubkyNoiseError::HomeserverRequestError {
+            kind: request.kind(),
+        };
+        assert_eq!(read_handshake_packet(response).await, Err(expected));
+    }
+
+    #[test]
+    fn request_categories_do_not_imply_corrupt_state_or_retry_safety() {
+        use pubky::errors::RequestErrorKind;
+        for kind in [
+            RequestErrorKind::Timeout,
+            RequestErrorKind::Connection,
+            RequestErrorKind::Body,
+            RequestErrorKind::Decode,
+            RequestErrorKind::InvalidRequest,
+            RequestErrorKind::Other,
+        ] {
+            assert_eq!(
+                map_homeserver_request_kind(kind),
+                PubkyNoiseError::HomeserverRequestError { kind }
+            );
+        }
         assert_eq!(
-            read_handshake_packet(response).await,
-            Err(PubkyNoiseError::HomeserverResponseError)
+            map_homeserver_request_kind(RequestErrorKind::Http { status: 503 }),
+            PubkyNoiseError::HomeserverHttpError { status: 503 }
+        );
+        let outside_request = Error::Authentication(pubky::errors::AuthError::Validation(
+            "private context".into(),
+        ));
+        assert_eq!(
+            map_homeserver_read_error(outside_request),
+            PubkyNoiseError::HomeserverResponseError
+        );
+        let decode = Error::Request(RequestError::DecodeJson {
+            message: "private context".into(),
+        });
+        assert_eq!(
+            map_homeserver_read_error(decode),
+            PubkyNoiseError::HomeserverRequestError {
+                kind: RequestErrorKind::Decode
+            }
         );
     }
 
@@ -1962,7 +2019,9 @@ mod tests {
             ),
             (
                 "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nab",
-                Err(PubkyNoiseError::HomeserverResponseError),
+                Err(PubkyNoiseError::HomeserverRequestError {
+                    kind: pubky::errors::RequestErrorKind::Decode,
+                }),
             ),
         ];
         for (wire, expected) in cases {
@@ -2003,7 +2062,12 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), read_bounded_packet(response, 4))
                     .await
                     .expect("the configured HTTP deadline must end the body read");
-            assert_eq!(result, Err(PubkyNoiseError::HomeserverResponseError));
+            assert_eq!(
+                result,
+                Err(PubkyNoiseError::HomeserverRequestError {
+                    kind: pubky::errors::RequestErrorKind::Timeout,
+                })
+            );
             tasks.shutdown().await;
         }
     }
