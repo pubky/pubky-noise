@@ -1,6 +1,7 @@
 pub mod backup_crypto;
 pub mod identity_payload;
 pub mod path_derivation;
+mod request_policy;
 pub mod serializer;
 pub mod snow_crypto;
 pub mod snow_crypto_resolver;
@@ -8,11 +9,13 @@ pub mod snow_crypto_resolver;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use pubky::errors::RequestError;
 use pubky::prelude::*;
 use pubky::PubkySession;
 use sha2::{Digest, Sha256};
 
+pub use request_policy::RequestPolicy;
 use serializer::{PubkyNoiseSessionState, SESSION_STATE_VERSION};
 use snow_crypto::{
     full_handshake_actions, ContextError, DataLinkContext, HandshakeAction, HandshakePattern,
@@ -79,9 +82,14 @@ async fn read_handshake_packet(
 }
 
 async fn read_bounded_packet(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     max_bytes: usize,
 ) -> Result<Vec<u8>, PubkyNoiseError> {
+    if response.status() != StatusCode::OK {
+        return Err(PubkyNoiseError::HomeserverHttpError {
+            status: response.status().as_u16(),
+        });
+    }
     if response
         .content_length()
         .is_some_and(|len| len > max_bytes as u64)
@@ -89,11 +97,10 @@ async fn read_bounded_packet(
         return Err(PubkyNoiseError::BadLengthCiphertext);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| PubkyNoiseError::HomeserverResponseError)?
-    {
+    let stream = response.bytes_stream();
+    futures_util::pin_mut!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| PubkyNoiseError::HomeserverResponseError)?;
         // Check before extending; Content-Length may be absent or untrustworthy.
         if chunk.len() > max_bytes - body.len() {
             return Err(PubkyNoiseError::BadLengthCiphertext);
@@ -214,6 +221,9 @@ impl std::fmt::Debug for LoadedSnapshot {
 
 #[derive(Eq, Hash, PartialEq, Debug)]
 pub enum PubkyNoiseError {
+    /// Handshake state cannot be reused or snapshotted until its pending write
+    /// is acknowledged, or a failed state transition is restored.
+    HandshakeRecoveryRequired,
     /// The configured pattern name is not recognized.
     UnknownNoisePattern,
     /// The pattern is recognized but its handshake actions are not supported.
@@ -224,20 +234,19 @@ pub enum PubkyNoiseError {
     MissingHandshakePacket,
     /// Handshake preparation received a packet when no read was required.
     UnexpectedHandshakePacket,
-    /// A homeserver read failed without an HTTP status, a successful (2xx)
-    /// response body could not be read, or a snapshot exceeded its size cap.
-    /// This does not imply that retrying will help.
+    /// A request or body read failed without an HTTP status, the request
+    /// deadline was exhausted, or a snapshot exceeded its size cap.
+    /// This does not prove rejection of a write or that retrying will help.
     HomeserverResponseError,
-    /// A homeserver read returned a non-success HTTP status other than an
-    /// absence status handled by that operation. Retry policy belongs to the
-    /// caller; authorization or request errors may need correction first.
+    /// A homeserver returned a status not accepted by the operation.
+    /// This includes incomplete success responses such as 202 or 206.
+    /// Authorization or request errors may need correction before another call.
     HomeserverHttpError {
         /// HTTP response status code. The response body is not retained.
         status: u16,
     },
-    /// Handshake write failed to reach the homeserver.
-    /// The Noise state has already advanced irreversibly; recovery requires
-    /// restoring from [`PubkyNoiseEncryptor::last_good_snapshot()`].
+    /// A convenience handshake, transport or backup write could not be confirmed.
+    /// This does not prove rejection; retain pending output for exact retry.
     HomeserverWriteError,
     IsHandshake,
     /// Restore failed: handshake replay error.
@@ -438,6 +447,19 @@ struct PendingConvenienceSend {
     acknowledgement_digest: [u8; 32],
 }
 
+struct PendingHandshakeWrite {
+    destination_path: String,
+    packet: [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2],
+}
+
+impl std::fmt::Debug for PendingHandshakeWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingHandshakeWrite")
+            .field("packet", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for PendingConvenienceSend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingConvenienceSend")
@@ -469,14 +491,21 @@ impl std::fmt::Debug for PendingConvenienceSend {
 ///
 /// ## Request deadlines
 ///
-/// Size limits bound response bytes, not time spent waiting for a body. Noise
-/// adds no deadline. On native targets, configure a total
-/// [`pubky::PubkyHttpClientBuilder::request_timeout`] on both the outbox client
-/// and the client used to create the local session. Pubky's native HTTP timeouts
-/// are disabled by default. A read timeout alone resets on successful reads and
-/// does not bound a continually active response, including empty body frames.
-/// Browser callers must enforce their own operation deadline and cancellation;
-/// Pubky's native HTTP timeout settings do not apply to WASM.
+/// Noise-owned I/O uses [`RequestPolicy`]: by default, a ten-second deadline per
+/// attempt and at most three attempts with exponential backoff. The deadline
+/// covers request preparation and the bounded response-body read, including
+/// continuously arriving chunks. It drops the request future when it expires.
+/// Browser suspension can delay timer delivery; this is not a wall-clock
+/// guarantee while the browser is suspended.
+///
+/// Keep Pubky's error-body limit bounded when constructing the supplied clients
+/// (its default is 4096 bytes). Noise cannot change an existing authenticated
+/// client's settings. Native Pubky request timeouts can provide an additional
+/// transport-level bound.
+///
+/// Prepared operations perform no I/O. Their callers own deadlines, publication,
+/// persistence, authorization and aggregate admission limits. A timeout or
+/// cancellation does not prove that a write was rejected.
 ///
 /// ```no_run
 /// # #[cfg(not(target_arch = "wasm32"))]
@@ -496,6 +525,9 @@ impl std::fmt::Debug for PendingConvenienceSend {
 /// # fn main() {}
 /// ```
 pub struct PubkyNoiseConfig {
+    /// Deadlines and bounded retries for Noise-owned network operations.
+    /// Prepared operations perform no I/O and remain caller-managed.
+    pub request_policy: RequestPolicy,
     pub outbox_client: Pubky,
     pub local_session: PubkySession,
     /// Folder prefix for writing messages to the local homeserver.
@@ -575,6 +607,7 @@ impl PubkyNoiseConfig {
             .map_err(|_| PubkyNoiseError::UnknownNoisePattern)?;
 
         Ok(Arc::new(PubkyNoiseConfig {
+            request_policy: RequestPolicy::default(),
             outbox_client,
             local_session: homeserver_auth_session,
             write_path,
@@ -583,6 +616,30 @@ impl PubkyNoiseConfig {
             pubky_noise_version,
             default_pattern,
         }))
+    }
+
+    async fn publish(&self, path: &str, packet: &[u8]) -> Result<(), PubkyNoiseError> {
+        self.request_policy
+            .run(|| async {
+                let response = self
+                    .local_session
+                    .storage()
+                    .put(path, packet.to_vec())
+                    .await
+                    .map_err(|error| match error {
+                        Error::Request(RequestError::Server { status, .. }) => {
+                            PubkyNoiseError::HomeserverHttpError {
+                                status: status.as_u16(),
+                            }
+                        }
+                        _ => PubkyNoiseError::HomeserverWriteError,
+                    })?;
+                match response.status().as_u16() {
+                    200 | 201 | 204 => Ok(()),
+                    status => Err(PubkyNoiseError::HomeserverHttpError { status }),
+                }
+            })
+            .await
     }
 }
 
@@ -606,6 +663,10 @@ pub struct PubkyNoiseEncryptor {
     unacknowledged_transport_digest: Option<[u8; 32]>,
     /// Exact retry data retained after an ambiguous convenience-send failure.
     pending_convenience_send: Option<PendingConvenienceSend>,
+    pending_handshake_write: Option<PendingHandshakeWrite>,
+    /// Snow transitions cannot be rolled back in place after an uncertain write
+    /// or failed authentication. Never expose that state as a valid checkpoint.
+    handshake_recovery_required: bool,
 
     // test-only fields — stripped from production builds
     #[cfg(feature = "test-utils")]
@@ -653,6 +714,8 @@ impl PubkyNoiseEncryptor {
             last_good_snapshot: None,
             unacknowledged_transport_digest: None,
             pending_convenience_send: None,
+            pending_handshake_write: None,
+            handshake_recovery_required: false,
             #[cfg(feature = "test-utils")]
             simulate_tampering: false,
             #[cfg(feature = "test-utils")]
@@ -664,7 +727,7 @@ impl PubkyNoiseEncryptor {
 
     /// Returns `true` if the Noise handshake has completed.
     pub fn is_handshake_complete(&self) -> bool {
-        !self.context.is_handshake()
+        !self.handshake_recovery_required && !self.context.is_handshake()
     }
 
     /// Return the remote X25519 static key learned from the Noise handshake.
@@ -674,7 +737,11 @@ impl PubkyNoiseEncryptor {
     /// Callers must compare this with their independently authenticated expected
     /// key before trusting the completed link or exchanging application messages.
     pub fn remote_static_public_key(&self) -> Option<&[u8]> {
-        self.context.remote_static_public_key()
+        if self.handshake_recovery_required {
+            None
+        } else {
+            self.context.remote_static_public_key()
+        }
     }
 
     /// Consume this encryptor to prepare one handshake step without network I/O.
@@ -712,6 +779,7 @@ impl PubkyNoiseEncryptor {
         mut self,
         incoming_packet: Option<&[u8]>,
     ) -> Result<PreparedHandshakeStep, PubkyNoiseError> {
+        self.ensure_handshake_recovered()?;
         if self.context.is_transport() {
             return Err(PubkyNoiseError::OtherError);
         }
@@ -805,39 +873,27 @@ impl PubkyNoiseEncryptor {
     /// - **Absent message** (HTTP 404/410 from the peer's outbox):
     ///   The method returns `Pending` without advancing the pending read.
     ///   Other HTTP statuses return [`PubkyNoiseError::HomeserverHttpError`];
-    ///   failures without a status and successful (2xx) body-read failures return
+    ///   failures without a status and HTTP 200 body-read failures return
     ///   [`PubkyNoiseError::HomeserverResponseError`]. Neither implies that a
     ///   retry will help. Once the cause is addressed, subsequent calls attempt
     ///   the same read; earlier successful actions in this call remain applied.
     ///
-    /// - **Write failure** (Initiator fails to write to her outbox):
-    ///   If the homeserver `put()` call fails, this method returns
-    ///   [`PubkyNoiseError::HomeserverWriteError`]. Because Snow's internal
-    ///   `HandshakeState` has already been irreversibly advanced by
-    ///   `write_message`, the encryptor is in a corrupted state and **cannot**
-    ///   simply retry. The caller must recover by restoring from the
-    ///   pre-mutation snapshot captured at the start of this call.
+    /// - **Uncertain write** (error, deadline or cancellation):
+    ///   The exact packet and path remain pending in this encryptor. A later
+    ///   call republishes them without advancing Snow again. Until publication
+    ///   is acknowledged, snapshotting and transport promotion fail with
+    ///   [`PubkyNoiseError::HandshakeRecoveryRequired`]. Alternatively, restore
+    ///   [`last_good_snapshot()`](Self::last_good_snapshot): it captures the
+    ///   state immediately before encryption, including preceding peer reads,
+    ///   so local replay reproduces the exact pending packet without fetching
+    ///   those reads again. Retry calls preserve that checkpoint.
     ///
-    ///   **Recovery**: each call to `handle_handshake` automatically captures
-    ///   a pre-mutation snapshot accessible via
-    ///   [`last_good_snapshot()`](Self::last_good_snapshot). For in-process
-    ///   recovery, pass that snapshot directly to [`restore()`](Self::restore);
-    ///   the replay mechanism rebuilds the Noise state at that checkpoint,
-    ///   allowing the handshake to resume from the right position.
-    ///
-    ///   Callers that need crash recovery must durably persist the
-    ///   pre-mutation snapshot themselves: encrypt it with
-    ///   [`backup_crypto::encrypt_backup_with_key`] and store it through
-    ///   caller-managed storage *before* the risky call. Note that
-    ///   [`persist_snapshot()`](Self::persist_snapshot) snapshots the
-    ///   encryptor's state at call time — it cannot persist
-    ///   `last_good_snapshot()`, and after a write failure the current state
-    ///   may already be advanced and corrupted.
-    ///
-    ///   Note: if the `put()` succeeds but the data is subsequently lost
-    ///   (e.g. homeserver crash after acknowledgment), the same snapshot-based
-    ///   recovery path applies — but the failure is not detectable by this
-    ///   method.
+    /// This convenience API retains retry data only in memory. For crash-safe
+    /// publication, use [`prepare_handshake_step()`](Self::prepare_handshake_step)
+    /// and atomically persist its state and exact pending output before sending.
+    /// A timeout does not prove rejection; never discard an uncertain pending
+    /// write or replace it with freshly generated output. A server losing data
+    /// after acknowledging a write is not detectable by this method.
     ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::UnsupportedNoisePattern`] for unsupported patterns.
@@ -848,19 +904,28 @@ impl PubkyNoiseEncryptor {
     ///   before reusing the encryptor.
     /// - Returns [`PubkyNoiseError::HomeserverHttpError`] on HTTP statuses other
     ///   than success or 404/410, retaining the status for caller classification.
-    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on GET failures
-    ///   without a status, or if a successful (2xx) response body cannot be read.
-    /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if the homeserver
-    ///   write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
-    ///   and [`restore()`](Self::restore) is required.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`] on an unclassified
+    ///   read/body failure or exhausted read deadline.
+    /// - Returns [`PubkyNoiseError::HomeserverWriteError`] if publication cannot
+    ///   be confirmed after the configured attempts. Retry the pending output
+    ///   in place or restore the pre-write checkpoint.
+    /// - Returns [`PubkyNoiseError::HandshakeRecoveryRequired`] after a failed
+    ///   cryptographic transition; restore the previous checkpoint before reuse.
     /// - Returns [`PubkyNoiseError::CounterOverflow`] if message slot space is exhausted.
     ///
     /// Successful response bodies are size-bounded before packet validation.
     /// Non-2xx bodies are handled by the Pubky SDK's configured error-body limit.
-    /// Configure [request deadlines](PubkyNoiseConfig#request-deadlines) separately.
+    /// See [request deadlines](PubkyNoiseConfig#request-deadlines) for retry bounds.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyNoiseError> {
-        // Capture pre-mutation snapshot so callers can recover from write failures.
-        self.last_good_snapshot = Some(self.snapshot_unchecked());
+        if self.context.get_phase() != NoisePhase::HandShake {
+            return Err(PubkyNoiseError::OtherError);
+        }
+        if self.pending_handshake_write.is_some() {
+            self.publish_pending_handshake().await?;
+        } else {
+            self.ensure_handshake_recovered()?;
+            self.last_good_snapshot = Some(self.snapshot_unchecked());
+        }
 
         let remaining_actions = self.context.remaining_handshake_actions()?;
         for action in remaining_actions {
@@ -874,51 +939,40 @@ impl PubkyNoiseEncryptor {
                     let public_key = &self.endpoint_pubkey;
                     let formatted_path = format!("{public_key}/{path}/{counter}");
 
-                    let response = self
+                    let packet = self
                         .config
-                        .outbox_client
-                        .public_storage()
-                        .get(formatted_path)
-                        .await;
-                    let Some((message, len)) = read_handshake_packet(response).await? else {
+                        .request_policy
+                        .run(|| async {
+                            let response = self
+                                .config
+                                .outbox_client
+                                .public_storage()
+                                .get(&formatted_path)
+                                .await;
+                            read_handshake_packet(response).await
+                        })
+                        .await?;
+                    let Some((message, len)) = packet else {
                         return Ok(HandshakeResult::Pending);
                     };
+                    self.handshake_recovery_required = true;
                     self.apply_handshake_read(message, len)?;
+                    self.handshake_recovery_required = false;
                 }
                 HandshakeAction::Write => {
                     self.context
                         .ensure_can_increment_counter()
                         .map_err(|_| PubkyNoiseError::CounterOverflow)?;
-                    if let Ok((formatted_path, packet)) = self.prepare_handshake_packet() {
-                        // Check for simulated write failure (test-only) or
-                        // actual homeserver write failure.
-                        #[cfg(feature = "test-utils")]
-                        let write_failed = if self.simulate_write_failure {
-                            true
-                        } else {
-                            self.config
-                                .local_session
-                                .storage()
-                                .put(formatted_path, packet.to_vec())
-                                .await
-                                .is_err()
-                        };
-                        #[cfg(not(feature = "test-utils"))]
-                        let write_failed = self
-                            .config
-                            .local_session
-                            .storage()
-                            .put(formatted_path, packet.to_vec())
-                            .await
-                            .is_err();
-                        if write_failed {
-                            // Snow's HandshakeState has already advanced
-                            // irreversibly. The caller must recover via
-                            // last_good_snapshot() + restore().
-                            return Err(PubkyNoiseError::HomeserverWriteError);
-                        }
-                        self.advance_handshake_message()?;
-                    }
+                    // Include completed peer reads so checkpoint-based recovery
+                    // regenerates the same packet without rereading mutable storage.
+                    self.last_good_snapshot = Some(self.snapshot_unchecked());
+                    self.handshake_recovery_required = true;
+                    let (destination_path, packet) = self.prepare_handshake_packet()?;
+                    self.pending_handshake_write = Some(PendingHandshakeWrite {
+                        destination_path,
+                        packet,
+                    });
+                    self.publish_pending_handshake().await?;
                 }
                 HandshakeAction::Pending => {
                     self.context.advance_sub_step();
@@ -935,6 +989,33 @@ impl PubkyNoiseEncryptor {
         Ok(HandshakeResult::Pending)
     }
 
+    fn ensure_handshake_recovered(&self) -> Result<(), PubkyNoiseError> {
+        if self.handshake_recovery_required {
+            Err(PubkyNoiseError::HandshakeRecoveryRequired)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn publish_pending_handshake(&mut self) -> Result<(), PubkyNoiseError> {
+        #[cfg(feature = "test-utils")]
+        if self.simulate_write_failure {
+            return Err(PubkyNoiseError::HomeserverWriteError);
+        }
+        let pending = self
+            .pending_handshake_write
+            .as_ref()
+            .ok_or(PubkyNoiseError::HandshakeRecoveryRequired)?;
+        self.config
+            .publish(&pending.destination_path, &pending.packet)
+            .await
+            .map_err(|_| PubkyNoiseError::HomeserverWriteError)?;
+        self.advance_handshake_message()?;
+        self.pending_handshake_write = None;
+        self.handshake_recovery_required = false;
+        Ok(())
+    }
+
     /// Transition from Noise Handshake phase to Transport phase.
     ///
     /// Call this once `is_handshake_complete()` returns `true`.
@@ -942,7 +1023,10 @@ impl PubkyNoiseEncryptor {
     ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::IsHandshake`] if still in handshake phase.
+    /// - Returns [`PubkyNoiseError::HandshakeRecoveryRequired`] while a write is
+    ///   uncertain or a failed handshake transition needs recovery.
     pub fn transition_transport(&mut self) -> Result<LinkId, PubkyNoiseError> {
+        self.ensure_handshake_recovered()?;
         if self.context.is_handshake() {
             return Err(PubkyNoiseError::IsHandshake);
         }
@@ -1103,10 +1187,11 @@ impl PubkyNoiseEncryptor {
             return Err(PubkyNoiseError::HomeserverWriteError);
         }
 
+        if !self.context.is_transport() {
+            return Err(PubkyNoiseError::IsHandshake);
+        }
         self.config
-            .local_session
-            .storage()
-            .put(destination_path, ciphertext.to_vec())
+            .publish(&destination_path, &ciphertext)
             .await
             .map_err(|_| PubkyNoiseError::HomeserverWriteError)?;
         self.acknowledge_prepared_transport(&acknowledgement_digest)?;
@@ -1357,8 +1442,8 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::HomeserverHttpError`] for non-success HTTP
     ///   statuses other than 404. In particular, 410 is not treated as absence here.
     /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the homeserver read
-    ///   fails without a status or if a successful (2xx) body cannot be read, including
-    ///   expiry of a caller-configured [deadline](PubkyNoiseConfig#request-deadlines).
+    ///   fails without a status or if an HTTP 200 body cannot be read, including
+    ///   exhausted [request deadlines](PubkyNoiseConfig#request-deadlines).
     /// - Returns [`PubkyNoiseError::BadLengthCiphertext`] if the packet is malformed.
     /// - Returns [`PubkyNoiseError::DecryptionError`] if Noise decryption fails.
     /// - Returns [`PubkyNoiseError::CounterOverflow`] if the remote outbound
@@ -1368,34 +1453,40 @@ impl PubkyNoiseEncryptor {
     pub async fn receive_message(&mut self) -> Result<Vec<Vec<u8>>, PubkyNoiseError> {
         let mut results = Vec::new();
         let formatted_path = self.next_receive_path()?;
-        match self
+        let ciphertext = self
             .config
-            .outbox_client
-            .public_storage()
-            .get(formatted_path)
-            .await
-        {
-            Ok(response) => {
-                // pubky's get() only returns Ok for 2xx responses.
-                let ciphertext =
-                    read_bounded_packet(response, PUBKY_NOISE_TRANSPORT_PACKET_LEN).await?;
-                let prepared = self.build_prepared_receive(&ciphertext)?;
-                self.apply_prepared_receive(&prepared);
-                results.push(prepared.plaintext().to_vec());
-            }
-            // 404 = no message available yet (normal polling behaviour)
-            Err(Error::Request(RequestError::Server { status, .. }))
-                if status == StatusCode::NOT_FOUND => {}
-            // Any other error (network, 5xx, 403, etc.) is surfaced.
-            Err(error) => {
-                return Err(map_homeserver_read_error(error));
-            }
+            .request_policy
+            .run(|| async {
+                match self
+                    .config
+                    .outbox_client
+                    .public_storage()
+                    .get(&formatted_path)
+                    .await
+                {
+                    Ok(response) => read_bounded_packet(response, PUBKY_NOISE_TRANSPORT_PACKET_LEN)
+                        .await
+                        .map(Some),
+                    Err(Error::Request(RequestError::Server { status, .. }))
+                        if status == StatusCode::NOT_FOUND =>
+                    {
+                        Ok(None)
+                    }
+                    Err(error) => Err(map_homeserver_read_error(error)),
+                }
+            })
+            .await?;
+        if let Some(ciphertext) = ciphertext {
+            let prepared = self.build_prepared_receive(&ciphertext)?;
+            self.apply_prepared_receive(&prepared);
+            results.push(prepared.plaintext().to_vec());
         }
         Ok(results)
     }
 
     /// Close and clean up this encryptor's Noise session.
     pub fn close(&mut self) {
+        self.pending_handshake_write = None;
         self.context.delete();
         // when the last atomically reference counted pointer
         // to the config including the pubky_root_seckey, the
@@ -1430,7 +1521,10 @@ impl PubkyNoiseEncryptor {
     /// # Errors
     /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] while a
     ///   prepared operation still needs to be persisted and acknowledged.
+    /// - Returns [`PubkyNoiseError::HandshakeRecoveryRequired`] while a handshake
+    ///   write is uncertain or a failed transition needs recovery.
     pub fn snapshot(&self) -> Result<PubkyNoiseSessionState, PubkyNoiseError> {
+        self.ensure_handshake_recovered()?;
         if self.unacknowledged_transport_digest.is_some() {
             return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
         }
@@ -1493,7 +1587,9 @@ impl PubkyNoiseEncryptor {
     /// # Errors
     /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] if a prepared
     ///   message and its resulting state must first be persisted together.
-    /// - Returns [`PubkyNoiseError::OtherError`] if the homeserver write fails.
+    /// - Returns [`PubkyNoiseError::HomeserverResponseError`],
+    ///   [`PubkyNoiseError::HomeserverHttpError`] or
+    ///   [`PubkyNoiseError::HomeserverWriteError`] if publication fails.
     pub async fn persist_snapshot(
         &self,
         backup_key: &[u8; 32],
@@ -1506,13 +1602,7 @@ impl PubkyNoiseEncryptor {
         let path = format!("{}/backup", self.config.write_path);
         let encrypted =
             backup_crypto::encrypt_backup_with_key(backup_key, &path, generation, &state);
-        self.config
-            .local_session
-            .storage()
-            .put(path, encrypted)
-            .await
-            .map_err(|_| PubkyNoiseError::OtherError)?;
-        Ok(())
+        self.config.publish(&path, &encrypted).await
     }
 
     /// Load and decrypt a session snapshot previously stored with
@@ -1521,7 +1611,7 @@ impl PubkyNoiseEncryptor {
     /// The returned state can be passed to [`restore()`](Self::restore) to
     /// reconstruct the encryptor.
     ///
-    /// Successful (2xx) response bodies are read in chunks under a size cap
+    /// HTTP 200 response bodies are read in chunks under a size cap
     /// ([`backup_crypto::MAX_BACKUP_RESPONSE_BYTES`]), and the record must
     /// match the size bounds of its envelope version. The backup path is
     /// probed with a `HEAD` request first: `HEAD` responses carry no body,
@@ -1530,9 +1620,8 @@ impl PubkyNoiseEncryptor {
     /// distinctly from a connectivity or server failure.
     ///
     /// Non-2xx bodies are handled by the Pubky SDK's configured error-body limit.
-    /// Size limits do not bound elapsed time: configure a total
-    /// [request deadline](PubkyNoiseConfig#request-deadlines) on the client used
-    /// to create `config.local_session` for both the HEAD probe and the GET.
+    /// The configured [request deadline](PubkyNoiseConfig#request-deadlines)
+    /// bounds the HEAD probe and GET body together on each attempt.
     ///
     /// # Parameters:
     /// - `backup_key`: A 32-byte key used to decrypt the snapshot. Must match
@@ -1553,8 +1642,8 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::HomeserverHttpError`] if the HEAD or GET
     ///   returns a non-success HTTP status other than 404/410.
     /// - Returns [`PubkyNoiseError::HomeserverResponseError`] if the backup
-    ///   cannot be fetched without an HTTP status, a successful (2xx) body cannot be read,
-    ///   or a 2xx response exceeds the size cap.
+    ///   cannot be fetched without an HTTP status, an HTTP 200 body cannot be read,
+    ///   a response exceeds the size cap, or request deadlines are exhausted.
     /// - Returns [`PubkyNoiseError::RestoreBackupDecryptError`] if decryption
     ///   fails (wrong key, tampered/corrupted ciphertext, or a record that
     ///   was encrypted for a different backup path — the path is bound into
@@ -1571,10 +1660,26 @@ impl PubkyNoiseEncryptor {
         min_generation: Option<u64>,
     ) -> Result<LoadedSnapshot, PubkyNoiseError> {
         let path = format!("{}/backup", config.write_path);
+        let body = config
+            .request_policy
+            .run(|| Self::read_backup(config, &path))
+            .await?;
+        let (generation, serialized) =
+            backup_crypto::decrypt_backup_with_key(backup_key, &path, &body, min_generation)
+                .map_err(map_backup_error)?;
+        let state = PubkyNoiseSessionState::deserialize(&serialized)
+            .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?;
+        Ok(LoadedSnapshot { generation, state })
+    }
+
+    async fn read_backup(
+        config: &PubkyNoiseConfig,
+        path: &str,
+    ) -> Result<Vec<u8>, PubkyNoiseError> {
         let storage = config.local_session.storage();
 
         // HEAD rejects absent or oversized backups without fetching a body.
-        match storage.stats(&path).await {
+        match storage.stats(path).await {
             // Reject an oversized backup before issuing the GET.
             Ok(Some(stats)) => {
                 if let Some(len) = stats.content_length {
@@ -1588,7 +1693,7 @@ impl PubkyNoiseEncryptor {
             Err(error) => return Err(map_homeserver_read_error(error)),
         }
 
-        let mut response = storage.get(&path).await.map_err(|err| match err {
+        let response = storage.get(path).await.map_err(|err| match err {
             Error::Request(RequestError::Server { status, .. })
                 if status == StatusCode::NOT_FOUND || status == StatusCode::GONE =>
             {
@@ -1596,36 +1701,12 @@ impl PubkyNoiseEncryptor {
             }
             error => map_homeserver_read_error(error),
         })?;
-
-        // Bounded body read: reject oversized responses before proportional
-        // allocation, regardless of what the Content-Length header claims
-        // (the HEAD probe above is only advisory — the GET response may
-        // differ from it).
-        if let Some(len) = response.content_length() {
-            if len > backup_crypto::MAX_BACKUP_RESPONSE_BYTES as u64 {
-                return Err(PubkyNoiseError::HomeserverResponseError);
-            }
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
+        read_bounded_packet(response, backup_crypto::MAX_BACKUP_RESPONSE_BYTES)
             .await
-            .map_err(|_| PubkyNoiseError::HomeserverResponseError)?
-        {
-            if body.len() + chunk.len() > backup_crypto::MAX_BACKUP_RESPONSE_BYTES {
-                return Err(PubkyNoiseError::HomeserverResponseError);
-            }
-            body.extend_from_slice(&chunk);
-        }
-
-        let (generation, serialized) =
-            backup_crypto::decrypt_backup_with_key(backup_key, &path, &body, min_generation)
-                .map_err(map_backup_error)?;
-
-        let state = PubkyNoiseSessionState::deserialize(&serialized)
-            .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?;
-
-        Ok(LoadedSnapshot { generation, state })
+            .map_err(|error| match error {
+                PubkyNoiseError::BadLengthCiphertext => PubkyNoiseError::HomeserverResponseError,
+                error => error,
+            })
     }
 
     /// Restore a `PubkyNoiseEncryptor` from a previously saved session state.
@@ -1769,6 +1850,8 @@ impl PubkyNoiseEncryptor {
             last_good_snapshot: None,
             unacknowledged_transport_digest: None,
             pending_convenience_send: None,
+            pending_handshake_write: None,
+            handshake_recovery_required: false,
             #[cfg(feature = "test-utils")]
             simulate_tampering: false,
             #[cfg(feature = "test-utils")]
@@ -1783,14 +1866,15 @@ impl PubkyNoiseEncryptor {
         self.link_id
     }
 
-    /// Returns the snapshot captured at the start of the last
-    /// [`handle_handshake()`](Self::handle_handshake) call, before any
-    /// state-mutating work.
+    /// Returns the recovery checkpoint captured by
+    /// [`handle_handshake()`](Self::handle_handshake).
     ///
-    /// The snapshot always reflects the state just before the **most recent**
-    /// `handle_handshake` call — each call overwrites the previous snapshot.
-    /// Callers that need to preserve a specific pre-failure snapshot should
-    /// clone or persist it before the next `handle_handshake` call.
+    /// Each call captures its starting state. Before encrypting a write, it
+    /// replaces that checkpoint with the pre-write state, including completed
+    /// peer reads. Restoring it reproduces the exact pending packet without
+    /// fetching those reads again. Calls retrying an uncertain write preserve
+    /// that checkpoint. A failed cryptographic transition also preserves the
+    /// last valid checkpoint until restoration.
     ///
     /// If a write to the local homeserver was lost during the handshake, the
     /// caller can pass the persisted snapshot to [`restore()`](Self::restore)
@@ -2005,6 +2089,49 @@ mod tests {
                     .expect("the configured HTTP deadline must end the body read");
             assert_eq!(result, Err(PubkyNoiseError::HomeserverResponseError));
             tasks.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn noise_deadline_bounds_stalled_and_active_response_bodies() {
+        for send_empty_frames in [false, true] {
+            let (response, mut body, mut tasks) = http2_response_for_test().await;
+            tasks.spawn(async move {
+                loop {
+                    if send_empty_frames && body.send_data(bytes::Bytes::new(), false).is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            let policy = RequestPolicy {
+                timeout: Duration::from_millis(50),
+                max_attempts: std::num::NonZeroU8::new(1).unwrap(),
+                ..Default::default()
+            };
+            let mut response = Some(response);
+            let start = std::time::Instant::now();
+            let result = policy
+                .run(|| read_bounded_packet(response.take().unwrap(), 4))
+                .await;
+            assert_eq!(result, Err(PubkyNoiseError::HomeserverResponseError));
+            assert!(
+                start.elapsed() < Duration::from_millis(900),
+                "fell back to the one-second HTTP timeout"
+            );
+            tasks.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_and_accepted_bodies_are_not_complete_packets() {
+        for status in [202, 206] {
+            let wire = format!("HTTP/1.1 {status} Unexpected\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd");
+            let response = response_for_test(wire.into_bytes()).await.unwrap();
+            assert_eq!(
+                read_bounded_packet(response, 4).await,
+                Err(PubkyNoiseError::HomeserverHttpError { status })
+            );
         }
     }
 

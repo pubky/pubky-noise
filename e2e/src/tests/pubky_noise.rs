@@ -20,6 +20,8 @@ use pubky_noise::snow_crypto::{
 };
 use pubky_noise::{HandshakeResult, PubkyNoiseConfig, PubkyNoiseEncryptor, PubkyNoiseError};
 
+mod request_bounds;
+
 const E2E_CLIENT_ID: &str = "pubky-noise-e2e";
 
 static SHARED_POSTGRES: OnceCell<Mutex<Weak<DockerPostgres>>> = OnceCell::const_new();
@@ -122,6 +124,15 @@ async fn setup_encryptors_on_server(
     homeserver: PublicKey,
     pattern: &str,
 ) -> EncryptorPair {
+    setup_encryptors_with_policy(initiator_pubky, homeserver, pattern, Default::default()).await
+}
+
+async fn setup_encryptors_with_policy(
+    initiator_pubky: Pubky,
+    homeserver: PublicKey,
+    pattern: &str,
+    policy: pubky_noise::RequestPolicy,
+) -> EncryptorPair {
     let responder_pubky = initiator_pubky.clone();
 
     let initiator_session = create_grant_session(&initiator_pubky, &homeserver).await;
@@ -130,7 +141,7 @@ async fn setup_encryptors_on_server(
     let server_path_string = "/pub/data".to_string();
 
     let initiator_keypair = Keypair::random();
-    let initiator_config = PubkyNoiseConfig::new(
+    let mut initiator_config = PubkyNoiseConfig::new(
         initiator_keypair.secret_key(),
         0,
         pattern,
@@ -139,9 +150,10 @@ async fn setup_encryptors_on_server(
         initiator_pubky,
     )
     .unwrap();
+    Arc::get_mut(&mut initiator_config).unwrap().request_policy = policy;
 
     let responder_keypair = Keypair::random();
-    let responder_config = PubkyNoiseConfig::new(
+    let mut responder_config = PubkyNoiseConfig::new(
         responder_keypair.secret_key(),
         0,
         pattern,
@@ -150,6 +162,7 @@ async fn setup_encryptors_on_server(
         responder_pubky,
     )
     .unwrap();
+    Arc::get_mut(&mut responder_config).unwrap().request_policy = policy;
 
     let initiator_ephemeral_keypair = Keypair::random();
     let responder_ephemeral_keypair = Keypair::random();
@@ -292,7 +305,17 @@ async fn snow_test_handshake_read_slot_from_snapshots() {
             pair.responder.handle_handshake().await,
             Err(PubkyNoiseError::HomeserverWriteError)
         );
-        assert_handshake_read_slot(&pair.responder, None);
+        assert_eq!(
+            pair.responder.snapshot().unwrap_err(),
+            PubkyNoiseError::HandshakeRecoveryRequired
+        );
+        assert_eq!(
+            pair.responder
+                .last_good_snapshot()
+                .unwrap()
+                .next_handshake_read_slot(),
+            Ok(None)
+        );
         pair.responder = PubkyNoiseEncryptor::restore(
             pair.responder_config.clone(),
             pair.responder.last_good_snapshot().unwrap().clone(),
@@ -300,7 +323,7 @@ async fn snow_test_handshake_read_slot_from_snapshots() {
         )
         .await
         .unwrap();
-        assert_handshake_read_slot(&pair.responder, Some(0));
+        assert_handshake_read_slot(&pair.responder, None);
         pair.responder.handle_handshake().await.unwrap();
         assert_handshake_read_slot(&pair.responder, (pattern == "XX").then_some(2));
 
@@ -310,7 +333,17 @@ async fn snow_test_handshake_read_slot_from_snapshots() {
                 pair.initiator.handle_handshake().await,
                 Err(PubkyNoiseError::HomeserverWriteError)
             );
-            assert_handshake_read_slot(&pair.initiator, None);
+            assert_eq!(
+                pair.initiator.snapshot().unwrap_err(),
+                PubkyNoiseError::HandshakeRecoveryRequired
+            );
+            assert_eq!(
+                pair.initiator
+                    .last_good_snapshot()
+                    .unwrap()
+                    .next_handshake_read_slot(),
+                Ok(None)
+            );
             pair.initiator = PubkyNoiseEncryptor::restore(
                 pair.initiator_config.clone(),
                 pair.initiator.last_good_snapshot().unwrap().clone(),
@@ -318,7 +351,7 @@ async fn snow_test_handshake_read_slot_from_snapshots() {
             )
             .await
             .unwrap();
-            assert_handshake_read_slot(&pair.initiator, Some(1));
+            assert_handshake_read_slot(&pair.initiator, None);
         }
         pair.initiator.handle_handshake().await.unwrap();
         assert_handshake_read_slot(&pair.initiator, None);
@@ -564,8 +597,20 @@ async fn snow_test_xx_rejects_tampered_handshake() {
         assert!(!receiver.is_handshake_complete());
         assert_eq!(receiver.remote_static_public_key(), None);
         assert_eq!(
-            receiver.snapshot().unwrap().serialize(),
+            receiver.snapshot().unwrap_err(),
+            PubkyNoiseError::HandshakeRecoveryRequired
+        );
+        assert_eq!(
+            receiver.last_good_snapshot().unwrap().serialize(),
             snapshot.serialize()
+        );
+        assert_eq!(
+            receiver.handle_handshake().await.unwrap_err(),
+            PubkyNoiseError::HandshakeRecoveryRequired
+        );
+        assert_eq!(
+            receiver.transition_transport().unwrap_err(),
+            PubkyNoiseError::HandshakeRecoveryRequired
         );
 
         storage.put(&path, packet.to_vec()).await.unwrap();
@@ -2983,12 +3028,11 @@ async fn snow_test_XX_initiator_write_failure_and_replay_recovery() {
     let _ = pair.initiator.handle_handshake().await.unwrap();
     assert!(pair.initiator.is_handshake_complete());
 
-    // handle_handshake captured the pre-mutation snapshot automatically.
-    // It should reflect the state BEFORE the Read+Write (counter=1, StepTwo).
+    // The pre-write checkpoint retains the peer read needed for exact replay.
     let pre_second_write_snapshot = pair.initiator.last_good_snapshot().unwrap().clone();
-    assert_eq!(pre_second_write_snapshot.counter, 1);
+    assert_eq!(pre_second_write_snapshot.counter, 2);
     assert_eq!(pre_second_write_snapshot.noise_step, NoiseStep::StepTwo);
-    assert_eq!(pre_second_write_snapshot.sub_step_index, 0);
+    assert_eq!(pre_second_write_snapshot.sub_step_index, 1);
 
     // Verify state advanced: counter=3 (read slot 1 + write slot 2), step=Final
     let post_write_snapshot = pair.initiator.snapshot().unwrap();
@@ -3033,8 +3077,7 @@ async fn snow_test_XX_initiator_write_failure_and_replay_recovery() {
     .await
     .unwrap();
 
-    // Verify restored state: counter=1, step=StepTwo, sub_step=0
-    // (back to before the Read+Write that was lost)
+    // Restoration stops immediately before the uncertain write.
     let restored_snapshot = restored_initiator.snapshot().unwrap();
     assert_eq!(restored_snapshot.counter, pre_second_write_snapshot.counter);
     assert_eq!(
@@ -3048,8 +3091,7 @@ async fn snow_test_XX_initiator_write_failure_and_replay_recovery() {
 
     // ── Phase 5: Re-do the handshake from the restored state ──
 
-    // Restored Initiator StepTwo: [Read, Write] → reads slot 1 (still on
-    // homeserver), writes slot 2. Snow finishes on initiator side.
+    // The cached transcript reproduces slot 2 without rereading the peer file.
     let _ = restored_initiator.handle_handshake().await.unwrap();
     assert!(restored_initiator.is_handshake_complete());
 
@@ -3076,15 +3118,9 @@ async fn snow_test_XX_initiator_write_failure_and_replay_recovery() {
     .await;
 }
 
-/// Verify that `last_good_snapshot()` correctly captures pre-mutation state
-/// at the start of each `handle_handshake()` call.
-///
-/// Checks:
-/// - Returns `None` before any `handle_handshake` call.
-/// - After each call, contains the state from *before* that call.
-/// - Updates on every subsequent call (tracks the latest pre-mutation state).
+/// Recovery checkpoints retain completed reads but never acknowledge a write.
 #[tokio::test]
-async fn snow_test_last_good_snapshot_tracks_pre_mutation_state() {
+async fn snow_test_last_good_snapshot_retains_pre_write_state() {
     let testnet = build_testnet().await;
     let mut pair = setup_encryptors_dual_server(&testnet, "NN").await;
 
@@ -3115,9 +3151,10 @@ async fn snow_test_last_good_snapshot_tracks_pre_mutation_state() {
     let _ = pair.responder.handle_handshake().await.unwrap();
 
     let snap = pair.responder.last_good_snapshot().unwrap();
-    assert_eq!(snap.counter, 0);
+    assert_eq!(snap.counter, 1);
     assert_eq!(snap.noise_step, NoiseStep::StepOne);
-    assert_eq!(snap.sub_step_index, 0);
+    assert_eq!(snap.sub_step_index, 1);
+    assert_eq!(snap.handshake_messages.len(), 1);
 
     // Responder advanced: read slot 0 + write slot 1 = counter 2, step StepTwo
     let current = pair.responder.snapshot().unwrap();
@@ -3269,12 +3306,12 @@ async fn snow_test_XX_initiator_put_failure_returns_error() {
     assert!(result.is_err());
     assert_eq!(result.unwrap_err(), PubkyNoiseError::HomeserverWriteError);
 
-    // ── Phase 3: Verify last_good_snapshot captured pre-StepTwo state ──
+    // The checkpoint includes the accepted read, but not the uncertain write.
 
     let pre_failure_snapshot = pair.initiator.last_good_snapshot().unwrap().clone();
-    assert_eq!(pre_failure_snapshot.counter, 1);
+    assert_eq!(pre_failure_snapshot.counter, 2);
     assert_eq!(pre_failure_snapshot.noise_step, NoiseStep::StepTwo);
-    assert_eq!(pre_failure_snapshot.sub_step_index, 0);
+    assert_eq!(pre_failure_snapshot.sub_step_index, 1);
 
     // ── Phase 4: Restore from snapshot ──
 
@@ -3303,7 +3340,7 @@ async fn snow_test_XX_initiator_put_failure_returns_error() {
 
     // ── Phase 5: Complete the handshake from restored state ──
 
-    // Restored Initiator StepTwo: [Read, Write] → reads slot 1, writes slot 2
+    // Restored Initiator resumes the write using its cached peer read.
     let _ = restored_initiator.handle_handshake().await.unwrap();
     assert!(restored_initiator.is_handshake_complete());
 

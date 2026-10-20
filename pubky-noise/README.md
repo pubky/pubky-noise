@@ -83,39 +83,36 @@ When polling a handshake packet, only HTTP 404/410 is treated as absent (`Pendin
 Transport reads treat only 404 as absent; snapshot reads map 404/410 to
 `RestoreBackupNotFoundError`. Other non-success HTTP statuses return
 `HomeserverHttpError { status }`. Read failures without an HTTP status and
-successful (2xx) response-body failures return `HomeserverResponseError`. Pubky
+HTTP 200 response-body failures return `HomeserverResponseError`. Pubky
 preserves a known non-success status even if reading its error body fails or times out.
 
 Neither error implies that retrying unchanged will help. Use the status to choose
 application-specific handling: authorization or request errors may require
 correction, while 408, 429 and some 5xx responses may warrant bounded retries.
 The failed read does not advance its cursor; earlier successful handshake actions
-remain applied. The quick start propagates errors to the caller; write failures
-still require the [snapshot recovery](#code-example) described below.
+remain applied. The quick start propagates errors to the caller; uncertain writes
+retain their exact pending output for [recovery](#write-failure-recovery).
 
 ### Request Deadlines
 
-Packet and snapshot byte limits bound accumulated successful-response bytes.
-Pubky separately caps captured error-body bytes. These byte limits do not bound
-elapsed time or total/peak memory. Configure a total
-`PubkyHttpClientBuilder::request_timeout` on native clients before using them for
-peer reads or creating the authenticated session used for snapshot reads. Pubky
-0.16.2 disables native HTTP timeouts by default. Its total request deadline runs
-from connection setup through completion of the response body, including error
-bodies. A separate `read_timeout` resets on each successful read, so it is not a
-substitute for a total deadline when a server continually sends data or empty
-frames. See the compiled example in the `PubkyNoiseConfig` API documentation.
+Noise-owned I/O uses `PubkyNoiseConfig::request_policy`. Defaults are 10 seconds
+per attempt, at most 3 attempts, and exponential backoff starting at 250 ms and
+capped at 2 seconds. Set `max_attempts` to one to disable retries. Each deadline
+covers request preparation and body consumption, including a continually active
+body. Expired deadlines and HTTP 408/429/502/503/504 can retry; other failures
+return immediately. Unconfirmed convenience writes return `HomeserverWriteError`
+after those attempts, preserving the caller's existing recovery contract.
 
-Noise does not impose a timeout or retry automatically. Choose deadlines and
-backoff for the application. Browser/WASM callers must provide operation-level
-deadlines and cancellation; Pubky's native HTTP timeout settings do not apply
-there. Cancellation of a write does not establish that it was rejected: preserve
-the existing snapshot and exact-ciphertext recovery requirements.
+Packet and snapshot byte caps still apply. Keep Pubky's error-body cap bounded
+when constructing its clients. Noise cannot change an existing authenticated
+client's settings, and these bounds do not limit aggregate sessions or application
+retry loops. Native Pubky request timeouts can add a transport-level bound.
+Browser suspension can delay timer delivery; no wall-clock guarantee applies
+while the browser is suspended.
 
-An HTTP/1.1 zero-sized chunk terminates a chunked body; an HTTP/2 empty DATA frame
-does not necessarily end the stream. The reader accepts empty frames without
-treating them as EOF or malformed ciphertext. A configured total deadline bounds
-both stalled responses and streams of empty frames.
+Prepared operations do no I/O. Their callers own deadlines, cancellation,
+authorization, admission and durable publication. A cancelled or timed-out write
+may already have reached the server: retain its exact pending bytes and path.
 
 ## Architecture
 
@@ -583,9 +580,13 @@ let mut restored = PubkyNoiseEncryptor::restore(config, loaded.state, endpoint_p
 During handshake, if a homeserver write fails:
 
 1. `handle_handshake()` returns `Err(HomeserverWriteError)`.
-2. Snow's internal state has already advanced irreversibly.
-3. Retrieve the pre-mutation snapshot via `last_good_snapshot()`.
-4. Persist it and pass to `restore()` to rebuild the session from the correct position.
+2. The encryptor retains the exact pending packet and path. Calling
+   `handle_handshake()` again retries them without advancing Snow again.
+3. Alternatively, pass `last_good_snapshot()` to `restore()`. This checkpoint
+   is immediately before encryption and includes any preceding peer reads, so
+   replay reproduces the exact output without fetching those reads again.
+4. Until the write is acknowledged, `snapshot()` and transport promotion return
+   `HandshakeRecoveryRequired`.
 
 The restore mechanism replays saved incoming messages and regenerates outgoing
 handshake bytes in memory through a fresh Noise state built with the same
@@ -593,61 +594,25 @@ ephemeral key material. It does not issue homeserver writes or republish packets
 
 ### Handshake Recovery with `last_good_snapshot`
 
-Every call to `handle_handshake()` automatically captures a pre-mutation snapshot before doing any work. If the call fails (or if a written message is subsequently lost), this snapshot is the recovery point.
+Every call captures its starting state. Before encrypting a write, it captures
+the pre-write state instead. Retries of an uncertain write preserve that
+checkpoint. A failed cryptographic transition must be restored before reuse.
 
 #### Why recovery is needed
 
-Snow's `HandshakeState` is a one-way ratchet: once `write_message()` is called, the internal state advances irreversibly. If the homeserver `put()` then fails, the encryptor's Noise state no longer matches what is actually stored on the homeservers. The encryptor cannot simply retry -- it must be rebuilt from scratch.
-
-#### Recovery sequence diagram
-
-```text
-                    Initiator                    Homeserver                  Responder
-                        |                            |                          |
-  [snapshot captured]   |                            |                          |
-                        |--- handle_handshake() ---->|                          |
-                        |   Snow advances state      |                          |
-                        |   put() FAILS              |                          |
-                        |<-- Err(HomeserverWrite) ---|                          |
-                        |                            |                          |
-  [encryptor is now     |                            |                          |
-   corrupted -- Snow    |                            |                          |
-   advanced but message |                            |                          |
-   never reached the    |                            |                          |
-   homeserver]          |                            |                          |
-                        |                            |                          |
-  [get last_good_       |                            |                          |
-   snapshot, serialize, |                            |                          |
-   persist to storage]  |                            |                          |
-                        |                            |                          |
-  [discard corrupted    |                            |                          |
-   encryptor]           |                            |                          |
-                        |                            |                          |
-  [restore() from       |                            |                          |
-   persisted snapshot:  |                            |                          |
-   - builds fresh Snow  |                            |                          |
-     with same          |                            |                          |
-     ephemeral key      |                            |                          |
-   - replays saved      |                            |                          |
-     handshake messages |                            |                          |
-   - state matches the  |                            |                          |
-     saved checkpoint]  |                            |                          |
-                        |                            |                          |
-  [restored encryptor]  |--- handle_handshake() ---->| (write succeeds)         |
-                        |                            |--- message available --->|
-                        |                            |                          |
-                        |          ... handshake continues normally ...         |
-```
+Snow's handshake state advances when it encrypts, before the server acknowledges
+the write. An error cannot tell whether the server stored the packet. Recovery
+must reuse that packet or regenerate it from the same pre-write state, never
+from a newly fetched peer response.
 
 #### Code example
 
-```rust,ignore
+```rust,no_run
+use std::sync::Arc;
+use pubky::PublicKey;
 use pubky_noise::{PubkyNoiseEncryptor, PubkyNoiseConfig, PubkyNoiseError, HandshakeResult};
-use pubky_noise::backup_crypto;
 
-// Recover from homeserver write failures *in-process*: the fresh
-// `last_good_snapshot()` captured at the start of the failed call is the
-// recovery point, so no disk is involved.
+// One in-process recovery step. The caller still bounds repeated calls.
 async fn handshake_with_recovery(
     encryptor: &mut PubkyNoiseEncryptor,
     config: Arc<PubkyNoiseConfig>,
@@ -656,12 +621,9 @@ async fn handshake_with_recovery(
     match encryptor.handle_handshake().await {
         Ok(result) => Ok(result),
         Err(PubkyNoiseError::HomeserverWriteError) => {
-            // The encryptor is corrupted, but the snapshot captured at the
-            // start of the failed call is still in memory -- restore directly
-            // from it. This also works when no prior call ever succeeded.
             let snapshot = encryptor
                 .last_good_snapshot()
-                .expect("always Some after handle_handshake")
+                .ok_or(PubkyNoiseError::HandshakeRecoveryRequired)?
                 .clone();
 
             *encryptor = PubkyNoiseEncryptor::restore(
@@ -671,41 +633,19 @@ async fn handshake_with_recovery(
             )
             .await?;
 
-            // The restored encryptor is back to the pre-failure position.
-            // The caller can retry handle_handshake() on the next poll.
+            // The next call republishes the same packet from the checkpoint.
             Ok(HandshakeResult::Pending)
         }
         Err(e) => Err(e),
     }
 }
 
-// Crash coverage additionally requires the recovery point to be durable.
-// This helper scopes that to explicit `HomeserverWriteError` failures only:
-// it persists the current state before each call, so if the `put()` inside
-// that call explicitly fails (returns an error), restoring the persisted
-// checkpoint replays correctly and the write can be retried. It does NOT
-// cover the lost-message case (Case a2, described below), where `put()`
-// succeeded and the server later lost the write: restoring the post-write
-// state would skip the lost write rather than republish it. Case a2 recovery
-// needs the durable checkpoint to remain at the *pre-write* state until peer
-// progress confirms the write actually persisted — call-side persistence
-// alone cannot establish that.
-async fn handshake_recovery_explicit_write_errors(
-    encryptor: &mut PubkyNoiseEncryptor,
-    config: Arc<PubkyNoiseConfig>,
-    endpoint_pubkey: PublicKey,
-    backup_key: &[u8; 32],
-    backup_path: &str,
-    generation: u64,
-) -> Result<HandshakeResult, PubkyNoiseError> {
-    let snapshot = encryptor.snapshot().unwrap();
-    let encrypted =
-        backup_crypto::encrypt_backup_with_key(backup_key, backup_path, generation, &snapshot);
-    save_to_disk(&encrypted); // your persistence logic
-
-    handshake_with_recovery(encryptor, config, endpoint_pubkey).await
-}
 ```
+
+This helper does not provide crash-safe persistence. For that, use
+`prepare_handshake_step()`, durably save its state and exact pending output
+together, then publish. Saving a checkpoint only after a failed write leaves
+a crash window.
 
 #### Lost-message recovery (Case a2)
 
@@ -718,7 +658,7 @@ does not detect or republish lost data.
 #### Key invariants
 
 - `last_good_snapshot()` returns `None` before the first `handle_handshake()` call.
-- Each `handle_handshake()` call overwrites the previous snapshot with the state from the start of *that* call.
+- The checkpoint is captured before the call's reads and refined immediately before a write; uncertain-write retries preserve it.
 - The snapshot contains the ephemeral secret key, which is the critical piece that allows `restore()` to re-derive the same transport keys via replay. Any persisted snapshot must be encrypted (as `persist_snapshot()` does).
 - `restore()` checks the replayed transcript against the saved handshake hash or LinkId for transport-phase restores. Missing or mismatched hashes return `RestoreBackupHashMismatch`.
 
@@ -732,9 +672,10 @@ does not detect or republish lost data.
 | `BadLengthCiphertext` | Received packet or authenticated transport frame is malformed | Discard message, check sender |
 | `MissingHandshakePacket` | Preparation requires a read, but no packet was supplied | Recover the previous checkpoint and fetch the required packet before preparing |
 | `UnexpectedHandshakePacket` | Preparation received a packet when no read was required | Recover the previous checkpoint and follow its read-slot probe |
-| `HomeserverHttpError { status }` | A handshake, transport or snapshot read returned a non-success HTTP status not handled as absence | Inspect the status and correct the cause or apply caller-owned retry policy; no automatic retry |
-| `HomeserverResponseError` | A read failed without an HTTP status, a successful (2xx) body read failed, or a snapshot exceeded its size cap | Check client configuration, connectivity and response validity; retry only after addressing the cause |
-| `HomeserverWriteError` | Homeserver write failed | Restore from `last_good_snapshot()` |
+| `HomeserverHttpError { status }` | A read or backup publication returned a status not accepted by that operation | Selected transient statuses have bounded retries; authorization and request errors may need correction |
+| `HomeserverResponseError` | A read/body failed, a deadline was exhausted, or a snapshot exceeded its size cap | Check client configuration, connectivity and response validity |
+| `HomeserverWriteError` | A convenience write could not be confirmed | Retry exact pending output; handshake callers may also restore `last_good_snapshot()` |
+| `HandshakeRecoveryRequired` | Handshake publication is uncertain or a cryptographic transition failed | Retry a pending write or restore its checkpoint; do not snapshot or promote uncertain state |
 | `IsHandshake` | Called a transport operation before transport phase | Wait for `is_handshake_complete()` and `transition_transport()` |
 | `EncryptionError` | Noise encryption failed during `send_message()` | Check transport state; session may be corrupted |
 | `DecryptionError` | Handshake or transport message authentication/decryption failed | Message may be tampered or nonces desynchronized |
