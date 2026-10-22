@@ -282,8 +282,10 @@ pub fn encrypt_backup(
 /// the checkpoint are rejected with [`BackupCryptoError::Rollback`].
 ///
 /// Returns the backup generation and the serialized session state.
-/// The returned bytes contain secrets and remain caller-owned; wipe them when
-/// no longer needed, for example by wrapping them in [`Zeroizing`].
+/// The temporary plaintext buffer is wrapped in [`Zeroizing`] and wiped on drop.
+/// The returned `Vec<u8>` is a separate, caller-owned copy containing secrets;
+/// it does not zeroize on drop. Callers must wipe it when no longer needed or
+/// wrap it in [`Zeroizing`] to wipe it on drop.
 pub fn decrypt_backup_with_key(
     key: &[u8; 32],
     backup_path: &str,
