@@ -25,20 +25,24 @@ use snow::types::{Cipher, Dh, Hash, Random};
 /// `getrandom`). In practice, Snow only calls the RNG once for ephemeral key
 /// generation during handshake construction.
 pub struct DeterministicRng {
-    seed: [u8; 32],
+    seed: zeroize::Zeroizing<[u8; 32]>,
     used: bool,
 }
 
 impl DeterministicRng {
     pub fn new(seed: [u8; 32]) -> Self {
-        DeterministicRng { seed, used: false }
+        DeterministicRng {
+            seed: zeroize::Zeroizing::new(seed),
+            used: false,
+        }
     }
 }
 
 impl Random for DeterministicRng {
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), snow::error::Error> {
         if !self.used && dest.len() == 32 {
-            dest.copy_from_slice(&self.seed);
+            dest.copy_from_slice(self.seed.as_ref());
+            zeroize::Zeroize::zeroize(&mut *self.seed);
             self.used = true;
             Ok(())
         } else {
@@ -56,21 +60,21 @@ impl Random for DeterministicRng {
 /// `DefaultResolver`. Only the RNG is overridden.
 pub struct ReplayResolver {
     default: DefaultResolver,
-    seed: [u8; 32],
+    seed: zeroize::Zeroizing<[u8; 32]>,
 }
 
 impl ReplayResolver {
     pub fn new(seed: [u8; 32]) -> Box<Self> {
         Box::new(ReplayResolver {
             default: DefaultResolver,
-            seed,
+            seed: zeroize::Zeroizing::new(seed),
         })
     }
 }
 
 impl CryptoResolver for ReplayResolver {
     fn resolve_rng(&self) -> Option<Box<dyn Random>> {
-        Some(Box::new(DeterministicRng::new(self.seed)))
+        Some(Box::new(DeterministicRng::new(*self.seed)))
     }
 
     fn resolve_dh(&self, choice: &snow::params::DHChoice) -> Option<Box<dyn Dh>> {
@@ -83,5 +87,30 @@ impl CryptoResolver for ReplayResolver {
 
     fn resolve_cipher(&self, choice: &snow::params::CipherChoice) -> Option<Box<dyn Cipher>> {
         self.default.resolve_cipher(choice)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_seed_is_erased_after_key_generation() {
+        let resolver = ReplayResolver::new([42; 32]);
+        let mut rng = DeterministicRng::new(*resolver.seed);
+        let mut public_nonce = [0; 16];
+        rng.try_fill_bytes(&mut public_nonce).unwrap();
+        assert!(!rng.used);
+        assert_eq!(*rng.seed, [42; 32]);
+
+        let mut key = [0; 32];
+        rng.try_fill_bytes(&mut key).unwrap();
+        assert_eq!(key, [42; 32]);
+        assert!(rng.used);
+        assert_eq!(*rng.seed, [0; 32]);
+
+        let mut replay = resolver.resolve_rng().unwrap();
+        replay.try_fill_bytes(&mut key).unwrap();
+        assert_eq!(key, [42; 32]);
     }
 }

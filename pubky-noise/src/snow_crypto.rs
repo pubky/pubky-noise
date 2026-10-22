@@ -3,6 +3,7 @@ use pubky::PublicKey;
 
 use snow::Builder;
 use snow::{HandshakeState, StatelessTransportState};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::snow_crypto_resolver::ReplayResolver;
 use crate::PubkyNoiseError;
@@ -390,11 +391,11 @@ pub(crate) struct DataLinkContext {
     message_patterns: HandshakePattern,
 
     // ephemeral key always handled by the snow
-    local_static_seckey: Option<SecretKey>,
+    local_static_seckey: Zeroizing<Option<SecretKey>>,
 
     /// The local ephemeral secret key used for this session.
     /// Captured at construction time so it can be persisted for restore.
-    local_ephemeral_seckey: [u8; 32],
+    local_ephemeral_seckey: Zeroizing<[u8; 32]>,
 
     noise_step: NoiseStep,
     noise_phase: NoisePhase,
@@ -499,10 +500,11 @@ impl DataLinkContext {
         local_static_key: Option<SecretKey>,
         endpoint_pubkey: PublicKey,
     ) -> Result<DataLinkContext, ContextError> {
+        let local_static_key = Zeroizing::new(local_static_key);
         Self::new_with_ephemeral(
             handshake_pattern,
             initiator,
-            local_static_key,
+            *local_static_key,
             endpoint_pubkey,
             None,
         )
@@ -519,6 +521,8 @@ impl DataLinkContext {
         endpoint_pubkey: PublicKey,
         ephemeral_secret: Option<[u8; 32]>,
     ) -> Result<DataLinkContext, ContextError> {
+        let local_static_key = Zeroizing::new(local_static_key);
+        let ephemeral_secret = Zeroizing::new(ephemeral_secret);
         // Section 5.3 The Handshake Object
         //
         // Perform the following steps:
@@ -529,11 +533,11 @@ impl DataLinkContext {
         let protocol_name = Self::build_protocol_name(&handshake_pattern);
 
         // Generate or use provided ephemeral seed
-        let ephemeral_seed = match ephemeral_secret {
-            Some(seed) => seed,
+        let ephemeral_seed = match *ephemeral_secret {
+            Some(seed) => Zeroizing::new(seed),
             None => {
-                let mut seed = [0u8; 32];
-                getrandom::fill(&mut seed).map_err(|_| ContextError::Init)?;
+                let mut seed = Zeroizing::new([0u8; 32]);
+                getrandom::fill(seed.as_mut()).map_err(|_| ContextError::Init)?;
                 seed
             }
         };
@@ -560,7 +564,6 @@ impl DataLinkContext {
             initiator,
             message_patterns: handshake_pattern,
 
-            //TODO: for now keep keys separated from the state.
             local_static_seckey: local_static_key,
 
             local_ephemeral_seckey: ephemeral_seed,
@@ -630,11 +633,14 @@ impl DataLinkContext {
     }
 
     pub fn delete(&mut self) {
-        if let Some(seckey) = &mut self.local_static_seckey {
-            seckey.as_mut_slice().copy_from_slice(&[0; 32][..]);
-        }
-        self.local_static_seckey = None;
-        self.local_ephemeral_seckey.copy_from_slice(&[0; 32][..]);
+        self.local_static_seckey.zeroize();
+        self.local_ephemeral_seckey.zeroize();
+        self.noise_handshake = None;
+        self.noise_transport = None;
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.noise_handshake.is_none() && self.noise_transport.is_none()
     }
 
     pub fn is_handshake(&self) -> bool {
@@ -808,7 +814,7 @@ impl DataLinkContext {
 
     /// Get the local static secret key (for backup/restore).
     pub fn get_static_secret(&self) -> Option<&SecretKey> {
-        self.local_static_seckey.as_ref()
+        (*self.local_static_seckey).as_ref()
     }
 
     /// Get the current noise step.
@@ -997,6 +1003,29 @@ mod tests {
         initiator.transition_to_transport().unwrap();
         responder.transition_to_transport().unwrap();
         (initiator, responder)
+    }
+
+    #[test]
+    fn deleting_context_releases_live_state_and_wipes_replay_keys() {
+        let handshake = DataLinkContext::new_with_ephemeral(
+            HandshakePattern::PatternXX,
+            true,
+            Some([3; 32]),
+            Keypair::random().public_key(),
+            Some([1; 32]),
+        )
+        .unwrap();
+        let (transport, _) = transport_contexts();
+        for mut context in [handshake, transport] {
+            assert!(!context.is_closed());
+            context.delete();
+            context.delete();
+            assert!(context.is_closed());
+            assert!(context.get_static_secret().is_none());
+            assert_eq!(context.get_ephemeral_secret(), &[0; 32]);
+            assert!(context.noise_handshake.is_none());
+            assert!(context.noise_transport.is_none());
+        }
     }
 
     #[test]

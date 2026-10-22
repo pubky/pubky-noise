@@ -8,6 +8,7 @@ use crate::snow_crypto::{
     full_handshake_actions, resolve_pattern, HandshakeAction, HandshakePattern, NoisePhase,
     NoiseStep, PUBKY_NOISE_CIPHERTEXT_LEN,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 /// Current serialization format version.
 pub const SESSION_STATE_VERSION: u8 = 1;
@@ -29,6 +30,9 @@ const EXHAUSTED_NOISE_NONCE: u64 = u64::MAX - 1;
 /// encrypted, authenticated, access-controlled, and deleted when superseded.
 /// Retaining a restorable snapshot extends the lifetime of the session's
 /// ephemeral material and therefore its exposure window.
+/// Raw snapshots and their clones remain caller-owned. Use [`Zeroizing`] or
+/// explicitly call [`Zeroize::zeroize`] when a copy is no longer needed. This
+/// type does not wipe on drop, so its public fields can still be moved out.
 #[derive(Clone)]
 pub struct PubkyNoiseSessionState {
     /// Format version for forward compatibility.
@@ -69,6 +73,13 @@ pub struct PubkyNoiseSessionState {
     /// Incoming handshake messages, in read order, without packet framing or padding.
     /// Retains every completed read so restoration needs no downloads.
     pub handshake_messages: Vec<Vec<u8>>,
+}
+
+impl Zeroize for PubkyNoiseSessionState {
+    fn zeroize(&mut self) {
+        self.ephemeral_secret.zeroize();
+        self.static_secret.zeroize();
+    }
 }
 
 /// Redacted `Debug`: the ephemeral and static secrets are never rendered.
@@ -228,6 +239,8 @@ impl PubkyNoiseSessionState {
     /// [198..]   repeated: message length (u16 big-endian), message bytes
     /// ```
     /// The size is bounded by [`MIN_SESSION_STATE_LEN`] and [`MAX_SESSION_STATE_LEN`].
+    /// The returned bytes contain secrets; the caller must wipe them when no
+    /// longer needed, for example by wrapping them in [`Zeroizing`].
     pub fn serialize(&self) -> Vec<u8> {
         let transcript_len = self
             .handshake_messages
@@ -346,17 +359,17 @@ impl PubkyNoiseSessionState {
             v => return Err(SerializerError::InvalidField("initiator", v)),
         };
 
-        let mut ephemeral_secret = [0u8; 32];
+        let mut ephemeral_secret = Zeroizing::new([0u8; 32]);
         ephemeral_secret.copy_from_slice(&data[4..36]);
 
         let has_static = data[36] == 1;
-        let static_secret = if has_static {
+        let static_secret = Zeroizing::new(if has_static {
             let mut key = [0u8; 32];
             key.copy_from_slice(&data[37..69]);
             Some(key)
         } else {
             None
-        };
+        });
 
         let counter = u32::from_be_bytes([data[69], data[70], data[71], data[72]]);
 
@@ -425,8 +438,8 @@ impl PubkyNoiseSessionState {
             phase,
             pattern,
             initiator,
-            ephemeral_secret,
-            static_secret,
+            ephemeral_secret: *ephemeral_secret,
+            static_secret: *static_secret,
             counter,
             noise_step,
             sub_step_index,
@@ -439,7 +452,11 @@ impl PubkyNoiseSessionState {
             endpoint_pubkey,
             handshake_messages,
         };
-        state.validate()?;
+        if let Err(error) = state.validate() {
+            let mut state = state;
+            state.zeroize();
+            return Err(error);
+        }
         Ok(state)
     }
 }
@@ -654,6 +671,33 @@ mod tests {
         assert_eq!(restored.write_counter, state.write_counter);
         assert_eq!(restored.read_counter, state.read_counter);
         assert_eq!(restored.handshake_messages, state.handshake_messages);
+    }
+
+    #[test]
+    fn wiping_snapshot_secrets_preserves_independent_recovery_copy() {
+        let mut state = transport_state();
+        state.static_secret = Some([7; 32]);
+        let recovery = state.clone();
+        let bytes = recovery.serialize();
+        state.zeroize();
+        assert_eq!(state.ephemeral_secret, [0; 32]);
+        assert!(state.static_secret.is_none());
+        assert_eq!(recovery.ephemeral_secret, [1; 32]);
+        assert_eq!(recovery.static_secret, Some([7; 32]));
+        assert_eq!(
+            PubkyNoiseSessionState::deserialize(&bytes)
+                .unwrap()
+                .serialize(),
+            bytes
+        );
+
+        // Public snapshots retain field-move and struct-update compatibility.
+        let messages = state.handshake_messages;
+        let moved = PubkyNoiseSessionState {
+            handshake_messages: messages,
+            ..recovery
+        };
+        assert_eq!(moved.serialize(), bytes);
     }
 
     #[test]

@@ -559,6 +559,19 @@ while a snapshot remains recoverable. The staged transport APIs also do not
 provide cross-process authentication, authorization, credential management, or
 locking; callers must enforce those requirements.
 
+Crate-owned replay keys, snapshot copies and temporary backup plaintext use
+zeroizing storage. These wipes rely on the `zeroize` crate's
+[guarantees and limitations](https://docs.rs/zeroize/1.8.2/zeroize/#what-guarantees-does-this-crate-provide).
+Closing an encryptor releases its live Noise state, but keeps
+its last good checkpoint and pending exact ciphertext available for recovery
+until the encryptor is dropped. Take any required current snapshot before closing.
+Raw snapshots, clones, derived keys and serialized/decrypted bytes returned to
+callers remain caller-owned: wrap them in `zeroize::Zeroizing` or wipe them when
+no longer needed. Dropping live Noise state delegates cleanup of its internal
+keys to Snow; this is not a guarantee that every compiler, allocator or dependency
+copy is erased. Memory cleanup does not protect an active session from a process
+memory reader or remove persisted backups.
+
 ### Recovery Flow
 
 ```rust,ignore

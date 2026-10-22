@@ -19,6 +19,7 @@ use snow_crypto::{
     NoisePhase, PUBKY_NOISE_CIPHERTEXT_LEN, PUBKY_NOISE_MSG_LEN, PUBKY_NOISE_TRANSPORT_PACKET_LEN,
     PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN,
 };
+use zeroize::Zeroizing;
 
 /// A 32-byte identifier derived from the Noise handshake.
 ///
@@ -180,7 +181,7 @@ fn prepared_transport_digest(
     hasher.update(resource);
     hasher.update((message.len() as u64).to_be_bytes());
     hasher.update(message);
-    hasher.update(state.serialize());
+    hasher.update(&*Zeroizing::new(state.serialize()));
     hasher.finalize().into()
 }
 
@@ -292,7 +293,7 @@ pub enum HandshakeResult {
 /// NN does not authenticate a peer identity.
 #[must_use = "persist the state and exact pending packet before publication"]
 pub struct PreparedHandshakeStep {
-    resulting_session_state: PubkyNoiseSessionState,
+    resulting_session_state: Zeroizing<PubkyNoiseSessionState>,
     outgoing: Option<(String, [u8; PUBKY_NOISE_CIPHERTEXT_LEN + 2])>,
     handshake_complete: bool,
     remote_static_public_key: Option<Vec<u8>>,
@@ -351,7 +352,7 @@ pub struct PreparedSend {
     /// Exact ciphertext packet to publish or retry.
     ciphertext: [u8; PUBKY_NOISE_TRANSPORT_PACKET_LEN],
     /// Session state to persist with this prepared ciphertext.
-    resulting_session_state: PubkyNoiseSessionState,
+    resulting_session_state: Zeroizing<PubkyNoiseSessionState>,
     // Binds acknowledgement to this exact prepared operation; it is not a secret.
     acknowledgement_digest: [u8; 32],
 }
@@ -399,10 +400,10 @@ impl std::fmt::Debug for PreparedSend {
 #[must_use = "persist the processing result and acknowledge the receive before continuing"]
 pub struct PreparedReceive {
     /// Decrypted private message payload buffer.
-    plaintext: [u8; PUBKY_NOISE_MSG_LEN],
+    plaintext: Zeroizing<[u8; PUBKY_NOISE_MSG_LEN]>,
     plaintext_len: usize,
     /// Session state to persist with the application's processing result.
-    resulting_session_state: PubkyNoiseSessionState,
+    resulting_session_state: Zeroizing<PubkyNoiseSessionState>,
     // Binds acknowledgement to this exact prepared operation; it is not a secret.
     acknowledgement_digest: [u8; 32],
 }
@@ -601,7 +602,7 @@ pub struct PubkyNoiseEncryptor {
     /// Snapshot captured automatically at the start of each
     /// [`handle_handshake()`](Self::handle_handshake) call, before any
     /// state-mutating work. See [`last_good_snapshot()`](Self::last_good_snapshot).
-    last_good_snapshot: Option<PubkyNoiseSessionState>,
+    last_good_snapshot: Option<Zeroizing<PubkyNoiseSessionState>>,
     /// Fences transport operations until the prepared transition is persisted.
     unacknowledged_transport_digest: Option<[u8; 32]>,
     /// Exact retry data retained after an ambiguous convenience-send failure.
@@ -629,21 +630,18 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::SnowNoiseBuildError`] if the Noise stack fails to build.
     pub fn new(
         config: Arc<PubkyNoiseConfig>,
-        mut holder_skey: [u8; 32],
+        holder_skey: [u8; 32],
         initiator: bool,
         endpoint_pubkey: PublicKey,
     ) -> Result<Self, PubkyNoiseError> {
+        let holder_skey = Zeroizing::new(holder_skey);
         let data_link_context = DataLinkContext::new(
             config.default_pattern,
             initiator,
-            Some(holder_skey),
+            Some(*holder_skey),
             endpoint_pubkey.clone(),
         )
         .map_err(|_| PubkyNoiseError::SnowNoiseBuildError)?;
-
-        // zeroize holder_skey after DataLinkContext load.
-        holder_skey.copy_from_slice(&[0; 32][..]);
-        //TODO: add assert on holder_skey byte pattern
 
         Ok(PubkyNoiseEncryptor {
             config,
@@ -664,7 +662,7 @@ impl PubkyNoiseEncryptor {
 
     /// Returns `true` if the Noise handshake has completed.
     pub fn is_handshake_complete(&self) -> bool {
-        !self.context.is_handshake()
+        !self.context.is_closed() && !self.context.is_handshake()
     }
 
     /// Return the remote X25519 static key learned from the Noise handshake.
@@ -706,13 +704,13 @@ impl PubkyNoiseEncryptor {
     /// return [`PubkyNoiseError::DecryptionError`], failed Noise writes return
     /// [`PubkyNoiseError::EncryptionError`], and exhausted message slots return
     /// [`PubkyNoiseError::CounterOverflow`]. Already being in transport phase
-    /// returns [`PubkyNoiseError::OtherError`]. Unsupported patterns return
+    /// or being closed returns [`PubkyNoiseError::OtherError`]. Unsupported patterns return
     /// [`PubkyNoiseError::UnsupportedNoisePattern`].
     pub fn prepare_handshake_step(
         mut self,
         incoming_packet: Option<&[u8]>,
     ) -> Result<PreparedHandshakeStep, PubkyNoiseError> {
-        if self.context.is_transport() {
+        if self.context.is_closed() || self.context.is_transport() {
             return Err(PubkyNoiseError::OtherError);
         }
         let actions = self.context.remaining_handshake_actions()?;
@@ -750,7 +748,7 @@ impl PubkyNoiseEncryptor {
         }
         self.context.complete_step();
         Ok(PreparedHandshakeStep {
-            resulting_session_state: self.snapshot_unchecked(),
+            resulting_session_state: Zeroizing::new(self.snapshot_unchecked()),
             outgoing,
             handshake_complete: self.is_handshake_complete(),
             remote_static_public_key: self.remote_static_public_key().map(<[u8]>::to_vec),
@@ -854,13 +852,17 @@ impl PubkyNoiseEncryptor {
     ///   write fails. Recovery via [`last_good_snapshot()`](Self::last_good_snapshot)
     ///   and [`restore()`](Self::restore) is required.
     /// - Returns [`PubkyNoiseError::CounterOverflow`] if message slot space is exhausted.
+    /// - Returns [`PubkyNoiseError::OtherError`] after the encryptor is closed.
     ///
     /// Successful response bodies are size-bounded before packet validation.
     /// Non-2xx bodies are handled by the Pubky SDK's configured error-body limit.
     /// Configure [request deadlines](PubkyNoiseConfig#request-deadlines) separately.
     pub async fn handle_handshake(&mut self) -> Result<HandshakeResult, PubkyNoiseError> {
+        if self.context.is_closed() {
+            return Err(PubkyNoiseError::OtherError);
+        }
         // Capture pre-mutation snapshot so callers can recover from write failures.
-        self.last_good_snapshot = Some(self.snapshot_unchecked());
+        self.last_good_snapshot = Some(Zeroizing::new(self.snapshot_unchecked()));
 
         let remaining_actions = self.context.remaining_handshake_actions()?;
         for action in remaining_actions {
@@ -942,7 +944,11 @@ impl PubkyNoiseEncryptor {
     ///
     /// # Errors:
     /// - Returns [`PubkyNoiseError::IsHandshake`] if still in handshake phase.
+    /// - Returns [`PubkyNoiseError::OtherError`] after the encryptor is closed.
     pub fn transition_transport(&mut self) -> Result<LinkId, PubkyNoiseError> {
+        if self.context.is_closed() {
+            return Err(PubkyNoiseError::OtherError);
+        }
         if self.context.is_handshake() {
             return Err(PubkyNoiseError::IsHandshake);
         }
@@ -979,7 +985,7 @@ impl PubkyNoiseEncryptor {
         let counter = self.context.get_write_slot();
         let destination_path = format!("{}/{counter}", self.config.write_path);
 
-        let mut resulting_session_state = self.snapshot_unchecked();
+        let mut resulting_session_state = Zeroizing::new(self.snapshot_unchecked());
         resulting_session_state.sending_nonce = resulting_session_state
             .sending_nonce
             .checked_add(1)
@@ -1191,7 +1197,7 @@ impl PubkyNoiseEncryptor {
         };
         #[cfg(feature = "test-utils")]
         let message = &message;
-        let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+        let mut plaintext = Zeroizing::new([0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN]);
 
         let plaintext_len = self
             .context
@@ -1204,8 +1210,9 @@ impl PubkyNoiseEncryptor {
             return Err(PubkyNoiseError::DecryptionError);
         }
         let (plaintext, plaintext_len) = decode_transport_plaintext(&plaintext)?;
+        let plaintext = Zeroizing::new(plaintext);
 
-        let mut resulting_session_state = self.snapshot_unchecked();
+        let mut resulting_session_state = Zeroizing::new(self.snapshot_unchecked());
         resulting_session_state.receiving_nonce = resulting_session_state
             .receiving_nonce
             .checked_add(1)
@@ -1394,14 +1401,15 @@ impl PubkyNoiseEncryptor {
         Ok(results)
     }
 
-    /// Close and clean up this encryptor's Noise session.
+    /// Release live Noise state and wipe this context's replay keys.
+    ///
+    /// The last good handshake checkpoint and any pending exact ciphertext remain
+    /// available for recovery until this encryptor is dropped. Caller-owned
+    /// snapshots, persisted backups and shared configuration are not erased.
+    /// Take any required current snapshot before closing; a closed encryptor
+    /// cannot produce a usable new snapshot or continue its Noise session.
     pub fn close(&mut self) {
         self.context.delete();
-        // when the last atomically reference counted pointer
-        // to the config including the pubky_root_seckey, the
-        // inner value allocation is destroyed.
-        // TODO: verify the Arc implementation to check what
-        // is mean by destroyed, it the memory free'd ?
     }
 
     /// Capture the current session state as a serializable snapshot.
@@ -1430,9 +1438,13 @@ impl PubkyNoiseEncryptor {
     /// # Errors
     /// - Returns [`PubkyNoiseError::UnacknowledgedPreparedTransport`] while a
     ///   prepared operation still needs to be persisted and acknowledged.
+    /// - Returns [`PubkyNoiseError::OtherError`] after the encryptor is closed.
     pub fn snapshot(&self) -> Result<PubkyNoiseSessionState, PubkyNoiseError> {
         if self.unacknowledged_transport_digest.is_some() {
             return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
+        }
+        if self.context.is_closed() {
+            return Err(PubkyNoiseError::OtherError);
         }
         Ok(self.snapshot_unchecked())
     }
@@ -1502,7 +1514,7 @@ impl PubkyNoiseEncryptor {
         if self.unacknowledged_transport_digest.is_some() {
             return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
         }
-        let state = self.snapshot()?;
+        let state = Zeroizing::new(self.snapshot()?);
         let path = format!("{}/backup", self.config.write_path);
         let encrypted =
             backup_crypto::encrypt_backup_with_key(backup_key, &path, generation, &state);
@@ -1621,6 +1633,7 @@ impl PubkyNoiseEncryptor {
         let (generation, serialized) =
             backup_crypto::decrypt_backup_with_key(backup_key, &path, &body, min_generation)
                 .map_err(map_backup_error)?;
+        let serialized = Zeroizing::new(serialized);
 
         let state = PubkyNoiseSessionState::deserialize(&serialized)
             .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?;
@@ -1661,6 +1674,7 @@ impl PubkyNoiseEncryptor {
         state: PubkyNoiseSessionState,
         endpoint_pubkey: PublicKey,
     ) -> Result<Self, PubkyNoiseError> {
+        let state = Zeroizing::new(state);
         state
             .validate()
             .map_err(|_| PubkyNoiseError::RestoreBackupDeserializeError)?;
@@ -1798,7 +1812,7 @@ impl PubkyNoiseEncryptor {
     ///
     /// Returns `None` if `handle_handshake` has never been called.
     pub fn last_good_snapshot(&self) -> Option<&PubkyNoiseSessionState> {
-        self.last_good_snapshot.as_ref()
+        self.last_good_snapshot.as_deref()
     }
 
     /// Test-only: enable ciphertext tampering simulation.
@@ -2084,7 +2098,7 @@ mod tests {
     #[test]
     fn prepared_handshake_debug_redacts_state_and_packet() {
         let prepared = PreparedHandshakeStep {
-            resulting_session_state: state_with_secrets(),
+            resulting_session_state: Zeroizing::new(state_with_secrets()),
             outgoing: Some((
                 "/pub/private-handshake/2".into(),
                 [42; PUBKY_NOISE_CIPHERTEXT_LEN + 2],

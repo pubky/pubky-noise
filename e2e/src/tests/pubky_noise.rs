@@ -1376,19 +1376,58 @@ async fn snow_test_snow_noise_build_error() {
 #[tokio::test]
 async fn snow_test_cleaning_sequence() {
     let testnet = build_testnet().await;
-    let mut pair = setup_encryptors(&testnet, "NN").await;
-    complete_nn_handshake(&mut pair).await;
-
-    send_and_verify(
-        &mut pair.initiator,
-        &mut pair.responder,
-        "Hello_World_Noise_Data",
-    )
-    .await;
-
-    // Close both encryptors
-    pair.initiator.close();
-    pair.responder.close();
+    for pattern in ["NN", "XX"] {
+        let mut pair = setup_encryptors(&testnet, pattern).await;
+        pair.initiator.handle_handshake().await.unwrap();
+        let checkpoint = pair.initiator.last_good_snapshot().unwrap().serialize();
+        pair.initiator.close();
+        pair.initiator.close();
+        assert!(!pair.initiator.is_handshake_complete());
+        assert_eq!(
+            pair.initiator.snapshot().unwrap_err(),
+            PubkyNoiseError::OtherError
+        );
+        assert_eq!(
+            pair.initiator.transition_transport().unwrap_err(),
+            PubkyNoiseError::OtherError
+        );
+        assert_eq!(
+            pair.initiator.handle_handshake().await.unwrap_err(),
+            PubkyNoiseError::OtherError
+        );
+        let recovery = pair.initiator.last_good_snapshot().unwrap().clone();
+        assert_eq!(recovery.serialize(), checkpoint);
+        assert_eq!(
+            pair.initiator.prepare_handshake_step(None).unwrap_err(),
+            PubkyNoiseError::OtherError
+        );
+        pair.initiator = PubkyNoiseEncryptor::restore(
+            pair.initiator_config.clone(),
+            recovery,
+            pair.responder_public_key.clone(),
+        )
+        .await
+        .unwrap();
+        if pattern == "NN" {
+            complete_nn_handshake(&mut pair).await;
+        } else {
+            complete_xx_handshake(&mut pair).await;
+        }
+        let snapshot = pair.initiator.snapshot().unwrap();
+        pair.initiator.close();
+        assert!(!pair.initiator.is_handshake_complete());
+        assert!(pair.initiator.prepare_send(b"closed").is_err());
+        pair.initiator = PubkyNoiseEncryptor::restore(
+            pair.initiator_config.clone(),
+            snapshot,
+            pair.responder_public_key.clone(),
+        )
+        .await
+        .unwrap();
+        send_and_verify(&mut pair.initiator, &mut pair.responder, "restored session").await;
+        pair.initiator.close();
+        pair.responder.close();
+    }
 }
 
 #[tokio::test]
@@ -2426,6 +2465,11 @@ async fn snow_test_send_message_failure_retries_exact_ciphertext() {
         PubkyNoiseError::UnacknowledgedPreparedTransport
     );
 
+    pair.initiator.close();
+    assert_eq!(
+        pair.initiator.snapshot().unwrap_err(),
+        PubkyNoiseError::UnacknowledgedPreparedTransport
+    );
     pair.initiator.test_disable_write_failure();
     pair.initiator.retry_pending_send().await.unwrap();
     let received = pair.responder.receive_message().await.unwrap();

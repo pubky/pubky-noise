@@ -119,6 +119,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use sha2::{Digest, Sha256};
 
 use crate::serializer::{PubkyNoiseSessionState, MAX_SESSION_STATE_LEN, MIN_SESSION_STATE_LEN};
+use zeroize::Zeroizing;
 
 /// Domain separation tag for backup key derivation.
 const BACKUP_KEY_DOMAIN: &[u8] = b"pubky-noise/session-backup/v0";
@@ -222,8 +223,8 @@ pub fn encrypt_backup_with_key(
     let header = envelope_header();
     let aad = build_aad(&header, backup_path);
 
-    let serialized = state.serialize();
-    let mut plaintext = Vec::with_capacity(GENERATION_LEN + serialized.len());
+    let serialized = Zeroizing::new(state.serialize());
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(GENERATION_LEN + serialized.len()));
     plaintext.extend_from_slice(&generation.to_be_bytes());
     plaintext.extend_from_slice(&serialized);
 
@@ -257,7 +258,7 @@ pub fn encrypt_backup(
     generation: u64,
     state: &PubkyNoiseSessionState,
 ) -> Vec<u8> {
-    let key = derive_backup_key(root_secret);
+    let key = Zeroizing::new(derive_backup_key(root_secret));
     encrypt_backup_with_key(&key, backup_path, generation, state)
 }
 
@@ -281,6 +282,10 @@ pub fn encrypt_backup(
 /// the checkpoint are rejected with [`BackupCryptoError::Rollback`].
 ///
 /// Returns the backup generation and the serialized session state.
+/// The temporary plaintext buffer is wrapped in [`Zeroizing`] and wiped on drop.
+/// The returned `Vec<u8>` is a separate, caller-owned copy containing secrets;
+/// it does not zeroize on drop. Callers must wipe it when no longer needed or
+/// wrap it in [`Zeroizing`] to wipe it on drop.
 pub fn decrypt_backup_with_key(
     key: &[u8; 32],
     backup_path: &str,
@@ -324,15 +329,17 @@ pub fn decrypt_backup_with_key(
         backup_path,
     );
     let cipher = XChaCha20Poly1305::new(key.into());
-    let plaintext = cipher
-        .decrypt(
-            nonce.into(),
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| BackupCryptoError::DecryptError)?;
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                nonce.into(),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| BackupCryptoError::DecryptError)?,
+    );
     let generation = u64::from_be_bytes(
         plaintext[..GENERATION_LEN]
             .try_into()
@@ -361,7 +368,7 @@ pub fn decrypt_backup(
     record: &[u8],
     min_generation: Option<u64>,
 ) -> Result<(u64, Vec<u8>), BackupCryptoError> {
-    let key = derive_backup_key(root_secret);
+    let key = Zeroizing::new(derive_backup_key(root_secret));
     decrypt_backup_with_key(&key, backup_path, record, min_generation)
 }
 
