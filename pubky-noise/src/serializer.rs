@@ -79,6 +79,8 @@ impl Zeroize for PubkyNoiseSessionState {
     fn zeroize(&mut self) {
         self.ephemeral_secret.zeroize();
         self.static_secret.zeroize();
+        self.sending_nonce.zeroize();
+        self.receiving_nonce.zeroize();
     }
 }
 
@@ -674,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn wiping_snapshot_secrets_preserves_independent_recovery_copy() {
+    fn wiping_snapshot_preserves_independent_recovery_copy() {
         let mut state = transport_state();
         state.static_secret = Some([7; 32]);
         let recovery = state.clone();
@@ -682,6 +684,8 @@ mod tests {
         state.zeroize();
         assert_eq!(state.ephemeral_secret, [0; 32]);
         assert!(state.static_secret.is_none());
+        assert_eq!((state.sending_nonce, state.receiving_nonce), (0, 0));
+        assert_eq!((recovery.sending_nonce, recovery.receiving_nonce), (2, 1));
         assert_eq!(recovery.ephemeral_secret, [1; 32]);
         assert_eq!(recovery.static_secret, Some([7; 32]));
         assert_eq!(

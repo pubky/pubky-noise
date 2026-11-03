@@ -120,12 +120,12 @@ fn map_homeserver_read_error(error: Error) -> PubkyNoiseError {
 /// Format: `[body_len_hi, body_len_lo, body, zero padding]`.
 fn encode_transport_plaintext(
     body: &[u8],
-) -> Result<[u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN], PubkyNoiseError> {
+) -> Result<Zeroizing<[u8; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN]>, PubkyNoiseError> {
     if body.len() > PUBKY_NOISE_MSG_LEN {
         return Err(PubkyNoiseError::EncryptionError);
     }
 
-    let mut plaintext = [0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN];
+    let mut plaintext = Zeroizing::new([0; PUBKY_NOISE_TRANSPORT_PLAINTEXT_LEN]);
     plaintext[..2].copy_from_slice(&(body.len() as u16).to_be_bytes());
     plaintext[2..body.len() + 2].copy_from_slice(body);
     Ok(plaintext)

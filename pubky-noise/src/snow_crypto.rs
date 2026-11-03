@@ -425,6 +425,12 @@ pub(crate) struct DataLinkContext {
     sub_step_index: usize,
 }
 
+impl Drop for DataLinkContext {
+    fn drop(&mut self) {
+        self.delete();
+    }
+}
+
 /// Redacted `Debug`: secret key material (`local_static_seckey`,
 /// `local_ephemeral_seckey`) and the Snow handshake/transport internals are
 /// never rendered. Transport nonce values are hidden as a logging policy
@@ -635,6 +641,8 @@ impl DataLinkContext {
     pub fn delete(&mut self) {
         self.local_static_seckey.zeroize();
         self.local_ephemeral_seckey.zeroize();
+        self.sending_nonce.zeroize();
+        self.receiving_nonce.zeroize();
         self.noise_handshake = None;
         self.noise_transport = None;
     }
@@ -1018,11 +1026,15 @@ mod tests {
         let (transport, _) = transport_contexts();
         for mut context in [handshake, transport] {
             assert!(!context.is_closed());
+            context.set_sending_nonce(2);
+            context.set_receiving_nonce(1);
             context.delete();
             context.delete();
             assert!(context.is_closed());
             assert!(context.get_static_secret().is_none());
             assert_eq!(context.get_ephemeral_secret(), &[0; 32]);
+            assert_eq!(context.get_sending_nonce(), 0);
+            assert_eq!(context.get_receiving_nonce(), 0);
             assert!(context.noise_handshake.is_none());
             assert!(context.noise_transport.is_none());
         }
