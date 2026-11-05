@@ -560,7 +560,10 @@ provide cross-process authentication, authorization, credential management, or
 locking; callers must enforce those requirements.
 
 Crate-owned replay keys, snapshot copies and temporary backup plaintext use
-zeroizing storage. These wipes rely on the `zeroize` crate's
+zeroizing storage. Owned temporary nonce buffers and retired session nonce
+cursors are also wiped for cleanup consistency, not because nonces are secret.
+Borrowed input and nonce bytes published in backup envelopes are not erased.
+These wipes rely on the `zeroize` crate's
 [guarantees and limitations](https://docs.rs/zeroize/1.8.2/zeroize/#what-guarantees-does-this-crate-provide).
 Closing an encryptor releases its live Noise state, but keeps
 its last good checkpoint and pending exact ciphertext available for recovery

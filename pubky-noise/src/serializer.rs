@@ -365,13 +365,12 @@ impl PubkyNoiseSessionState {
         ephemeral_secret.copy_from_slice(&data[4..36]);
 
         let has_static = data[36] == 1;
-        let static_secret = Zeroizing::new(if has_static {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&data[37..69]);
-            Some(key)
-        } else {
-            None
-        });
+        let mut static_secret = Zeroizing::new(None);
+        if has_static {
+            static_secret
+                .insert([0u8; 32])
+                .copy_from_slice(&data[37..69]);
+        }
 
         let counter = u32::from_be_bytes([data[69], data[70], data[71], data[72]]);
 
@@ -398,13 +397,13 @@ impl PubkyNoiseSessionState {
             None
         };
 
-        let sending_nonce = u64::from_be_bytes([
+        let sending_nonce = Zeroizing::new(u64::from_be_bytes([
             data[141], data[142], data[143], data[144], data[145], data[146], data[147], data[148],
-        ]);
+        ]));
 
-        let receiving_nonce = u64::from_be_bytes([
+        let receiving_nonce = Zeroizing::new(u64::from_be_bytes([
             data[149], data[150], data[151], data[152], data[153], data[154], data[155], data[156],
-        ]);
+        ]));
 
         let write_counter = u32::from_be_bytes([data[157], data[158], data[159], data[160]]);
 
@@ -447,8 +446,8 @@ impl PubkyNoiseSessionState {
             sub_step_index,
             handshake_hash,
             link_id,
-            sending_nonce,
-            receiving_nonce,
+            sending_nonce: *sending_nonce,
+            receiving_nonce: *receiving_nonce,
             write_counter,
             read_counter,
             endpoint_pubkey,

@@ -232,7 +232,7 @@ pub fn encrypt_backup_with_key(
     let nonce = random_nonce();
     let ciphertext = cipher
         .encrypt(
-            &nonce,
+            XNonce::from_slice(&*nonce),
             Payload {
                 msg: &plaintext,
                 aad: &aad,
@@ -242,7 +242,7 @@ pub fn encrypt_backup_with_key(
 
     let mut out = Vec::with_capacity(HEADER_LEN + NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&header);
-    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&*nonce);
     out.extend_from_slice(&ciphertext);
     out
 }
@@ -373,9 +373,9 @@ pub fn decrypt_backup(
 }
 
 /// Draws a fresh random 192-bit nonce from the OS CSPRNG.
-fn random_nonce() -> XNonce {
-    let mut nonce = XNonce::default();
-    getrandom::fill(&mut nonce).expect("OS entropy source must be available");
+fn random_nonce() -> Zeroizing<[u8; NONCE_LEN]> {
+    let mut nonce = Zeroizing::new([0u8; NONCE_LEN]);
+    getrandom::fill(&mut *nonce).expect("OS entropy source must be available");
     nonce
 }
 
@@ -491,7 +491,7 @@ mod tests {
         let nonce = random_nonce();
         let ciphertext = cipher
             .encrypt(
-                &nonce,
+                XNonce::from_slice(&*nonce),
                 Payload {
                     msg: plaintext,
                     aad: &aad,
@@ -500,7 +500,7 @@ mod tests {
             .unwrap();
 
         let mut record = header.to_vec();
-        record.extend_from_slice(&nonce);
+        record.extend_from_slice(&*nonce);
         record.extend_from_slice(&ciphertext);
         record
     }

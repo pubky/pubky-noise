@@ -958,14 +958,21 @@ impl PubkyNoiseEncryptor {
         Ok(link_id)
     }
 
-    fn build_prepared_send(&self, plaintext: &[u8]) -> Result<PreparedSend, PubkyNoiseError> {
+    fn ensure_transport_ready(&self) -> Result<(), PubkyNoiseError> {
+        if self.context.is_closed() {
+            return Err(PubkyNoiseError::OtherError);
+        }
         if self.unacknowledged_transport_digest.is_some() {
             return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
         }
         if !self.context.is_transport() {
             return Err(PubkyNoiseError::IsHandshake);
         }
+        Ok(())
+    }
 
+    fn build_prepared_send(&self, plaintext: &[u8]) -> Result<PreparedSend, PubkyNoiseError> {
+        self.ensure_transport_ready()?;
         self.context
             .ensure_can_advance_write_slot()
             .map_err(map_context_overflow)?;
@@ -1048,6 +1055,7 @@ impl PubkyNoiseEncryptor {
     ///   slot space is exhausted.
     /// - Returns [`PubkyNoiseError::NonceOverflow`] if the sending nonce space
     ///   is exhausted.
+    /// - Returns [`PubkyNoiseError::OtherError`] after the encryptor is closed.
     pub fn prepare_send(&mut self, plaintext: &[u8]) -> Result<PreparedSend, PubkyNoiseError> {
         let prepared = self.build_prepared_send(plaintext)?;
         #[cfg(feature = "test-utils")]
@@ -1081,6 +1089,7 @@ impl PubkyNoiseEncryptor {
     ///   slot space is exhausted.
     /// - Returns [`PubkyNoiseError::NonceOverflow`] if the sending nonce space
     ///   is exhausted.
+    /// - Returns [`PubkyNoiseError::OtherError`] after the encryptor is closed.
     #[deprecated(
         note = "use prepare_send and acknowledge_persisted_send for crash-safe publication"
     )]
@@ -1145,13 +1154,9 @@ impl PubkyNoiseEncryptor {
     /// - Returns [`PubkyNoiseError::CounterOverflow`] or
     ///   [`PubkyNoiseError::NonceOverflow`] if the inbound transport space is
     ///   exhausted.
+    /// - Returns [`PubkyNoiseError::OtherError`] after the encryptor is closed.
     pub fn next_receive_path(&self) -> Result<String, PubkyNoiseError> {
-        if self.unacknowledged_transport_digest.is_some() {
-            return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
-        }
-        if !self.context.is_transport() {
-            return Err(PubkyNoiseError::IsHandshake);
-        }
+        self.ensure_transport_ready()?;
         self.context
             .ensure_can_advance_read_slot()
             .map_err(map_context_overflow)?;
@@ -1171,12 +1176,7 @@ impl PubkyNoiseEncryptor {
         &self,
         ciphertext: &[u8],
     ) -> Result<PreparedReceive, PubkyNoiseError> {
-        if self.unacknowledged_transport_digest.is_some() {
-            return Err(PubkyNoiseError::UnacknowledgedPreparedTransport);
-        }
-        if !self.context.is_transport() {
-            return Err(PubkyNoiseError::IsHandshake);
-        }
+        self.ensure_transport_ready()?;
         self.context
             .ensure_can_advance_read_slot()
             .map_err(map_context_overflow)?;
@@ -1275,6 +1275,7 @@ impl PubkyNoiseEncryptor {
     ///   transport slot space is exhausted.
     /// - Returns [`PubkyNoiseError::NonceOverflow`] if the receiving nonce space
     ///   is exhausted.
+    /// - Returns [`PubkyNoiseError::OtherError`] after the encryptor is closed.
     pub fn prepare_receive(
         &mut self,
         ciphertext: &[u8],
@@ -1372,6 +1373,7 @@ impl PubkyNoiseEncryptor {
     ///   transport slot space is exhausted.
     /// - Returns [`PubkyNoiseError::NonceOverflow`] if the receiving nonce space
     ///   is exhausted.
+    /// - Returns [`PubkyNoiseError::OtherError`] after the encryptor is closed.
     pub async fn receive_message(&mut self) -> Result<Vec<Vec<u8>>, PubkyNoiseError> {
         let mut results = Vec::new();
         let formatted_path = self.next_receive_path()?;
@@ -1407,7 +1409,9 @@ impl PubkyNoiseEncryptor {
     /// available for recovery until this encryptor is dropped. Caller-owned
     /// snapshots, persisted backups and shared configuration are not erased.
     /// Take any required current snapshot before closing; a closed encryptor
-    /// cannot produce a usable new snapshot or continue its Noise session.
+    /// cannot produce a usable new snapshot, prepare new transport operations,
+    /// or read new messages. An already-pending convenience send can still
+    /// republish its exact ciphertext without using the closed Noise state.
     pub fn close(&mut self) {
         self.context.delete();
     }

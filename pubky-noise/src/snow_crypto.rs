@@ -658,9 +658,9 @@ impl DataLinkContext {
         }
     }
 
-    /// Check if this context is in transport phase.
+    /// Check if this context has live transport state.
     pub fn is_transport(&self) -> bool {
-        self.noise_phase == NoisePhase::Transport
+        self.noise_phase == NoisePhase::Transport && self.noise_transport.is_some()
     }
 
     /// Return the peer's static key only after the handshake completes.
@@ -1031,6 +1031,7 @@ mod tests {
             context.delete();
             context.delete();
             assert!(context.is_closed());
+            assert!(!context.is_transport());
             assert!(context.get_static_secret().is_none());
             assert_eq!(context.get_ephemeral_secret(), &[0; 32]);
             assert_eq!(context.get_sending_nonce(), 0);

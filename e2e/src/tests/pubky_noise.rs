@@ -1416,7 +1416,26 @@ async fn snow_test_cleaning_sequence() {
         let snapshot = pair.initiator.snapshot().unwrap();
         pair.initiator.close();
         assert!(!pair.initiator.is_handshake_complete());
-        assert!(pair.initiator.prepare_send(b"closed").is_err());
+        assert_eq!(
+            pair.initiator.prepare_send(b"closed").unwrap_err(),
+            PubkyNoiseError::OtherError
+        );
+        assert_eq!(
+            pair.initiator.prepare_receive(&[]).unwrap_err(),
+            PubkyNoiseError::OtherError
+        );
+        assert_eq!(
+            pair.initiator.next_receive_path().unwrap_err(),
+            PubkyNoiseError::OtherError
+        );
+        assert_eq!(
+            pair.initiator.receive_message().await.unwrap_err(),
+            PubkyNoiseError::OtherError
+        );
+        assert_eq!(
+            pair.initiator.send_message(b"closed").await.unwrap_err(),
+            PubkyNoiseError::OtherError
+        );
         pair.initiator = PubkyNoiseEncryptor::restore(
             pair.initiator_config.clone(),
             snapshot,
